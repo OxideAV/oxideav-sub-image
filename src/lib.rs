@@ -13,10 +13,12 @@
 //! | DVB sub  | `dvbsub`  | *(none)*       | rides MPEG-TS |
 //! | VobSub   | `vobsub`  | `vobsub`       | `.idx`+`.sub` |
 //!
-//! ## Scope for this first cut
+//! ## Scope
 //!
-//! * **Decode only.** Encoding palette-indexed bitmap subtitle formats
-//!   is follow-up work.
+//! * PGS supports both decode and encode.
+//! * DVB subtitles and VobSub are decode-only for now. DVB subs need a
+//!   TS-aware muxer upstream; VobSub needs the `.idx`+`.sub` pair written
+//!   in lock-step which this crate doesn't yet expose.
 //! * One RGBA [`oxideav_core::VideoFrame`] is emitted per display-set
 //!   (cue change) — either the full video-canvas-sized frame (PGS/DVB)
 //!   or the bitmap's own rectangle (VobSub).
@@ -78,6 +80,28 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
         };
         reg.register_decoder_impl(CodecId::new(id), caps, factory);
     }
+
+    // PGS encoder. The other two formats are decode-only for now: DVB
+    // subs need a TS-aware muxer to produce valid streams, and VobSub
+    // needs the `.idx`+`.sub` pair written in lock-step.
+    let pgs_enc_caps = CodecCapabilities {
+        decode: false,
+        encode: true,
+        media_type: MediaType::Subtitle,
+        intra_only: true,
+        lossy: true,
+        lossless: false,
+        hardware_accelerated: false,
+        implementation: "pgs_sw".into(),
+        max_width: None,
+        max_height: None,
+        max_bitrate: None,
+        max_sample_rate: None,
+        max_channels: None,
+        priority: 100,
+        accepted_pixel_formats: vec![oxideav_core::PixelFormat::Rgba],
+    };
+    reg.register_encoder_impl(CodecId::new(PGS_CODEC_ID), pgs_enc_caps, pgs::make_encoder);
 }
 
 /// Register the PGS (`.sup`) and VobSub (`.idx`+`.sub`) containers.

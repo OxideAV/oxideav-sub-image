@@ -28,7 +28,12 @@
 //!
 //! ## Scope / limitations
 //!
-//! * **Decode only.**
+//! * Decode and encode supported. The encoder emits a single composition
+//!   object covering the full frame per input [`oxideav_core::VideoFrame`]
+//!   and quantises colour into a ≤ 255-entry palette (index 0 reserved
+//!   for transparent). When the frame has more than 255 distinct RGBA
+//!   colours the palette is built from a 3/3/2/2 (R/G/B/A) bucketed
+//!   reduction, nearest-matching any surplus colours.
 //! * Objects referenced by a composition but not yet seen via ODS are
 //!   skipped silently — PGS allows carrying only palette/WDS updates.
 //! * ODS fragmentation is handled (an object carries `last_in_sequence`
@@ -40,7 +45,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, SeekFrom};
 
-use oxideav_codec::Decoder;
+use oxideav_codec::{Decoder, Encoder};
 use oxideav_container::{ContainerRegistry, Demuxer, ProbeData, ProbeScore, ReadSeek};
 use oxideav_core::{
     CodecId, CodecParameters, Error, Frame, MediaType, Packet, PixelFormat, Result, StreamInfo,
@@ -653,6 +658,413 @@ impl Decoder for PgsDecoder {
         self.pending.clear();
         self.eof = false;
         Ok(())
+    }
+}
+
+// --- Encoder -----------------------------------------------------------
+
+/// Build a PGS encoder. The encoder accepts [`Frame::Video`] frames with
+/// [`PixelFormat::Rgba`] and emits one [`Packet`] per frame carrying a
+/// complete PGS display-set (PCS + WDS + PDS + ODS + END).
+///
+/// All pixels are quantised into a 255-entry palette (index 0 is reserved
+/// for fully-transparent background). When the input has ≤ 255 distinct
+/// RGBA colours the quantisation is lossless; otherwise each channel is
+/// reduced to a lower bit-depth (3-3-2-2 R-G-B-A) which loses precision
+/// but stays within the PGS palette budget.
+pub fn make_encoder(_params: &CodecParameters) -> Result<Box<dyn Encoder>> {
+    let mut out_params = CodecParameters::video(CodecId::new(PGS_CODEC_ID));
+    out_params.media_type = MediaType::Subtitle;
+    out_params.pixel_format = Some(PixelFormat::Rgba);
+    Ok(Box::new(PgsEncoder {
+        codec_id: CodecId::new(PGS_CODEC_ID),
+        params: out_params,
+        pending: VecDeque::new(),
+        composition_number: 0,
+    }))
+}
+
+struct PgsEncoder {
+    codec_id: CodecId,
+    params: CodecParameters,
+    pending: VecDeque<Packet>,
+    composition_number: u16,
+}
+
+impl Encoder for PgsEncoder {
+    fn codec_id(&self) -> &CodecId {
+        &self.codec_id
+    }
+
+    fn output_params(&self) -> &CodecParameters {
+        &self.params
+    }
+
+    fn send_frame(&mut self, frame: &Frame) -> Result<()> {
+        let Frame::Video(v) = frame else {
+            return Err(Error::unsupported(
+                "PGS encoder only accepts Frame::Video input",
+            ));
+        };
+        if v.format != PixelFormat::Rgba {
+            return Err(Error::unsupported(format!(
+                "PGS encoder only accepts RGBA, got {:?}",
+                v.format
+            )));
+        }
+        if v.width == 0 || v.height == 0 {
+            return Err(Error::invalid("PGS encoder: zero-sized frame"));
+        }
+        if self.params.width.is_none() {
+            self.params.width = Some(v.width);
+            self.params.height = Some(v.height);
+        }
+
+        let (indices, palette_rgba) = quantise_rgba(v)?;
+        let composition_number = self.composition_number;
+        self.composition_number = self.composition_number.wrapping_add(1);
+        let pts_90k = frame_pts_90k(v).unwrap_or(0);
+        let bytes = encode_display_set(
+            v.width as u16,
+            v.height as u16,
+            composition_number,
+            pts_90k,
+            &palette_rgba,
+            &indices,
+        );
+        let mut packet = Packet::new(0, TimeBase::new(1, 90_000), bytes);
+        packet.pts = Some(pts_90k as i64);
+        packet.dts = Some(pts_90k as i64);
+        packet.flags.keyframe = true;
+        self.pending.push_back(packet);
+        Ok(())
+    }
+
+    fn receive_packet(&mut self) -> Result<Packet> {
+        self.pending.pop_front().ok_or(Error::NeedMore)
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+fn frame_pts_90k(v: &VideoFrame) -> Option<u32> {
+    let pts = v.pts?;
+    let scaled = v.time_base.rescale(pts, TimeBase::new(1, 90_000));
+    if scaled < 0 {
+        Some(0)
+    } else {
+        Some(scaled as u32)
+    }
+}
+
+/// Walk an RGBA frame and produce an indexed-colour buffer + palette.
+/// Index 0 is always fully-transparent black (so any (_, _, _, 0) source
+/// pixel collapses to index 0 regardless of colour channels).
+fn quantise_rgba(v: &VideoFrame) -> Result<(Vec<u8>, Vec<[u8; 4]>)> {
+    if v.planes.is_empty() {
+        return Err(Error::invalid("PGS encoder: RGBA frame has no plane"));
+    }
+    let plane = &v.planes[0];
+    let width = v.width as usize;
+    let height = v.height as usize;
+    let needed = width * 4;
+    if plane.stride < needed {
+        return Err(Error::invalid("PGS encoder: RGBA stride too small"));
+    }
+    let mut palette: Vec<[u8; 4]> = Vec::with_capacity(256);
+    palette.push([0, 0, 0, 0]);
+    let mut map: HashMap<[u8; 4], u8> = HashMap::new();
+    map.insert([0, 0, 0, 0], 0);
+
+    let mut indices = vec![0u8; width * height];
+    let mut quantise_harder = false;
+    'scan: for row in 0..height {
+        let line = &plane.data[row * plane.stride..row * plane.stride + needed];
+        for col in 0..width {
+            let px = &line[col * 4..col * 4 + 4];
+            let key = if px[3] == 0 {
+                [0, 0, 0, 0]
+            } else {
+                [px[0], px[1], px[2], px[3]]
+            };
+            if let Some(&idx) = map.get(&key) {
+                indices[row * width + col] = idx;
+                continue;
+            }
+            if palette.len() >= 255 {
+                quantise_harder = true;
+                break 'scan;
+            }
+            let idx = palette.len() as u8;
+            palette.push(key);
+            map.insert(key, idx);
+            indices[row * width + col] = idx;
+        }
+    }
+
+    if quantise_harder {
+        return quantise_rgba_332(v);
+    }
+    Ok((indices, palette))
+}
+
+/// Fallback quantisation: bucket R/G/B to 3/3/2 bits and A to 2 bits.
+/// Yields up to 256 distinct indices; index 0 is fully-transparent.
+fn quantise_rgba_332(v: &VideoFrame) -> Result<(Vec<u8>, Vec<[u8; 4]>)> {
+    let plane = &v.planes[0];
+    let width = v.width as usize;
+    let height = v.height as usize;
+    let needed = width * 4;
+    if plane.stride < needed {
+        return Err(Error::invalid("PGS encoder: RGBA stride too small"));
+    }
+    let mut palette: Vec<[u8; 4]> = Vec::with_capacity(256);
+    palette.push([0, 0, 0, 0]);
+    let mut map: HashMap<[u8; 4], u8> = HashMap::new();
+    map.insert([0, 0, 0, 0], 0);
+    let mut indices = vec![0u8; width * height];
+    for row in 0..height {
+        let line = &plane.data[row * plane.stride..row * plane.stride + needed];
+        for col in 0..width {
+            let px = &line[col * 4..col * 4 + 4];
+            if px[3] == 0 {
+                indices[row * width + col] = 0;
+                continue;
+            }
+            let r = px[0] & 0xE0;
+            let g = px[1] & 0xE0;
+            let b = px[2] & 0xC0;
+            let a = match px[3] {
+                0..=63 => 0x3F,
+                64..=127 => 0x7F,
+                128..=191 => 0xBF,
+                _ => 0xFF,
+            };
+            let key = [r, g, b, a];
+            if let Some(&idx) = map.get(&key) {
+                indices[row * width + col] = idx;
+                continue;
+            }
+            let idx = palette.len() as u8;
+            palette.push(key);
+            map.insert(key, idx);
+            indices[row * width + col] = idx;
+            if palette.len() == 256 {
+                // No room for a further colour — subsequent novel pixels
+                // snap to the nearest existing entry.
+                for row2 in row..height {
+                    let line2 = &plane.data[row2 * plane.stride..row2 * plane.stride + needed];
+                    let start_col = if row2 == row { col + 1 } else { 0 };
+                    for col2 in start_col..width {
+                        let px2 = &line2[col2 * 4..col2 * 4 + 4];
+                        let key2 = if px2[3] == 0 {
+                            [0, 0, 0, 0]
+                        } else {
+                            let r = px2[0] & 0xE0;
+                            let g = px2[1] & 0xE0;
+                            let b = px2[2] & 0xC0;
+                            let a = match px2[3] {
+                                0..=63 => 0x3F,
+                                64..=127 => 0x7F,
+                                128..=191 => 0xBF,
+                                _ => 0xFF,
+                            };
+                            [r, g, b, a]
+                        };
+                        indices[row2 * width + col2] = *map
+                            .get(&key2)
+                            .unwrap_or(&nearest_palette_entry(&palette, key2));
+                    }
+                }
+                return Ok((indices, palette));
+            }
+        }
+    }
+    Ok((indices, palette))
+}
+
+fn nearest_palette_entry(palette: &[[u8; 4]], key: [u8; 4]) -> u8 {
+    let mut best = 0u8;
+    let mut best_d = i32::MAX;
+    for (i, entry) in palette.iter().enumerate() {
+        let dr = entry[0] as i32 - key[0] as i32;
+        let dg = entry[1] as i32 - key[1] as i32;
+        let db = entry[2] as i32 - key[2] as i32;
+        let da = entry[3] as i32 - key[3] as i32;
+        let d = dr * dr + dg * dg + db * db + da * da;
+        if d < best_d {
+            best_d = d;
+            best = i as u8;
+        }
+    }
+    best
+}
+
+/// Encode an indexed bitmap + palette into a single PGS display-set
+/// byte-string (PCS + WDS + PDS + ODS + END, each with the shared
+/// "PG" segment header).
+fn encode_display_set(
+    width: u16,
+    height: u16,
+    composition_number: u16,
+    pts_90k: u32,
+    palette: &[[u8; 4]],
+    indices: &[u8],
+) -> Vec<u8> {
+    let mut out = Vec::new();
+
+    // PCS.
+    let mut pcs = Vec::new();
+    pcs.extend_from_slice(&width.to_be_bytes());
+    pcs.extend_from_slice(&height.to_be_bytes());
+    pcs.push(0x10); // frame rate (ignored by decoders but conventional)
+    pcs.extend_from_slice(&composition_number.to_be_bytes());
+    pcs.push(0x80); // composition state: epoch-start
+    pcs.push(0); // palette update flag
+    pcs.push(0); // palette id
+    pcs.push(1); // one composition object
+    pcs.extend_from_slice(&1u16.to_be_bytes()); // object id
+    pcs.push(0); // window id
+    pcs.push(0); // flags (not cropped, not forced)
+    pcs.extend_from_slice(&0u16.to_be_bytes()); // x
+    pcs.extend_from_slice(&0u16.to_be_bytes()); // y
+    push_segment(&mut out, pts_90k, SEG_PCS, &pcs);
+
+    // WDS.
+    let mut wds = Vec::new();
+    wds.push(1); // one window
+    wds.push(0); // window id
+    wds.extend_from_slice(&0u16.to_be_bytes()); // x
+    wds.extend_from_slice(&0u16.to_be_bytes()); // y
+    wds.extend_from_slice(&width.to_be_bytes());
+    wds.extend_from_slice(&height.to_be_bytes());
+    push_segment(&mut out, pts_90k, SEG_WDS, &wds);
+
+    // PDS.
+    let mut pds = Vec::new();
+    pds.push(0); // palette id
+    pds.push(0); // palette version
+    for (idx, rgba) in palette.iter().enumerate() {
+        if idx >= 256 {
+            break;
+        }
+        if rgba[3] == 0 {
+            // PGS does carry transparent entries, but the canonical form
+            // for "unused" is alpha 0 with zeroed chroma — emit it.
+            pds.push(idx as u8);
+            pds.push(0);
+            pds.push(0x80);
+            pds.push(0x80);
+            pds.push(0);
+            continue;
+        }
+        let (y, cb, cr) = rgb_to_ycbcr_bt601(rgba[0], rgba[1], rgba[2]);
+        pds.push(idx as u8);
+        pds.push(y);
+        pds.push(cr);
+        pds.push(cb);
+        pds.push(rgba[3]);
+    }
+    push_segment(&mut out, pts_90k, SEG_PDS, &pds);
+
+    // ODS — single fragment (0xC0 = first + last sequence).
+    let rle = encode_rle(indices, width as usize, height as usize);
+    let mut ods = Vec::new();
+    ods.extend_from_slice(&1u16.to_be_bytes()); // object id
+    ods.push(0); // object version
+    ods.push(0xC0); // first + last
+    let obj_data_len = (rle.len() + 4) as u32; // width+height (4) + rle
+    ods.push(((obj_data_len >> 16) & 0xFF) as u8);
+    ods.push(((obj_data_len >> 8) & 0xFF) as u8);
+    ods.push((obj_data_len & 0xFF) as u8);
+    ods.extend_from_slice(&width.to_be_bytes());
+    ods.extend_from_slice(&height.to_be_bytes());
+    ods.extend_from_slice(&rle);
+    push_segment(&mut out, pts_90k, SEG_ODS, &ods);
+
+    // END.
+    push_segment(&mut out, pts_90k, SEG_END, &[]);
+
+    out
+}
+
+fn push_segment(out: &mut Vec<u8>, pts_90k: u32, seg_type: u8, body: &[u8]) {
+    out.extend_from_slice(b"PG");
+    out.extend_from_slice(&pts_90k.to_be_bytes());
+    out.extend_from_slice(&0u32.to_be_bytes()); // DTS — not used
+    out.push(seg_type);
+    out.extend_from_slice(&(body.len() as u16).to_be_bytes());
+    out.extend_from_slice(body);
+}
+
+fn rgb_to_ycbcr_bt601(r: u8, g: u8, b: u8) -> (u8, u8, u8) {
+    let r = r as i32;
+    let g = g as i32;
+    let b = b as i32;
+    let y = ((77 * r + 150 * g + 29 * b + 128) >> 8) as u8;
+    let cb = (((-43 * r - 84 * g + 127 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
+    let cr = (((127 * r - 106 * g - 21 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
+    (y, cb, cr)
+}
+
+/// Encode a width×height indexed-colour buffer into PGS run-length form
+/// (see [`decode_rle`] for the inverse description).
+pub fn encode_rle(pixels: &[u8], width: usize, height: usize) -> Vec<u8> {
+    debug_assert_eq!(pixels.len(), width * height);
+    let mut out = Vec::new();
+    for row in 0..height {
+        let mut col = 0usize;
+        while col < width {
+            let colour = pixels[row * width + col];
+            let mut run = 1usize;
+            while col + run < width && pixels[row * width + col + run] == colour && run < 0x3FFF {
+                run += 1;
+            }
+            emit_run(&mut out, run, colour);
+            col += run;
+        }
+        // End-of-line marker: 00 00.
+        out.push(0);
+        out.push(0);
+    }
+    out
+}
+
+fn emit_run(out: &mut Vec<u8>, run: usize, colour: u8) {
+    if colour == 0 {
+        // Transparent background run.
+        if run < 64 {
+            out.push(0);
+            out.push(run as u8); // 00LLLLLL — L > 0
+        } else {
+            out.push(0);
+            out.push(0x40 | ((run >> 8) & 0x3F) as u8);
+            out.push((run & 0xFF) as u8);
+        }
+        return;
+    }
+    if run == 1 {
+        out.push(colour);
+        return;
+    }
+    if run < 4 {
+        // Short runs are cheaper as N back-to-back single pixels.
+        for _ in 0..run {
+            out.push(colour);
+        }
+        return;
+    }
+    if run < 64 {
+        out.push(0);
+        out.push(0x80 | (run as u8 & 0x3F));
+        out.push(colour);
+    } else {
+        out.push(0);
+        out.push(0xC0 | ((run >> 8) & 0x3F) as u8);
+        out.push((run & 0xFF) as u8);
+        out.push(colour);
     }
 }
 
