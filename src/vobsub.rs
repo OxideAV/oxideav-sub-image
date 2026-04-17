@@ -571,10 +571,163 @@ fn extract_spu(buf: &[u8]) -> Option<Vec<u8>> {
             return Some(buf[..spu_len].to_vec());
         }
     }
-    // TODO: unwrap MPEG-PS pack + PES framing. We treat the buffer as
-    // raw if the length-prefix check fails — most test fixtures use
-    // that shape.
+    // MPEG-PS pack + PES private_stream_1 form: walk the PS packets and
+    // concatenate the PES payloads (dropping the 1-byte substream-id
+    // prefix DVD uses inside private_stream_1) until we have enough to
+    // hold a full SPU (its first 2 bytes give the total length).
+    extract_spu_from_ps(buf)
+}
+
+/// Walk an MPEG-PS stream, concatenating DVD sub payloads from every
+/// private_stream_1 PES packet until one full SPU has been recovered.
+fn extract_spu_from_ps(buf: &[u8]) -> Option<Vec<u8>> {
+    let mut cur = 0usize;
+    let mut spu: Vec<u8> = Vec::new();
+    let mut target: Option<usize> = None;
+
+    while cur + 4 <= buf.len() {
+        // All PS start codes share the 0x000001 prefix.
+        if buf[cur] != 0 || buf[cur + 1] != 0 || buf[cur + 2] != 1 {
+            return None;
+        }
+        let code = buf[cur + 3];
+        cur += 4;
+        match code {
+            // Pack header (0xBA). MPEG-2 form: 10xx then 9 bytes, then a
+            // 3-bit stuffing-length followed by that many stuffing bytes.
+            // MPEG-1 form: starts with 0010xxxx and is 8 bytes total.
+            0xBA => {
+                if cur >= buf.len() {
+                    return None;
+                }
+                if (buf[cur] & 0xC0) == 0x40 {
+                    // MPEG-2: 9 fixed bytes + stuffing (low 3 bits of byte 9).
+                    if cur + 10 > buf.len() {
+                        return None;
+                    }
+                    let stuffing = (buf[cur + 9] & 0x07) as usize;
+                    cur += 10 + stuffing;
+                } else if (buf[cur] & 0xF0) == 0x20 {
+                    // MPEG-1: 8 fixed bytes.
+                    cur += 8;
+                } else {
+                    return None;
+                }
+            }
+            // System header — 2-byte length followed by that many bytes.
+            0xBB => {
+                if cur + 2 > buf.len() {
+                    return None;
+                }
+                let len = u16::from_be_bytes([buf[cur], buf[cur + 1]]) as usize;
+                cur += 2 + len;
+            }
+            // Private stream 1 — DVD subs. Length + PES header + 1-byte
+            // substream id, then the SPU payload fragment.
+            0xBD => {
+                if cur + 2 > buf.len() {
+                    return None;
+                }
+                let pes_len = u16::from_be_bytes([buf[cur], buf[cur + 1]]) as usize;
+                cur += 2;
+                let pes_end = cur + pes_len;
+                if pes_end > buf.len() {
+                    return None;
+                }
+                let body = parse_pes_body(&buf[cur..pes_end])?;
+                // DVD sub packets carry a 1-byte substream id at body[0];
+                // valid ids are 0x20..0x3F.
+                if body.is_empty() {
+                    cur = pes_end;
+                    continue;
+                }
+                let substream = body[0];
+                if !(0x20..=0x3F).contains(&substream) {
+                    cur = pes_end;
+                    continue;
+                }
+                spu.extend_from_slice(&body[1..]);
+                if target.is_none() && spu.len() >= 2 {
+                    target = Some(u16::from_be_bytes([spu[0], spu[1]]) as usize);
+                }
+                if let Some(t) = target {
+                    if spu.len() >= t {
+                        spu.truncate(t);
+                        return Some(spu);
+                    }
+                }
+                cur = pes_end;
+            }
+            // Padding / other PES packets — just skip by length.
+            0xBE | 0xBF => {
+                if cur + 2 > buf.len() {
+                    return None;
+                }
+                let len = u16::from_be_bytes([buf[cur], buf[cur + 1]]) as usize;
+                cur += 2 + len;
+            }
+            // MPEG program end.
+            0xB9 => break,
+            _ => {
+                if cur + 2 > buf.len() {
+                    return None;
+                }
+                let len = u16::from_be_bytes([buf[cur], buf[cur + 1]]) as usize;
+                cur += 2 + len;
+            }
+        }
+    }
     None
+}
+
+/// Strip the PES header of an MPEG-1 or MPEG-2 PES packet body, returning
+/// a slice starting at the payload byte (the DVD substream-id byte for
+/// private_stream_1).
+fn parse_pes_body(pes: &[u8]) -> Option<&[u8]> {
+    if pes.is_empty() {
+        return None;
+    }
+    // MPEG-2 PES: starts with 0b10xxxxxx. Header format:
+    //   flags1 (1) | flags2 (1) | hdr_data_len (1) | hdr_data (...).
+    if (pes[0] & 0xC0) == 0x80 {
+        if pes.len() < 3 {
+            return None;
+        }
+        let hdr_len = pes[2] as usize;
+        let start = 3 + hdr_len;
+        if start > pes.len() {
+            return None;
+        }
+        return Some(&pes[start..]);
+    }
+    // MPEG-1 PES: leading stuffing (0xFF) up to 16 bytes, then optional
+    // STD buffer size (2 bytes, first byte & 0xC0 == 0x40), then
+    // optional PTS/DTS (flags 0x20/0x30/0x10 leading bits).
+    let mut i = 0usize;
+    while i < pes.len() && i < 16 && pes[i] == 0xFF {
+        i += 1;
+    }
+    if i >= pes.len() {
+        return None;
+    }
+    if (pes[i] & 0xC0) == 0x40 {
+        i += 2;
+    }
+    if i >= pes.len() {
+        return None;
+    }
+    let b = pes[i];
+    if (b & 0xF0) == 0x20 {
+        i += 5;
+    } else if (b & 0xF0) == 0x30 {
+        i += 10;
+    } else if b == 0x0F {
+        i += 1;
+    }
+    if i > pes.len() {
+        return None;
+    }
+    Some(&pes[i..])
 }
 
 struct VobSubDemuxer {
@@ -932,5 +1085,37 @@ timestamp: 00:00:03:000, filepos: 000000040
         for px in data.chunks(4) {
             assert_eq!(px, &[255, 0, 0, 255], "pixel not red: {:?}", px);
         }
+    }
+
+    #[test]
+    fn extracts_spu_from_raw() {
+        let raw = build_demo_spu(2, 2, &[1u8, 1, 1, 1]);
+        let out = extract_spu(&raw).unwrap();
+        assert_eq!(out, raw);
+    }
+
+    #[test]
+    fn extracts_spu_from_mpeg_ps_wrap() {
+        // Build one SPU, wrap it into a minimal MPEG-2 PS with pack +
+        // one private_stream_1 PES packet carrying the DVD substream id.
+        let spu = build_demo_spu(2, 2, &[1u8, 1, 1, 1]);
+        let mut ps = Vec::new();
+        // Pack header (MPEG-2): 0x000001BA, 10 bytes incl. 0 stuffing.
+        ps.extend_from_slice(&[0, 0, 1, 0xBA]);
+        // byte 0 starts with 01 → MPEG-2 marker
+        ps.extend_from_slice(&[0x44, 0x00, 0x04, 0x00, 0x04, 0x01, 0x00, 0x00, 0x00, 0xF8]);
+        // Private stream 1 PES: start code + 2-byte length + PES hdr +
+        // substream id (0x20) + SPU payload.
+        let substream = 0x20u8;
+        let pes_payload_len = 3 + 1 + spu.len(); // flags(2) + hdr_len(1) + substream + spu
+        ps.extend_from_slice(&[0, 0, 1, 0xBD]);
+        ps.extend_from_slice(&(pes_payload_len as u16).to_be_bytes());
+        // Minimal MPEG-2 PES header: 0x80, 0x00, 0x00 (no PTS/DTS, 0 hdr data).
+        ps.extend_from_slice(&[0x80, 0x00, 0x00]);
+        ps.push(substream);
+        ps.extend_from_slice(&spu);
+
+        let out = extract_spu(&ps).unwrap();
+        assert_eq!(out, spu);
     }
 }
