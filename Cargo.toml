@@ -1,24 +1,24 @@
 [package]
 name = "oxideav-sub-image"
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
-repository.workspace = true
-authors.workspace = true
+version = "0.0.3"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+repository = "https://github.com/OxideAV/oxideav-sub-image"
+authors = ["Mark Karpeles"]
 description = "Pure-Rust bitmap-subtitle decoders: PGS (.sup Blu-ray), DVB subtitles, VobSub (.idx/.sub)"
 
 readme = "README.md"
-homepage.workspace = true
+homepage = "https://github.com/OxideAV/oxideav-sub-image"
 keywords = ["multimedia", "subtitle", "image", "dvdsub", "pgs"]
 categories = ["multimedia", "parser-implementations"]
 
 [dependencies]
-oxideav-core = { workspace = true }
-oxideav-codec = { workspace = true }
-oxideav-container = { workspace = true }
+oxideav-core = "0.0"
+oxideav-codec = "0.0"
+oxideav-container = "0.0"
 
 [dev-dependencies]
-oxideav-core = { workspace = true }
-oxideav-codec = { workspace = true }
-oxideav-container = { workspace = true }
+oxideav-core = "0.0"
+oxideav-codec = "0.0"
+oxideav-container = "0.0"

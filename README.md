@@ -10,9 +10,9 @@ wrappers, no `*-sys` crates.
 
 ```toml
 [dependencies]
-oxideav-sub-image = "0.0.1"
+oxideav-sub-image = "0.0"
 ```
 
 ## License
 
-MIT — see [LICENSE](https://github.com/OxideAV/oxideav-workspace/blob/master/LICENSE).
+MIT — see [LICENSE](LICENSE).
