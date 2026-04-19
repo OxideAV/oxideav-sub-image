@@ -33,7 +33,7 @@ pub mod dvbsub;
 pub mod pgs;
 pub mod vobsub;
 
-use oxideav_codec::CodecRegistry;
+use oxideav_codec::{CodecInfo, CodecRegistry};
 use oxideav_container::ContainerRegistry;
 use oxideav_core::{CodecCapabilities, CodecId, MediaType};
 
@@ -78,7 +78,11 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
             VOBSUB_CODEC_ID => vobsub::make_decoder,
             _ => unreachable!(),
         };
-        reg.register_decoder_impl(CodecId::new(id), caps, factory);
+        reg.register(
+            CodecInfo::new(CodecId::new(id))
+                .capabilities(caps)
+                .decoder(factory),
+        );
     }
 
     // PGS encoder. The other two formats are decode-only for now: DVB
@@ -101,7 +105,11 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
         priority: 100,
         accepted_pixel_formats: vec![oxideav_core::PixelFormat::Rgba],
     };
-    reg.register_encoder_impl(CodecId::new(PGS_CODEC_ID), pgs_enc_caps, pgs::make_encoder);
+    reg.register(
+        CodecInfo::new(CodecId::new(PGS_CODEC_ID))
+            .capabilities(pgs_enc_caps)
+            .encoder(pgs::make_encoder),
+    );
 }
 
 /// Register the PGS (`.sup`) and VobSub (`.idx`+`.sub`) containers.
