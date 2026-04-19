@@ -22,8 +22,8 @@ framework but usable standalone. Zero C dependencies.
 
 ```toml
 [dependencies]
-oxideav-core = "0.0"
-oxideav-codec = "0.0"
+oxideav-core = "0.1"
+oxideav-codec = "0.1"
 oxideav-container = "0.0"
 oxideav-sub-image = "0.0"
 ```
