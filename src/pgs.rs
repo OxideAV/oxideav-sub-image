@@ -48,8 +48,8 @@ use std::io::{Read, SeekFrom};
 use oxideav_codec::{Decoder, Encoder};
 use oxideav_container::{ContainerRegistry, Demuxer, ProbeData, ProbeScore, ReadSeek};
 use oxideav_core::{
-    CodecId, CodecParameters, Error, Frame, MediaType, Packet, PixelFormat, Result, StreamInfo,
-    TimeBase, VideoFrame, VideoPlane,
+    CodecId, CodecParameters, CodecResolver, Error, Frame, MediaType, Packet, PixelFormat, Result,
+    StreamInfo, TimeBase, VideoFrame, VideoPlane,
 };
 
 use crate::PGS_CODEC_ID;
@@ -485,7 +485,7 @@ fn probe_pgs(p: &ProbeData) -> ProbeScore {
     }
 }
 
-fn open_pgs(mut input: Box<dyn ReadSeek>) -> Result<Box<dyn Demuxer>> {
+fn open_pgs(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box<dyn Demuxer>> {
     let mut buf = Vec::new();
     input.seek(SeekFrom::Start(0))?;
     input.read_to_end(&mut buf)?;

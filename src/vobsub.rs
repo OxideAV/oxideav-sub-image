@@ -56,8 +56,8 @@ use std::path::{Path, PathBuf};
 use oxideav_codec::Decoder;
 use oxideav_container::{ContainerRegistry, Demuxer, ProbeData, ProbeScore, ReadSeek};
 use oxideav_core::{
-    CodecId, CodecParameters, Error, Frame, MediaType, Packet, PixelFormat, Result, StreamInfo,
-    TimeBase, VideoFrame, VideoPlane,
+    CodecId, CodecParameters, CodecResolver, Error, Frame, MediaType, Packet, PixelFormat, Result,
+    StreamInfo, TimeBase, VideoFrame, VideoPlane,
 };
 
 use crate::VOBSUB_CODEC_ID;
@@ -446,7 +446,10 @@ fn probe_vobsub(p: &ProbeData) -> ProbeScore {
     }
 }
 
-fn open_vobsub(mut input: Box<dyn ReadSeek>) -> Result<Box<dyn Demuxer>> {
+fn open_vobsub(
+    mut input: Box<dyn ReadSeek>,
+    _codecs: &dyn CodecResolver,
+) -> Result<Box<dyn Demuxer>> {
     // We assume the input is the `.idx` file (text). We read it and then
     // look for the matching `.sub` alongside by filename. Since the
     // `ReadSeek` trait doesn't expose a path, the only source we can
