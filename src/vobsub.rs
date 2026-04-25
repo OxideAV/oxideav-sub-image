@@ -53,12 +53,12 @@ use std::collections::VecDeque;
 use std::io::{Read, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use oxideav_codec::Decoder;
-use oxideav_container::{ContainerRegistry, Demuxer, ProbeData, ProbeScore, ReadSeek};
+use oxideav_core::Decoder;
 use oxideav_core::{
     CodecId, CodecParameters, CodecResolver, Error, Frame, MediaType, Packet, PixelFormat, Result,
     StreamInfo, TimeBase, VideoFrame, VideoPlane,
 };
+use oxideav_core::{ContainerRegistry, Demuxer, ProbeData, ProbeScore, ReadSeek};
 
 use crate::VOBSUB_CODEC_ID;
 

@@ -45,12 +45,12 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, SeekFrom};
 
-use oxideav_codec::{Decoder, Encoder};
-use oxideav_container::{ContainerRegistry, Demuxer, ProbeData, ProbeScore, ReadSeek};
 use oxideav_core::{
     CodecId, CodecParameters, CodecResolver, Error, Frame, MediaType, Packet, PixelFormat, Result,
     StreamInfo, TimeBase, VideoFrame, VideoPlane,
 };
+use oxideav_core::{ContainerRegistry, Demuxer, ProbeData, ProbeScore, ReadSeek};
+use oxideav_core::{Decoder, Encoder};
 
 use crate::PGS_CODEC_ID;
 

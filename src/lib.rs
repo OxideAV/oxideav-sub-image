@@ -33,9 +33,9 @@ pub mod dvbsub;
 pub mod pgs;
 pub mod vobsub;
 
-use oxideav_codec::{CodecInfo, CodecRegistry};
-use oxideav_container::ContainerRegistry;
+use oxideav_core::ContainerRegistry;
 use oxideav_core::{CodecCapabilities, CodecId, MediaType};
+use oxideav_core::{CodecInfo, CodecRegistry};
 
 /// Codec id for PGS / HDMV / Blu-ray `.sup` streams.
 pub const PGS_CODEC_ID: &str = "pgs";
