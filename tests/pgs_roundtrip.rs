@@ -18,12 +18,9 @@ fn make_rgba_frame(width: u32, height: u32, pixels: &[[u8; 4]]) -> VideoFrame {
     for px in pixels {
         data.extend_from_slice(px);
     }
+    let _ = height;
     VideoFrame {
-        format: PixelFormat::Rgba,
-        width,
-        height,
         pts: Some(0),
-        time_base: TimeBase::new(1, 90_000),
         planes: vec![VideoPlane {
             stride: (width as usize) * 4,
             data,
@@ -57,9 +54,7 @@ fn small_palette_roundtrip() {
     let Frame::Video(v) = decoded else {
         panic!("expected video frame");
     };
-    assert_eq!(v.width, 2);
-    assert_eq!(v.height, 2);
-    assert_eq!(v.format, PixelFormat::Rgba);
+    assert_eq!(v.planes[0].stride, 2 * 4);
 
     let d = &v.planes[0].data;
     assert_eq!(d.len(), 2 * 2 * 4);
@@ -128,8 +123,7 @@ fn lossy_fallback_for_wide_palette() {
     let Frame::Video(v) = dec.receive_frame().unwrap() else {
         panic!("expected video frame");
     };
-    assert_eq!(v.width, w);
-    assert_eq!(v.height, h);
+    assert_eq!(v.planes[0].stride, (w * 4) as usize);
     assert_eq!(v.planes[0].data.len(), (w * h * 4) as usize);
     // Every output pixel must carry a non-zero alpha (original alpha was
     // 255 everywhere) so the quantiser didn't accidentally drop the
@@ -151,11 +145,9 @@ fn lossy_fallback_for_wide_palette() {
 #[test]
 fn pts_is_rescaled_to_90khz() {
     let frame = VideoFrame {
-        format: PixelFormat::Rgba,
-        width: 2,
-        height: 2,
-        pts: Some(1000), // 1 ms at 1/1_000_000 → 90 ticks at 1/90_000
-        time_base: TimeBase::new(1, 1_000_000),
+        // PTS interpreted as microseconds — the canonical input timebase
+        // post-slim VideoFrame. 1000 µs → 90 ticks at the 90 kHz PGS clock.
+        pts: Some(1000),
         planes: vec![VideoPlane {
             stride: 8,
             data: vec![0u8; 16],

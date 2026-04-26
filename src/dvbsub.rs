@@ -32,7 +32,7 @@ use std::collections::{HashMap, VecDeque};
 
 use oxideav_core::Decoder;
 use oxideav_core::{
-    CodecId, CodecParameters, Error, Frame, Packet, PixelFormat, Result, VideoFrame, VideoPlane,
+    CodecId, CodecParameters, Error, Frame, Packet, Result, VideoFrame, VideoPlane,
 };
 
 use crate::DVBSUB_CODEC_ID;
@@ -715,11 +715,7 @@ impl Decoder for DvbSubDecoder {
         }
 
         let frame = VideoFrame {
-            format: PixelFormat::Rgba,
-            width: width as u32,
-            height: height as u32,
             pts: packet.pts,
-            time_base: packet.time_base,
             planes: vec![VideoPlane {
                 stride: width * 4,
                 data: canvas,
@@ -903,9 +899,7 @@ mod tests {
         let Frame::Video(v) = frame else {
             panic!("expected video frame");
         };
-        assert_eq!(v.width, 2);
-        assert_eq!(v.height, 2);
-        assert_eq!(v.format, PixelFormat::Rgba);
+        assert_eq!(v.planes[0].stride, 2 * 4);
         assert_eq!(v.planes[0].data.len(), 2 * 2 * 4);
         // Row 0: white, red.
         let r0c0 = &v.planes[0].data[0..4];

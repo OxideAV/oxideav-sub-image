@@ -815,11 +815,7 @@ impl Decoder for VobSubDecoder {
             canvas[dst + 3] = alpha;
         }
         let frame = VideoFrame {
-            format: PixelFormat::Rgba,
-            width: w as u32,
-            height: h as u32,
             pts: packet.pts,
-            time_base: packet.time_base,
             planes: vec![VideoPlane {
                 stride: (w as usize) * 4,
                 data: canvas,
@@ -1081,8 +1077,8 @@ timestamp: 00:00:03:000, filepos: 000000040
         let Frame::Video(v) = frame else {
             panic!("expected video frame");
         };
-        assert_eq!(v.width, 2);
-        assert_eq!(v.height, 2);
+        assert_eq!(v.planes[0].stride, 2 * 4);
+        assert_eq!(v.planes[0].data.len(), 2 * 2 * 4);
         let data = &v.planes[0].data;
         // All pixels red + alpha 255.
         for px in data.chunks(4) {

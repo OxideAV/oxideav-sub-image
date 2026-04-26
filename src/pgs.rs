@@ -620,14 +620,11 @@ impl Decoder for PgsDecoder {
         let rendered = ds
             .render()?
             .unwrap_or_else(|| vec![0u8; (width as usize) * (height as usize) * 4]);
+        let _ = (width, height);
         let frame = VideoFrame {
-            format: PixelFormat::Rgba,
-            width,
-            height,
             pts: packet.pts,
-            time_base: packet.time_base,
             planes: vec![VideoPlane {
-                stride: (width as usize) * 4,
+                stride: (pcs.width as usize) * 4,
                 data: rendered,
             }],
         };
@@ -706,27 +703,39 @@ impl Encoder for PgsEncoder {
                 "PGS encoder only accepts Frame::Video input",
             ));
         };
-        if v.format != PixelFormat::Rgba {
-            return Err(Error::unsupported(format!(
-                "PGS encoder only accepts RGBA, got {:?}",
-                v.format
-            )));
+        // Pixel format is now stream-level — RGBA is asserted at the
+        // CodecParameters layer upstream. Derive (width, height) from
+        // the first plane: RGBA stride is `width * 4`.
+        if v.planes.is_empty() {
+            return Err(Error::invalid("PGS encoder: frame has no plane"));
         }
-        if v.width == 0 || v.height == 0 {
+        let plane = &v.planes[0];
+        if plane.stride == 0 || plane.stride % 4 != 0 {
+            return Err(Error::invalid(
+                "PGS encoder: RGBA plane stride must be a positive multiple of 4",
+            ));
+        }
+        let width = (plane.stride / 4) as u32;
+        let height = if width == 0 {
+            0
+        } else {
+            (plane.data.len() / plane.stride) as u32
+        };
+        if width == 0 || height == 0 {
             return Err(Error::invalid("PGS encoder: zero-sized frame"));
         }
         if self.params.width.is_none() {
-            self.params.width = Some(v.width);
-            self.params.height = Some(v.height);
+            self.params.width = Some(width);
+            self.params.height = Some(height);
         }
 
-        let (indices, palette_rgba) = quantise_rgba(v)?;
+        let (indices, palette_rgba) = quantise_rgba(v, width, height)?;
         let composition_number = self.composition_number;
         self.composition_number = self.composition_number.wrapping_add(1);
         let pts_90k = frame_pts_90k(v).unwrap_or(0);
         let bytes = encode_display_set(
-            v.width as u16,
-            v.height as u16,
+            width as u16,
+            height as u16,
             composition_number,
             pts_90k,
             &palette_rgba,
@@ -750,8 +759,11 @@ impl Encoder for PgsEncoder {
 }
 
 fn frame_pts_90k(v: &VideoFrame) -> Option<u32> {
+    // VideoFrame no longer carries a time_base. Treat the incoming pts as
+    // microseconds (the canonical subtitle pts unit) and rescale to the
+    // 90 kHz PGS clock.
     let pts = v.pts?;
-    let scaled = v.time_base.rescale(pts, TimeBase::new(1, 90_000));
+    let scaled = TimeBase::new(1, 1_000_000).rescale(pts, TimeBase::new(1, 90_000));
     if scaled < 0 {
         Some(0)
     } else {
@@ -762,13 +774,13 @@ fn frame_pts_90k(v: &VideoFrame) -> Option<u32> {
 /// Walk an RGBA frame and produce an indexed-colour buffer + palette.
 /// Index 0 is always fully-transparent black (so any (_, _, _, 0) source
 /// pixel collapses to index 0 regardless of colour channels).
-fn quantise_rgba(v: &VideoFrame) -> Result<(Vec<u8>, Vec<[u8; 4]>)> {
+fn quantise_rgba(v: &VideoFrame, width: u32, height: u32) -> Result<(Vec<u8>, Vec<[u8; 4]>)> {
     if v.planes.is_empty() {
         return Err(Error::invalid("PGS encoder: RGBA frame has no plane"));
     }
     let plane = &v.planes[0];
-    let width = v.width as usize;
-    let height = v.height as usize;
+    let width = width as usize;
+    let height = height as usize;
     let needed = width * 4;
     if plane.stride < needed {
         return Err(Error::invalid("PGS encoder: RGBA stride too small"));
@@ -805,17 +817,17 @@ fn quantise_rgba(v: &VideoFrame) -> Result<(Vec<u8>, Vec<[u8; 4]>)> {
     }
 
     if quantise_harder {
-        return quantise_rgba_332(v);
+        return quantise_rgba_332(v, width as u32, height as u32);
     }
     Ok((indices, palette))
 }
 
 /// Fallback quantisation: bucket R/G/B to 3/3/2 bits and A to 2 bits.
 /// Yields up to 256 distinct indices; index 0 is fully-transparent.
-fn quantise_rgba_332(v: &VideoFrame) -> Result<(Vec<u8>, Vec<[u8; 4]>)> {
+fn quantise_rgba_332(v: &VideoFrame, width: u32, height: u32) -> Result<(Vec<u8>, Vec<[u8; 4]>)> {
     let plane = &v.planes[0];
-    let width = v.width as usize;
-    let height = v.height as usize;
+    let width = width as usize;
+    let height = height as usize;
     let needed = width * 4;
     if plane.stride < needed {
         return Err(Error::invalid("PGS encoder: RGBA stride too small"));
@@ -1209,9 +1221,7 @@ mod tests {
         let Frame::Video(v) = frame else {
             panic!("expected video frame");
         };
-        assert_eq!(v.width, 2);
-        assert_eq!(v.height, 2);
-        assert_eq!(v.format, PixelFormat::Rgba);
+        assert_eq!(v.planes[0].stride, 2 * 4);
         let data = &v.planes[0].data;
         assert_eq!(data.len(), 2 * 2 * 4);
         // Row 0: red, red — the YCbCr round-trip is approximate, so
