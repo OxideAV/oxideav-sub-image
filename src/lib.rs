@@ -34,6 +34,7 @@ pub mod pgs;
 pub mod vobsub;
 
 use oxideav_core::ContainerRegistry;
+use oxideav_core::RuntimeContext;
 use oxideav_core::{CodecCapabilities, CodecId, MediaType};
 use oxideav_core::{CodecInfo, CodecRegistry};
 
@@ -122,8 +123,35 @@ pub fn register_containers(reg: &mut ContainerRegistry) {
     vobsub::register_container(reg);
 }
 
-/// Convenience combined registration, mirroring `oxideav_webp::register`.
-pub fn register(codecs: &mut CodecRegistry, containers: &mut ContainerRegistry) {
-    register_codecs(codecs);
-    register_containers(containers);
+/// Unified registration entry point — installs PGS / DVB / VobSub
+/// codecs into the codec sub-registry and the PGS + VobSub containers
+/// into the container sub-registry of the supplied [`RuntimeContext`].
+pub fn register(ctx: &mut RuntimeContext) {
+    register_codecs(&mut ctx.codecs);
+    register_containers(&mut ctx.containers);
+}
+
+#[cfg(test)]
+mod register_tests {
+    use super::*;
+
+    #[test]
+    fn register_via_runtime_context_installs_both_sides() {
+        let mut ctx = RuntimeContext::new();
+        register(&mut ctx);
+        let id = CodecId::new(PGS_CODEC_ID);
+        assert!(
+            ctx.codecs.has_decoder(&id),
+            "PGS decoder factory not installed via RuntimeContext"
+        );
+        assert!(
+            ctx.codecs.has_encoder(&id),
+            "PGS encoder factory not installed via RuntimeContext"
+        );
+        assert_eq!(
+            ctx.containers.container_for_extension("sup"),
+            Some("pgs"),
+            "PGS container extension not installed via RuntimeContext"
+        );
+    }
 }
