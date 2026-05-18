@@ -48,8 +48,13 @@ pub const VOBSUB_CODEC_ID: &str = "vobsub";
 /// Register decoders for PGS, DVB subtitles, and VobSub.
 ///
 /// Media type is `Subtitle` even though the emitted frames are
-/// `Frame::Video(Rgba)`. That matches ffmpeg's convention: the stream's
-/// media kind is `Subtitle`, but the codec emits bitmap pictures.
+/// `Frame::Video(Rgba)` — bitmap-subtitle codecs are subtitle
+/// streams at the container level but produce pre-rendered RGBA
+/// pictures (PGS, DVB subtitles, and VobSub all decode to bitmap
+/// frames per their respective specs). The `Subtitle` media-kind
+/// tag is the conventional way to surface this dual nature to
+/// downstream consumers (player, mixer, file writer) so they route
+/// the stream to subtitle handling but receive video frames.
 pub fn register_codecs(reg: &mut CodecRegistry) {
     for (id, impl_name) in [
         (PGS_CODEC_ID, "pgs_sw"),
