@@ -679,6 +679,14 @@ impl Decoder for DvbSubDecoder {
             return Err(Error::invalid("DVB sub: zero canvas"));
         }
         let mut canvas = vec![0u8; width * height * 4];
+        // DVB page composition stacks regions and, within a region, the
+        // referenced objects. When two of those overlap and the topmost
+        // CLUT entry is only partially transparent, the correct result is
+        // the source colour blended *over* whatever is already on the
+        // canvas (Porter–Duff source-over), not a hard overwrite — so the
+        // blit runs through the shared alpha-aware compositor. Index 0 is
+        // the conventional DVB transparent background, mapped to alpha 0
+        // so it's skipped.
         for pr in &page {
             let Some(region) = regions.get(&pr.region_id) else {
                 continue;
@@ -690,27 +698,21 @@ impl Decoder for DvbSubDecoder {
                 };
                 let base_x = pr.x as usize + ro.x as usize;
                 let base_y = pr.y as usize + ro.y as usize;
-                for (row_idx, row) in obj.rows.iter().enumerate() {
-                    let dy = base_y + row_idx;
-                    if dy >= height {
-                        break;
-                    }
-                    for (col_idx, &px) in row.iter().enumerate() {
-                        let dx = base_x + col_idx;
-                        if dx >= width {
-                            break;
-                        }
+                crate::composite::blit_indexed(
+                    &mut canvas,
+                    width,
+                    height,
+                    &obj.rows,
+                    base_x,
+                    base_y,
+                    |px| {
                         if px == 0 {
-                            continue; // transparent background
+                            [0, 0, 0, 0]
+                        } else {
+                            clut.entries[px as usize]
                         }
-                        let rgba = clut.entries[px as usize];
-                        if rgba[3] == 0 {
-                            continue;
-                        }
-                        let dst = (dy * width + dx) * 4;
-                        canvas[dst..dst + 4].copy_from_slice(&rgba);
-                    }
-                }
+                    },
+                );
             }
         }
 

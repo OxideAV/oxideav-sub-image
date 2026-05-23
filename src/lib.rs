@@ -29,6 +29,7 @@
 //!
 //! See per-module docs for format-specific limitations.
 
+pub mod composite;
 pub mod dvbsub;
 pub mod pgs;
 pub mod vobsub;

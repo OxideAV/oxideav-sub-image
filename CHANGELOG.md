@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `composite` module with a Porter–Duff source-over (`over`) primitive
+  and an alpha-aware `blit_indexed` helper. Overlapping subtitle objects
+  whose topmost pixel is partially transparent now blend over earlier
+  canvas content instead of hard-overwriting it. PGS and DVB-subtitle
+  render paths route their blits through the shared compositor.
+
 ## [0.0.6](https://github.com/OxideAV/oxideav-sub-image/compare/v0.0.5...v0.0.6) - 2026-05-06
 
 ### Other

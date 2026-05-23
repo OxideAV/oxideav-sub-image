@@ -15,6 +15,14 @@ frame per display-set. The stream's media kind is `Subtitle` even though
 the frame kind is `Video`, matching ffmpeg's convention for bitmap-based
 subtitle codecs.
 
+When a display-set stacks overlapping objects (multiple PGS composition
+objects, multiple DVB regions/objects) and the topmost pixel is only
+partially transparent, the painted source is alpha-composited *over* the
+existing canvas content using the Porter–Duff source-over operator
+(`composite::over` / `composite::blit_indexed`), rather than hard-copying
+and discarding what's underneath. Fully-opaque and fully-transparent
+pixels short-circuit to a plain copy / no-op.
+
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone. Zero C dependencies.
 

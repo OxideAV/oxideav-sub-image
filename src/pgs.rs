@@ -440,25 +440,18 @@ impl DisplaySet {
             let oy = co.y as usize;
             let ow = obj.width as usize;
             let oh = obj.height as usize;
-            for row in 0..oh {
-                let dy = oy + row;
-                if dy >= height {
-                    break;
-                }
-                for col in 0..ow {
-                    let dx = ox + col;
-                    if dx >= width {
-                        break;
-                    }
-                    let idx = obj.pixels[row * ow + col] as usize;
-                    let rgba = self.palette.entries[idx];
-                    if rgba[3] == 0 {
-                        continue;
-                    }
-                    let dst = (dy * width + dx) * 4;
-                    canvas[dst..dst + 4].copy_from_slice(&rgba);
-                }
-            }
+            // Composition objects can overlap; when the topmost palette
+            // entry is partially transparent the source blends *over*
+            // whatever earlier object already painted, rather than
+            // overwriting it (Porter–Duff source-over). Build the object
+            // as rows of palette indices and run the shared compositor.
+            let rows: Vec<Vec<u8>> = (0..oh)
+                .map(|row| obj.pixels[row * ow..row * ow + ow].to_vec())
+                .collect();
+            let palette = &self.palette;
+            crate::composite::blit_indexed(&mut canvas, width, height, &rows, ox, oy, |idx| {
+                palette.entries[idx as usize]
+            });
         }
         Ok(Some(canvas))
     }
