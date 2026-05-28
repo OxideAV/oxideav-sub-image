@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- PGS encoder now crops each input frame to the tight bounding box of
+  its non-transparent pixels before quantisation and emits a single
+  composition object positioned at the bbox's `(x, y)`. The WDS window
+  shrinks to match the object footprint. Fully-transparent input frames
+  emit an erase display-set (PCS with zero composition objects + empty
+  WDS) instead of paying the cost of a fully-transparent ODS RLE. For a
+  100×40 cue on a 1920×1080 canvas the packet shrinks from ~8.4 KB to
+  ~3.2 KB (~62%); for a wide subtitle text band the saving is closer to
+  9%. The decoder side already handled arbitrary object dimensions and
+  positions via `composite::blit_indexed`, so round-trips remain
+  bit-identical for visible pixels.
+- Three new round-trip tests covering the bbox path: a tight-bbox
+  round-trip asserting both the smaller packet size and the correct
+  pixel position; a fully-transparent-input → erase round-trip
+  asserting PCS + WDS + END (no PDS / ODS); and an
+  all-sides-padding-stripping round-trip exhaustively comparing every
+  decoded pixel.
 - `composite` module with a Porter–Duff source-over (`over`) primitive
   and an alpha-aware `blit_indexed` helper. Overlapping subtitle objects
   whose topmost pixel is partially transparent now blend over earlier

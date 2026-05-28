@@ -159,3 +159,157 @@ fn pts_is_rescaled_to_90khz() {
     assert_eq!(packet.pts, Some(90));
     assert_eq!(packet.time_base, TimeBase::new(1, 90_000));
 }
+
+/// The encoder crops to the tight bbox of non-transparent pixels: a
+/// large canvas with a small visible cue near the bottom encodes to
+/// noticeably fewer bytes than a full-canvas variant of the same shape
+/// (every transparent row would otherwise need an RLE end-of-line run).
+/// The decoded RGBA frame still has full-canvas dimensions and the cue
+/// lands at the correct position.
+#[test]
+fn tight_bbox_shrinks_encoded_size_and_decodes_at_offset() {
+    let w = 64u32;
+    let h = 64u32;
+    // Canvas is mostly transparent. A 4×3 opaque block lives at
+    // (40, 50). Everywhere else is alpha 0.
+    let bx = 40usize;
+    let by = 50usize;
+    let bw = 4usize;
+    let bh = 3usize;
+    let mut pixels = vec![[0u8, 0, 0, 0]; (w * h) as usize];
+    for r in 0..bh {
+        for c in 0..bw {
+            let idx = (by + r) * w as usize + (bx + c);
+            pixels[idx] = [200, 50, 25, 255];
+        }
+    }
+    let frame = make_rgba_frame(w, h, &pixels);
+
+    let mut enc = pgs::make_encoder(&codec_params()).unwrap();
+    enc.send_frame(&Frame::Video(frame)).unwrap();
+    let pkt = enc.receive_packet().unwrap();
+
+    // Full-canvas equivalent would carry 64 rows of RLE plus end-of-line
+    // markers; the bbox version only carries 3 rows. The exact saving
+    // depends on the RLE format but the bytewise inequality is a stable
+    // floor.
+    assert!(
+        pkt.data.len() < 200,
+        "tight-bbox packet unexpectedly large: {} bytes",
+        pkt.data.len()
+    );
+
+    // Round-trip — decoded canvas keeps full size and only the bbox is
+    // non-transparent.
+    let mut dec = pgs::make_decoder(&codec_params()).unwrap();
+    dec.send_packet(&pkt).unwrap();
+    let Frame::Video(v) = dec.receive_frame().unwrap() else {
+        panic!("expected video frame");
+    };
+    assert_eq!(v.planes[0].stride, (w * 4) as usize);
+    assert_eq!(v.planes[0].data.len(), (w * h * 4) as usize);
+    let d = &v.planes[0].data;
+    // Pixel outside the bbox is fully-transparent.
+    let outside = ((10u32) * w + 10) as usize * 4;
+    assert_eq!(&d[outside..outside + 4], &[0, 0, 0, 0]);
+    // Pixel inside the bbox carries the red-dominated quantised colour.
+    let inside = ((by as u32) * w + bx as u32) as usize * 4;
+    assert!(
+        d[inside] > 150 && d[inside + 3] == 255,
+        "expected red+opaque at bbox origin, got {:?}",
+        &d[inside..inside + 4]
+    );
+    // Just outside the bbox to the east (within the same row) is also
+    // transparent, confirming the encoder didn't smear.
+    let east = ((by as u32) * w + (bx + bw) as u32) as usize * 4;
+    assert_eq!(&d[east..east + 4], &[0, 0, 0, 0]);
+}
+
+/// A fully-transparent input frame emits an erase display-set (PCS
+/// with zero composition objects) and decodes to a fully-transparent
+/// canvas at the canvas dimensions.
+#[test]
+fn fully_transparent_frame_emits_erase() {
+    let w = 16u32;
+    let h = 8u32;
+    let pixels = vec![[0u8, 0, 0, 0]; (w * h) as usize];
+    let frame = make_rgba_frame(w, h, &pixels);
+
+    let mut enc = pgs::make_encoder(&codec_params()).unwrap();
+    enc.send_frame(&Frame::Video(frame)).unwrap();
+    let pkt = enc.receive_packet().unwrap();
+
+    // Erase = PCS + WDS + END only — no PDS, no ODS. Three "PG"
+    // segment headers (13 bytes each) plus body bytes.
+    let mut pg_count = 0;
+    for i in 0..pkt.data.len().saturating_sub(1) {
+        if &pkt.data[i..i + 2] == b"PG" {
+            pg_count += 1;
+        }
+    }
+    assert_eq!(
+        pg_count, 3,
+        "erase display-set must carry exactly PCS + WDS + END"
+    );
+
+    let mut dec = pgs::make_decoder(&codec_params()).unwrap();
+    dec.send_packet(&pkt).unwrap();
+    let Frame::Video(v) = dec.receive_frame().unwrap() else {
+        panic!("expected video frame");
+    };
+    assert_eq!(v.planes[0].stride, (w * 4) as usize);
+    assert_eq!(v.planes[0].data.len(), (w * h * 4) as usize);
+    for chunk in v.planes[0].data.chunks(4) {
+        assert_eq!(chunk, &[0, 0, 0, 0]);
+    }
+}
+
+/// Padding rows / columns on every side of an otherwise non-transparent
+/// region are stripped by the bbox detector: encoding then decoding
+/// reproduces the same pixels at the same coordinates.
+#[test]
+fn bbox_strips_padding_on_all_sides() {
+    let w = 8u32;
+    let h = 8u32;
+    let mut pixels = vec![[0u8, 0, 0, 0]; (w * h) as usize];
+    // 2×2 opaque square at (3, 3).
+    for r in 3..5 {
+        for c in 3..5 {
+            pixels[r * w as usize + c] = [0, 200, 0, 255];
+        }
+    }
+    let frame = make_rgba_frame(w, h, &pixels);
+    let mut enc = pgs::make_encoder(&codec_params()).unwrap();
+    enc.send_frame(&Frame::Video(frame)).unwrap();
+    let pkt = enc.receive_packet().unwrap();
+    let mut dec = pgs::make_decoder(&codec_params()).unwrap();
+    dec.send_packet(&pkt).unwrap();
+    let Frame::Video(v) = dec.receive_frame().unwrap() else {
+        panic!("expected video frame");
+    };
+    let d = &v.planes[0].data;
+    // Every pixel outside the 2×2 square is transparent.
+    for r in 0..h as usize {
+        for c in 0..w as usize {
+            let i = (r * w as usize + c) * 4;
+            if (3..5).contains(&r) && (3..5).contains(&c) {
+                assert!(
+                    d[i + 1] > 100 && d[i + 3] == 255,
+                    "expected opaque green at ({}, {}), got {:?}",
+                    r,
+                    c,
+                    &d[i..i + 4]
+                );
+            } else {
+                assert_eq!(
+                    &d[i..i + 4],
+                    &[0, 0, 0, 0],
+                    "expected transparent at ({}, {}), got {:?}",
+                    r,
+                    c,
+                    &d[i..i + 4]
+                );
+            }
+        }
+    }
+}

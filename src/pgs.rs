@@ -28,12 +28,15 @@
 //!
 //! ## Scope / limitations
 //!
-//! * Decode and encode supported. The encoder emits a single composition
-//!   object covering the full frame per input [`oxideav_core::VideoFrame`]
-//!   and quantises colour into a ≤ 255-entry palette (index 0 reserved
-//!   for transparent). When the frame has more than 255 distinct RGBA
-//!   colours the palette is built from a 3/3/2/2 (R/G/B/A) bucketed
-//!   reduction, nearest-matching any surplus colours.
+//! * Decode and encode supported. The encoder crops the input frame to
+//!   the tight bounding box of its non-transparent pixels and emits a
+//!   single composition object covering that sub-rectangle at the
+//!   bbox's `(x, y)`. Colour is quantised into a ≤ 255-entry palette
+//!   (index 0 reserved for transparent). When the cropped region has
+//!   more than 255 distinct RGBA colours the palette is built from a
+//!   3/3/2/2 (R/G/B/A) bucketed reduction, nearest-matching any
+//!   surplus colours. Fully-transparent input frames emit an erase
+//!   display-set (PCS carrying zero composition objects + empty WDS).
 //! * Objects referenced by a composition but not yet seen via ODS are
 //!   skipped silently — PGS allows carrying only palette/WDS updates.
 //! * ODS fragmentation is handled (an object carries `last_in_sequence`
@@ -722,18 +725,43 @@ impl Encoder for PgsEncoder {
             self.params.height = Some(height);
         }
 
-        let (indices, palette_rgba) = quantise_rgba(v, width, height)?;
         let composition_number = self.composition_number;
         self.composition_number = self.composition_number.wrapping_add(1);
         let pts_90k = frame_pts_90k(v).unwrap_or(0);
-        let bytes = encode_display_set(
-            width as u16,
-            height as u16,
-            composition_number,
-            pts_90k,
-            &palette_rgba,
-            &indices,
-        );
+
+        // Find the tight bounding box of non-transparent pixels. PGS
+        // structurally allows an object smaller than the canvas placed at
+        // an arbitrary (x, y); shrinking to the bbox lets a small visible
+        // region (a single line of subtitle text near the bottom of a
+        // 1920×1080 canvas, for example) be encoded as a small object
+        // rather than reserving an RLE run for every transparent row of
+        // the full frame.
+        let bbox = tight_bbox(v, width as usize, height as usize);
+        let bytes = match bbox {
+            None => {
+                // Fully transparent — emit an erase display-set (PCS with
+                // zero objects + empty WDS). The decoder maps this to a
+                // fully-transparent canvas, clearing whatever was shown
+                // previously.
+                encode_erase_display_set(width as u16, height as u16, composition_number, pts_90k)
+            }
+            Some((bx, by, bw, bh)) => {
+                let (indices, palette_rgba) =
+                    quantise_rgba_region(v, width as usize, bx, by, bw, bh)?;
+                encode_display_set(
+                    width as u16,
+                    height as u16,
+                    bx as u16,
+                    by as u16,
+                    bw as u16,
+                    bh as u16,
+                    composition_number,
+                    pts_90k,
+                    &palette_rgba,
+                    &indices,
+                )
+            }
+        };
         let mut packet = Packet::new(0, TimeBase::new(1, 90_000), bytes);
         packet.pts = Some(pts_90k as i64);
         packet.dts = Some(pts_90k as i64);
@@ -764,38 +792,104 @@ fn frame_pts_90k(v: &VideoFrame) -> Option<u32> {
     }
 }
 
-/// Walk an RGBA frame and produce an indexed-colour buffer + palette.
-/// Index 0 is always fully-transparent black (so any (_, _, _, 0) source
-/// pixel collapses to index 0 regardless of colour channels).
-fn quantise_rgba(v: &VideoFrame, width: u32, height: u32) -> Result<(Vec<u8>, Vec<[u8; 4]>)> {
+/// Find the smallest rectangle covering every pixel with non-zero alpha.
+///
+/// Returns `None` if the frame is fully transparent (alpha == 0 everywhere),
+/// otherwise `Some((x, y, width, height))` in pixel units. A zero-width
+/// or zero-height frame also returns `None`.
+fn tight_bbox(v: &VideoFrame, width: usize, height: usize) -> Option<(usize, usize, usize, usize)> {
+    if width == 0 || height == 0 || v.planes.is_empty() {
+        return None;
+    }
+    let plane = &v.planes[0];
+    let needed = width * 4;
+    if plane.stride < needed {
+        return None;
+    }
+    let mut min_x = width;
+    let mut max_x: isize = -1;
+    let mut min_y = height;
+    let mut max_y: isize = -1;
+    for row in 0..height {
+        let line = &plane.data[row * plane.stride..row * plane.stride + needed];
+        let mut row_has = false;
+        let mut row_min = width;
+        let mut row_max: isize = -1;
+        for col in 0..width {
+            if line[col * 4 + 3] != 0 {
+                if !row_has {
+                    row_min = col;
+                    row_has = true;
+                }
+                row_max = col as isize;
+            }
+        }
+        if row_has {
+            if (row as isize) < min_y as isize {
+                min_y = row;
+            }
+            if (row as isize) > max_y {
+                max_y = row as isize;
+            }
+            if row_min < min_x {
+                min_x = row_min;
+            }
+            if row_max > max_x {
+                max_x = row_max;
+            }
+        }
+    }
+    if max_x < 0 || max_y < 0 {
+        return None;
+    }
+    let bw = (max_x as usize - min_x) + 1;
+    let bh = (max_y as usize - min_y) + 1;
+    Some((min_x, min_y, bw, bh))
+}
+
+/// Walk an RGBA frame's sub-rectangle and produce a paired indexed-colour
+/// buffer and palette covering just that region. The caller supplies the
+/// full frame width (for stride) plus the bbox `(x, y, width, height)`.
+/// Index 0 is always fully-transparent black.
+fn quantise_rgba_region(
+    v: &VideoFrame,
+    frame_width: usize,
+    bx: usize,
+    by: usize,
+    bw: usize,
+    bh: usize,
+) -> Result<(Vec<u8>, Vec<[u8; 4]>)> {
     if v.planes.is_empty() {
         return Err(Error::invalid("PGS encoder: RGBA frame has no plane"));
     }
     let plane = &v.planes[0];
-    let width = width as usize;
-    let height = height as usize;
-    let needed = width * 4;
+    let needed = frame_width * 4;
     if plane.stride < needed {
         return Err(Error::invalid("PGS encoder: RGBA stride too small"));
+    }
+    if bx + bw > frame_width || by * plane.stride + needed > plane.data.len() {
+        return Err(Error::invalid("PGS encoder: bbox out of frame"));
     }
     let mut palette: Vec<[u8; 4]> = Vec::with_capacity(256);
     palette.push([0, 0, 0, 0]);
     let mut map: HashMap<[u8; 4], u8> = HashMap::new();
     map.insert([0, 0, 0, 0], 0);
 
-    let mut indices = vec![0u8; width * height];
+    let mut indices = vec![0u8; bw * bh];
     let mut quantise_harder = false;
-    'scan: for row in 0..height {
-        let line = &plane.data[row * plane.stride..row * plane.stride + needed];
-        for col in 0..width {
-            let px = &line[col * 4..col * 4 + 4];
+    'scan: for row in 0..bh {
+        let src_row = by + row;
+        let line = &plane.data[src_row * plane.stride..src_row * plane.stride + needed];
+        for col in 0..bw {
+            let src_col = bx + col;
+            let px = &line[src_col * 4..src_col * 4 + 4];
             let key = if px[3] == 0 {
                 [0, 0, 0, 0]
             } else {
                 [px[0], px[1], px[2], px[3]]
             };
             if let Some(&idx) = map.get(&key) {
-                indices[row * width + col] = idx;
+                indices[row * bw + col] = idx;
                 continue;
             }
             if palette.len() >= 255 {
@@ -805,37 +899,48 @@ fn quantise_rgba(v: &VideoFrame, width: u32, height: u32) -> Result<(Vec<u8>, Ve
             let idx = palette.len() as u8;
             palette.push(key);
             map.insert(key, idx);
-            indices[row * width + col] = idx;
+            indices[row * bw + col] = idx;
         }
     }
 
     if quantise_harder {
-        return quantise_rgba_332(v, width as u32, height as u32);
+        return quantise_rgba_332_region(v, frame_width, bx, by, bw, bh);
     }
     Ok((indices, palette))
 }
 
-/// Fallback quantisation: bucket R/G/B to 3/3/2 bits and A to 2 bits.
-/// Yields up to 256 distinct indices; index 0 is fully-transparent.
-fn quantise_rgba_332(v: &VideoFrame, width: u32, height: u32) -> Result<(Vec<u8>, Vec<[u8; 4]>)> {
+/// Fallback quantisation: bucket R/G/B to 3/3/2 bits and A to 2 bits over
+/// a sub-rectangle of the frame. Yields up to 256 distinct indices;
+/// index 0 is fully-transparent.
+fn quantise_rgba_332_region(
+    v: &VideoFrame,
+    frame_width: usize,
+    bx: usize,
+    by: usize,
+    bw: usize,
+    bh: usize,
+) -> Result<(Vec<u8>, Vec<[u8; 4]>)> {
     let plane = &v.planes[0];
-    let width = width as usize;
-    let height = height as usize;
-    let needed = width * 4;
+    let needed = frame_width * 4;
     if plane.stride < needed {
         return Err(Error::invalid("PGS encoder: RGBA stride too small"));
+    }
+    if bx + bw > frame_width {
+        return Err(Error::invalid("PGS encoder: bbox out of frame"));
     }
     let mut palette: Vec<[u8; 4]> = Vec::with_capacity(256);
     palette.push([0, 0, 0, 0]);
     let mut map: HashMap<[u8; 4], u8> = HashMap::new();
     map.insert([0, 0, 0, 0], 0);
-    let mut indices = vec![0u8; width * height];
-    for row in 0..height {
-        let line = &plane.data[row * plane.stride..row * plane.stride + needed];
-        for col in 0..width {
-            let px = &line[col * 4..col * 4 + 4];
+    let mut indices = vec![0u8; bw * bh];
+    for row in 0..bh {
+        let src_row = by + row;
+        let line = &plane.data[src_row * plane.stride..src_row * plane.stride + needed];
+        for col in 0..bw {
+            let src_col = bx + col;
+            let px = &line[src_col * 4..src_col * 4 + 4];
             if px[3] == 0 {
-                indices[row * width + col] = 0;
+                indices[row * bw + col] = 0;
                 continue;
             }
             let r = px[0] & 0xE0;
@@ -849,21 +954,24 @@ fn quantise_rgba_332(v: &VideoFrame, width: u32, height: u32) -> Result<(Vec<u8>
             };
             let key = [r, g, b, a];
             if let Some(&idx) = map.get(&key) {
-                indices[row * width + col] = idx;
+                indices[row * bw + col] = idx;
                 continue;
             }
             let idx = palette.len() as u8;
             palette.push(key);
             map.insert(key, idx);
-            indices[row * width + col] = idx;
+            indices[row * bw + col] = idx;
             if palette.len() == 256 {
                 // No room for a further colour — subsequent novel pixels
                 // snap to the nearest existing entry.
-                for row2 in row..height {
-                    let line2 = &plane.data[row2 * plane.stride..row2 * plane.stride + needed];
+                for row2 in row..bh {
+                    let src_row2 = by + row2;
+                    let line2 =
+                        &plane.data[src_row2 * plane.stride..src_row2 * plane.stride + needed];
                     let start_col = if row2 == row { col + 1 } else { 0 };
-                    for col2 in start_col..width {
-                        let px2 = &line2[col2 * 4..col2 * 4 + 4];
+                    for col2 in start_col..bw {
+                        let src_col2 = bx + col2;
+                        let px2 = &line2[src_col2 * 4..src_col2 * 4 + 4];
                         let key2 = if px2[3] == 0 {
                             [0, 0, 0, 0]
                         } else {
@@ -878,7 +986,7 @@ fn quantise_rgba_332(v: &VideoFrame, width: u32, height: u32) -> Result<(Vec<u8>
                             };
                             [r, g, b, a]
                         };
-                        indices[row2 * width + col2] = *map
+                        indices[row2 * bw + col2] = *map
                             .get(&key2)
                             .unwrap_or(&nearest_palette_entry(&palette, key2));
                     }
@@ -909,10 +1017,18 @@ fn nearest_palette_entry(palette: &[[u8; 4]], key: [u8; 4]) -> u8 {
 
 /// Encode an indexed bitmap + palette into a single PGS display-set
 /// byte-string (PCS + WDS + PDS + ODS + END, each with the shared
-/// "PG" segment header).
+/// "PG" segment header). The composition object sits at
+/// `(obj_x, obj_y)` on a `canvas_w × canvas_h` canvas and itself
+/// measures `obj_w × obj_h` pixels — `indices` must be `obj_w * obj_h`
+/// bytes long.
+#[allow(clippy::too_many_arguments)]
 fn encode_display_set(
-    width: u16,
-    height: u16,
+    canvas_w: u16,
+    canvas_h: u16,
+    obj_x: u16,
+    obj_y: u16,
+    obj_w: u16,
+    obj_h: u16,
     composition_number: u16,
     pts_90k: u32,
     palette: &[[u8; 4]],
@@ -922,8 +1038,8 @@ fn encode_display_set(
 
     // PCS.
     let mut pcs = Vec::new();
-    pcs.extend_from_slice(&width.to_be_bytes());
-    pcs.extend_from_slice(&height.to_be_bytes());
+    pcs.extend_from_slice(&canvas_w.to_be_bytes());
+    pcs.extend_from_slice(&canvas_h.to_be_bytes());
     pcs.push(0x10); // frame rate (ignored by decoders but conventional)
     pcs.extend_from_slice(&composition_number.to_be_bytes());
     pcs.push(0x80); // composition state: epoch-start
@@ -933,18 +1049,23 @@ fn encode_display_set(
     pcs.extend_from_slice(&1u16.to_be_bytes()); // object id
     pcs.push(0); // window id
     pcs.push(0); // flags (not cropped, not forced)
-    pcs.extend_from_slice(&0u16.to_be_bytes()); // x
-    pcs.extend_from_slice(&0u16.to_be_bytes()); // y
+    pcs.extend_from_slice(&obj_x.to_be_bytes()); // x
+    pcs.extend_from_slice(&obj_y.to_be_bytes()); // y
     push_segment(&mut out, pts_90k, SEG_PCS, &pcs);
 
-    // WDS.
+    // WDS — declare a single window matching the object's footprint.
+    // Decoders use this to scope the area that will be redrawn between
+    // display-sets; clamp to canvas if the object would overrun (a
+    // 1-pixel-wide object at canvas_w-1 still fits).
+    let win_w = obj_w.min(canvas_w.saturating_sub(obj_x));
+    let win_h = obj_h.min(canvas_h.saturating_sub(obj_y));
     let mut wds = Vec::new();
     wds.push(1); // one window
     wds.push(0); // window id
-    wds.extend_from_slice(&0u16.to_be_bytes()); // x
-    wds.extend_from_slice(&0u16.to_be_bytes()); // y
-    wds.extend_from_slice(&width.to_be_bytes());
-    wds.extend_from_slice(&height.to_be_bytes());
+    wds.extend_from_slice(&obj_x.to_be_bytes()); // x
+    wds.extend_from_slice(&obj_y.to_be_bytes()); // y
+    wds.extend_from_slice(&win_w.to_be_bytes());
+    wds.extend_from_slice(&win_h.to_be_bytes());
     push_segment(&mut out, pts_90k, SEG_WDS, &wds);
 
     // PDS.
@@ -975,7 +1096,7 @@ fn encode_display_set(
     push_segment(&mut out, pts_90k, SEG_PDS, &pds);
 
     // ODS — single fragment (0xC0 = first + last sequence).
-    let rle = encode_rle(indices, width as usize, height as usize);
+    let rle = encode_rle(indices, obj_w as usize, obj_h as usize);
     let mut ods = Vec::new();
     ods.extend_from_slice(&1u16.to_be_bytes()); // object id
     ods.push(0); // object version
@@ -984,10 +1105,46 @@ fn encode_display_set(
     ods.push(((obj_data_len >> 16) & 0xFF) as u8);
     ods.push(((obj_data_len >> 8) & 0xFF) as u8);
     ods.push((obj_data_len & 0xFF) as u8);
-    ods.extend_from_slice(&width.to_be_bytes());
-    ods.extend_from_slice(&height.to_be_bytes());
+    ods.extend_from_slice(&obj_w.to_be_bytes());
+    ods.extend_from_slice(&obj_h.to_be_bytes());
     ods.extend_from_slice(&rle);
     push_segment(&mut out, pts_90k, SEG_ODS, &ods);
+
+    // END.
+    push_segment(&mut out, pts_90k, SEG_END, &[]);
+
+    out
+}
+
+/// Encode an "erase" display-set — a PCS carrying zero composition
+/// objects, an empty WDS, and the END marker. This is the canonical
+/// representation of a fully-transparent frame (no objects to compose),
+/// and tells the decoder/player to clear whatever subtitle was on
+/// screen before.
+fn encode_erase_display_set(
+    canvas_w: u16,
+    canvas_h: u16,
+    composition_number: u16,
+    pts_90k: u32,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+
+    let mut pcs = Vec::new();
+    pcs.extend_from_slice(&canvas_w.to_be_bytes());
+    pcs.extend_from_slice(&canvas_h.to_be_bytes());
+    pcs.push(0x10); // frame rate
+    pcs.extend_from_slice(&composition_number.to_be_bytes());
+    pcs.push(0x80); // composition state: epoch-start (forces redraw)
+    pcs.push(0); // palette update flag
+    pcs.push(0); // palette id
+    pcs.push(0); // zero composition objects
+    push_segment(&mut out, pts_90k, SEG_PCS, &pcs);
+
+    // WDS — zero windows. The body byte count is one (the window-count
+    // field). An entirely empty body is rejected by `DisplaySet::push`,
+    // so always emit the count.
+    let wds = vec![0u8]; // zero windows
+    push_segment(&mut out, pts_90k, SEG_WDS, &wds);
 
     // END.
     push_segment(&mut out, pts_90k, SEG_END, &[]);

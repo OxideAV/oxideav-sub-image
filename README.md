@@ -86,13 +86,18 @@ let packet = enc.receive_packet()?;
 // packet.data is one complete PGS display-set (PCS + WDS + PDS + ODS + END).
 ```
 
-Each `send_frame` call produces one packet. The encoder quantises the
-frame's RGBA pixels into a ≤ 255-entry palette (index 0 is reserved
-for fully-transparent). When the input has more than 255 distinct RGBA
+Each `send_frame` call produces one packet. The encoder first finds the
+tight bounding box of the frame's non-transparent pixels and emits one
+composition object covering just that sub-rectangle at the bbox's
+`(x, y)`; the surrounding transparent area is not encoded. Colour is
+then quantised into a ≤ 255-entry palette (index 0 is reserved for
+fully-transparent). When the bbox has more than 255 distinct RGBA
 colours the encoder falls back to a 3/3/2/2 (R/G/B/A) bucketed
 reduction; otherwise the quantisation is lossless up to the BT.601
-RGB↔YCbCr round-trip PGS does in the palette. The composition always
-places a single object covering the full frame at `(0, 0)`.
+RGB↔YCbCr round-trip PGS does in the palette. A fully-transparent
+input frame emits an erase display-set (PCS with zero composition
+objects + empty WDS), which the decoder maps to a fully-transparent
+canvas — the canonical way to clear whatever was on screen before.
 
 ### Codec / container IDs
 
