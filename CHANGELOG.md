@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- PGS multi-fragment ODS reassembly is now exercised by tests. A real
+  PGS muxer splits any object whose data overruns the per-segment size
+  limit across several `object_data` segments using the
+  first/continuation/last sequence-flag bits, and the decoder must
+  concatenate the fragments before reading the object_data_length /
+  width / height header or the RLE. The single-segment demo builder
+  never produced that shape, so the `parse_ods_into` reassembly branch
+  was untested. New `build_demo_display_set_fragmented` test helper
+  (sharing one `demo_rle` encoder with the single-segment builder so the
+  two can't drift) splits the object payload across N segments at even
+  byte boundaries — including boundaries inside the 7-byte width/height
+  header. Tests assert: a 4×3 object fragmented into 2..=7 segments
+  decodes byte-identically to the single-segment form; a 1×1 object cut
+  into 32 one-byte fragments (first boundary inside object_data_length)
+  still reassembles; a first-without-last (incomplete) object is dropped
+  rather than rendered as a partial bitmap; plus an integration-level
+  round-trip through the public decoder confirming the helper is reachable.
 - PGS RLE codec property sweep: 1500 randomised encode→decode round-trips
   across varied widths (1..=31), heights (1..=17) and palette sizes
   (1..=12) confirm `decode_rle ∘ encode_rle == identity`; targeted sweeps
