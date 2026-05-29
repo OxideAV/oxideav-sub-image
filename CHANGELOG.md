@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/OxideAV/oxideav-sub-image/compare/v0.0.6...v0.0.7) - 2026-05-29
+
+### Other
+
+- RLE property+negative sweep + scrub two attributive ffmpeg refs
+- pgs encoder: tight-bbox crop + erase display-set for transparent frames
+- harden blit_indexed against offset overflow + add property sweeps
+- Porter–Duff source-over blit for overlapping subtitle objects
+- re-document the subtitle-stream-emits-video-frames convention
+
 ### Added
 
 - PGS RLE codec property sweep: 1500 randomised encode→decode round-trips
