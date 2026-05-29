@@ -414,7 +414,9 @@ impl DisplaySet {
             }
             SEG_END => {}
             _ => {
-                // Unknown / reserved — ignore like ffmpeg does.
+                // Unknown / reserved segment type — ignored, on the
+                // principle that future PGS extensions should not break
+                // playback of the parts of the stream we do understand.
             }
         }
         Ok(())
@@ -1175,7 +1177,13 @@ fn rgb_to_ycbcr_bt601(r: u8, g: u8, b: u8) -> (u8, u8, u8) {
 /// (see [`decode_rle`] for the inverse description).
 pub fn encode_rle(pixels: &[u8], width: usize, height: usize) -> Vec<u8> {
     debug_assert_eq!(pixels.len(), width * height);
-    let mut out = Vec::new();
+    // Pre-size the output. A worst-case run-of-singletons emits one byte
+    // per pixel plus a 2-byte end-of-line per row; a best-case long-run
+    // input emits 3-4 bytes per row. Allocating once at the
+    // singleton-worst-case bound avoids growth churn for typical
+    // subtitle-text bitmaps without overcommitting on the long-run path,
+    // which lands inside the initial capacity anyway.
+    let mut out = Vec::with_capacity(pixels.len() + height * 2);
     for row in 0..height {
         let mut col = 0usize;
         while col < width {
@@ -1350,6 +1358,271 @@ mod tests {
         let rle: &[u8] = &[0x01, 0x01, 0x00, 0x02, 0x00, 0x00];
         let px = decode_rle(rle, 4, 1).unwrap();
         assert_eq!(px, vec![1, 1, 0, 0]);
+    }
+
+    // ---- RLE property sweep ---------------------------------------------
+    //
+    // The PGS RLE format documented in the module header has narrow rules
+    // for short-vs-long runs and a separate "colour 0" branch with three
+    // length encodings. The encoder picks the cheapest form per run; the
+    // decoder must accept whichever the encoder emitted. These sweeps
+    // verify `encode_rle ∘ decode_rle == identity` over a wide spread of
+    // indexed bitmaps without external corpora.
+
+    /// Deterministic LCG (same constants the composite tests use). Lets
+    /// the sweeps run in plain Rust with no proptest dep.
+    fn lcg(state: &mut u64) -> u32 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (*state >> 32) as u32
+    }
+
+    #[test]
+    fn rle_roundtrip_random_widths_and_palettes() {
+        // Sweep random bitmaps of varying width / height / palette size.
+        // For each, encode → decode → check equality.
+        let mut st = 0x9e37_79b9_7f4a_7c15u64;
+        let mut sampled = 0usize;
+        for _ in 0..1_500 {
+            let width = ((lcg(&mut st) % 31) + 1) as usize; // 1..=31
+            let height = ((lcg(&mut st) % 17) + 1) as usize; // 1..=17
+            let palette_size = ((lcg(&mut st) % 12) + 1) as u8; // 1..=12 distinct values incl. 0
+            let mut pixels = vec![0u8; width * height];
+            for px in &mut pixels {
+                *px = (lcg(&mut st) as u8) % palette_size;
+            }
+            let rle = encode_rle(&pixels, width, height);
+            let back = decode_rle(&rle, width, height).unwrap_or_else(|e| {
+                panic!(
+                    "decode failed on roundtrip w={width} h={height} palette={palette_size}: {e:?}"
+                )
+            });
+            assert_eq!(
+                back, pixels,
+                "round-trip diverged at w={width} h={height} palette={palette_size}"
+            );
+            sampled += 1;
+        }
+        assert_eq!(sampled, 1_500);
+    }
+
+    #[test]
+    fn rle_roundtrip_long_runs() {
+        // Force long-run encoding paths (14-bit length form). A 600-wide
+        // row of a single non-zero colour exercises the
+        // `0xC0|hi LL CC` branch; the all-transparent row exercises the
+        // `0x40|hi LL` branch.
+        for colour in [0u8, 1u8, 42u8] {
+            for width in [64usize, 100, 256, 600, 1024] {
+                let height = 3usize;
+                let pixels = vec![colour; width * height];
+                let rle = encode_rle(&pixels, width, height);
+                let back = decode_rle(&rle, width, height).unwrap();
+                assert_eq!(
+                    back, pixels,
+                    "long-run roundtrip diverged at colour={colour} width={width}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rle_roundtrip_alternating_short_runs() {
+        // Alternating colours mean every run is length 1 — the encoder
+        // must emit a literal byte per pixel for colour != 0, and the
+        // `0x00 0x01` 2-byte form for each colour-0 pixel.
+        let width = 16usize;
+        let height = 4usize;
+        let mut pixels = vec![0u8; width * height];
+        for (i, px) in pixels.iter_mut().enumerate() {
+            *px = if i % 2 == 0 { 0 } else { 7 };
+        }
+        let rle = encode_rle(&pixels, width, height);
+        let back = decode_rle(&rle, width, height).unwrap();
+        assert_eq!(back, pixels);
+    }
+
+    #[test]
+    fn rle_roundtrip_one_pixel_rows() {
+        // A 1×N bitmap stresses the end-of-line marker between
+        // single-pixel rows.
+        for height in [1usize, 2, 5, 11] {
+            for colour in [0u8, 1u8, 250u8] {
+                let pixels = vec![colour; height];
+                let rle = encode_rle(&pixels, 1, height);
+                let back = decode_rle(&rle, 1, height).unwrap();
+                assert_eq!(back, pixels, "1×{height} colour={colour}");
+            }
+        }
+    }
+
+    #[test]
+    fn rle_roundtrip_mixed_run_lengths_in_one_row() {
+        // A handcrafted row that hits every encoder branch in sequence:
+        // 1 literal, 3-singletons, 5-colour-run, 70-colour-run, then
+        // 80-zero-run, then 200-zero-run.
+        let mut pixels: Vec<u8> = Vec::new();
+        pixels.push(9); // 1 literal
+        pixels.extend(std::iter::repeat(5).take(3)); // 3 of colour 5 → 3 literals
+        pixels.extend(std::iter::repeat(6).take(5)); // 5 of colour 6 → short 3-byte run
+        pixels.extend(std::iter::repeat(7).take(70)); // 70 of colour 7 → 14-bit run
+        pixels.extend(std::iter::repeat(0).take(80)); // 80 of colour 0 → 14-bit zero run
+        pixels.extend(std::iter::repeat(0).take(200)); // a second zero block
+        let width = pixels.len();
+        let height = 1usize;
+        let rle = encode_rle(&pixels, width, height);
+        let back = decode_rle(&rle, width, height).unwrap();
+        assert_eq!(back, pixels);
+    }
+
+    #[test]
+    fn rle_size_shrinks_for_long_uniform_runs() {
+        // A long, uniform run must shrink in the encoder — that's the
+        // whole point of the format. The 14-bit-length form caps a run
+        // at 4 bytes including its 2-byte end-of-line, so a 1000-wide
+        // single-colour row should land well below the singleton bound.
+        let width = 1000usize;
+        let pixels = vec![3u8; width];
+        let rle = encode_rle(&pixels, width, 1);
+        assert!(
+            rle.len() < 10,
+            "long-run encoding too verbose: {} bytes for 1000-wide flat row",
+            rle.len()
+        );
+    }
+
+    // ---- RLE negative-input sweep ---------------------------------------
+    //
+    // The decoder must not panic on malformed RLE — that input arrives
+    // from PGS payloads off arbitrary disks / networks. These tests pass
+    // pathological byte streams in and assert the result is either a
+    // graceful `Error::invalid` or a clamped success (the documented
+    // behaviour for runs that overshoot the row).
+
+    #[test]
+    fn rle_truncated_escape_returns_invalid_not_panic() {
+        // Lone 0x00 with no follow-up byte → escape begun, stream ended.
+        let err = decode_rle(&[0x00], 4, 1);
+        assert!(err.is_err(), "truncated escape must error: {err:?}");
+    }
+
+    #[test]
+    fn rle_truncated_14bit_length_returns_invalid_not_panic() {
+        // 0x00 0x4X marks the 14-bit-length-only form, needs one more byte.
+        let err = decode_rle(&[0x00, 0x40], 4, 1);
+        assert!(err.is_err(), "truncated 14-bit length must error: {err:?}");
+    }
+
+    #[test]
+    fn rle_truncated_short_colour_run_returns_invalid_not_panic() {
+        // 0x00 0x8L marks the short-colour-run form, needs colour byte.
+        let err = decode_rle(&[0x00, 0x82], 4, 1);
+        assert!(
+            err.is_err(),
+            "truncated short colour run must error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn rle_truncated_long_colour_run_returns_invalid_not_panic() {
+        // 0x00 0xCX marks the 14-bit-colour-run form, needs LL CC bytes.
+        let err = decode_rle(&[0x00, 0xC0], 4, 1);
+        assert!(
+            err.is_err(),
+            "truncated 14-bit colour run must error: {err:?}"
+        );
+        let err = decode_rle(&[0x00, 0xC0, 0xFF], 4, 1);
+        assert!(
+            err.is_err(),
+            "14-bit colour run missing colour byte must error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn rle_overlong_run_clamps_to_row_without_panic() {
+        // The documented decoder behaviour for an over-long run is to
+        // clamp to the row end and continue. Build a 4-wide row with a
+        // 14-bit run claiming 100 pixels of colour 5, then a normal
+        // end-of-line. The 4 pixels of colour 5 must come out cleanly.
+        let rle: &[u8] = &[0x00, 0xC0, 0x64, 0x05, 0x00, 0x00];
+        let px = decode_rle(rle, 4, 1).unwrap();
+        assert_eq!(px, vec![5, 5, 5, 5]);
+    }
+
+    #[test]
+    fn rle_too_many_lines_returns_invalid_not_panic() {
+        // 1-row bitmap fed three end-of-lines: the second EOL pushes
+        // `row` past `height` and must error rather than scribble.
+        let rle: &[u8] = &[0x00, 0x00, 0x00, 0x00];
+        let err = decode_rle(rle, 1, 1);
+        assert!(err.is_err(), "extra EOL must error: {err:?}");
+    }
+
+    #[test]
+    fn rle_pixel_past_end_returns_invalid_not_panic() {
+        // A single literal pixel after the final end-of-line means
+        // `row >= height` and the decoder hits the post-EOL pixel branch.
+        let rle: &[u8] = &[0x01, 0x00, 0x00, 0x02];
+        let err = decode_rle(rle, 1, 1);
+        assert!(err.is_err(), "pixel past EOL must error: {err:?}");
+    }
+
+    #[test]
+    fn rle_random_garbage_never_panics() {
+        // Feed pseudo-random byte streams to the decoder over a sweep
+        // of widths and heights. The result may be Ok or Err but must
+        // not panic / corrupt memory / take time disproportionate to
+        // the input length.
+        let mut st = 0xfeed_face_dead_beefu64;
+        for _ in 0..400 {
+            let len = (lcg(&mut st) % 128) as usize;
+            let mut bytes = vec![0u8; len];
+            for b in &mut bytes {
+                *b = lcg(&mut st) as u8;
+            }
+            let width = ((lcg(&mut st) % 17) + 1) as usize;
+            let height = ((lcg(&mut st) % 9) + 1) as usize;
+            let _ = decode_rle(&bytes, width, height); // just must not panic
+        }
+    }
+
+    #[test]
+    fn rle_roundtrip_all_one_colour_no_zero() {
+        // Every pixel is a single non-zero colour. The encoder must
+        // produce a single 14-bit-colour-run plus end-of-line.
+        let width = 200usize;
+        let height = 2usize;
+        let pixels = vec![42u8; width * height];
+        let rle = encode_rle(&pixels, width, height);
+        let back = decode_rle(&rle, width, height).unwrap();
+        assert_eq!(back, pixels);
+        // Two rows × (one 4-byte 14-bit-run + 2-byte EOL) = 12 bytes is
+        // the optimal encoding; we accept up to 16 bytes to allow for
+        // any small encoder rearrangement.
+        assert!(
+            rle.len() <= 16,
+            "uniform-row encoding too verbose: {} bytes",
+            rle.len()
+        );
+    }
+
+    #[test]
+    fn rle_roundtrip_all_transparent_no_colour() {
+        // Every pixel is colour 0. Each row encodes as one transparent
+        // run + EOL.
+        let width = 300usize;
+        let height = 4usize;
+        let pixels = vec![0u8; width * height];
+        let rle = encode_rle(&pixels, width, height);
+        let back = decode_rle(&rle, width, height).unwrap();
+        assert_eq!(back, pixels);
+        // Per row: 3-byte 14-bit zero run + 2-byte EOL = 5 bytes. ×4 = 20.
+        assert!(
+            rle.len() <= 28,
+            "transparent-row encoding too verbose: {} bytes",
+            rle.len()
+        );
     }
 
     #[test]

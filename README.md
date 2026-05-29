@@ -12,8 +12,10 @@ Pure-Rust bitmap-subtitle codecs and containers:
 
 All three decoders emit RGBA `oxideav_core::VideoFrame` values — one
 frame per display-set. The stream's media kind is `Subtitle` even though
-the frame kind is `Video`, matching ffmpeg's convention for bitmap-based
-subtitle codecs.
+the frame kind is `Video` — the dual tagging surfaces the
+bitmap-subtitle nature of these codecs to downstream consumers (player,
+mixer, file writer) without losing the fact that what arrives is a
+pre-rendered RGBA picture.
 
 When a display-set stacks overlapping objects (multiple PGS composition
 objects, multiple DVB regions/objects) and the topmost pixel is only

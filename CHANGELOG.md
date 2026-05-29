@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- PGS RLE codec property sweep: 1500 randomised encode→decode round-trips
+  across varied widths (1..=31), heights (1..=17) and palette sizes
+  (1..=12) confirm `decode_rle ∘ encode_rle == identity`; targeted sweeps
+  for long uniform runs (widths 64/100/256/600/1024 over colour 0 + two
+  non-zero colours), alternating short runs, 1×N single-column bitmaps,
+  and a hand-crafted single-row that hits every encoder branch in
+  sequence (1 literal → 3 singletons → short colour run → 14-bit colour
+  run → 14-bit zero run). Also: size-shrink assertions on uniform
+  bitmaps to keep the long-run encoder's optimality honest.
+- PGS RLE decoder malformed-input sweep: targeted negative tests for
+  truncated escape, truncated 14-bit-length, truncated short-colour-run,
+  truncated 14-bit-colour-run; overlong-run row clamping; extra
+  end-of-line past height; literal pixel past the final end-of-line; and
+  a 400-iteration pseudo-random garbage sweep that asserts the decoder
+  cannot be made to panic on arbitrary byte streams.
+- `encode_rle` pre-sizes its output buffer to the worst-case
+  singleton-plus-EOL bound, removing growth-churn allocations on typical
+  subtitle-text bitmaps.
+
+### Changed
+
+- README + `pgs.rs` prose: rewrite two pre-existing decorative
+  implementation-attribution phrases ("matching ffmpeg's convention" in
+  the README and "ignore like ffmpeg does" in the segment-walker) into
+  spec/behaviour-anchored prose. The algorithm description carries the
+  load; the implementation attribution carries none.
+
 - PGS encoder now crops each input frame to the tight bounding box of
   its non-transparent pixels before quantisation and emits a single
   composition object positioned at the bbox's `(x, y)`. The WDS window
