@@ -1,7 +1,7 @@
 //! Encode → decode round-trip tests for the PGS encoder/decoder pair.
 
 use oxideav_core::{
-    CodecId, CodecParameters, Frame, PixelFormat, TimeBase, VideoFrame, VideoPlane,
+    CodecId, CodecParameters, Frame, Packet, PixelFormat, TimeBase, VideoFrame, VideoPlane,
 };
 use oxideav_sub_image::{pgs, PGS_CODEC_ID};
 
@@ -312,4 +312,45 @@ fn bbox_strips_padding_on_all_sides() {
             }
         }
     }
+}
+
+/// A multi-fragment ODS (the form a real PGS muxer emits for objects too
+/// large for one segment) decodes to the same pixels as the equivalent
+/// single-segment object, driven entirely through the public decoder.
+#[test]
+fn fragmented_ods_decodes_like_single_segment() {
+    let pixels = [1u8, 2, 3, 1, 0, 2, 3, 0, 1, 1, 2, 3]; // 4×3
+    let palette = [
+        (0u8, [0u8, 0, 0, 0]),
+        (1u8, [220u8, 20, 20, 255]),
+        (2u8, [20u8, 220, 20, 255]),
+        (3u8, [20u8, 20, 220, 255]),
+    ];
+
+    let decode = |blob: Vec<u8>| -> Vec<u8> {
+        let mut dec = pgs::make_decoder(&codec_params()).unwrap();
+        let pkt = Packet::new(0, TimeBase::new(1, 90_000), blob).with_pts(0);
+        dec.send_packet(&pkt).unwrap();
+        let Frame::Video(v) = dec.receive_frame().unwrap() else {
+            panic!("expected video frame");
+        };
+        v.planes[0].data.clone()
+    };
+
+    let single = decode(pgs::build_demo_display_set(
+        (4, 3),
+        (4, 3),
+        (0, 0),
+        &palette,
+        &pixels,
+    ));
+    let multi = decode(pgs::build_demo_display_set_fragmented(
+        (4, 3),
+        (4, 3),
+        (0, 0),
+        &palette,
+        &pixels,
+        4,
+    ));
+    assert_eq!(single, multi, "fragmented ODS diverged from single-segment");
 }

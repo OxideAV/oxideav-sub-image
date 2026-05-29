@@ -1310,11 +1310,35 @@ pub fn build_demo_display_set(
     }
     segment(&mut out, 0, SEG_PDS, &pds);
 
-    // ODS (first+last sequence).
-    let mut rle = Vec::new();
-    // encode `pixels` as a sequence of single-pixel runs + end-of-line.
+    // ODS (first+last sequence). Single-pixel runs + end-of-line, shared
+    // with the fragmented builder via `demo_rle`.
+    let rle = demo_rle(object, pixels);
+    let mut ods = Vec::new();
+    ods.extend_from_slice(&1u16.to_be_bytes()); // object id
+    ods.push(0); // object version
+    ods.push(0xC0); // first + last sequence
+    let obj_data_len = (rle.len() + 4) as u32; // width+height (4) + rle
+    ods.push(((obj_data_len >> 16) & 0xFF) as u8);
+    ods.push(((obj_data_len >> 8) & 0xFF) as u8);
+    ods.push((obj_data_len & 0xFF) as u8);
+    ods.extend_from_slice(&object.0.to_be_bytes());
+    ods.extend_from_slice(&object.1.to_be_bytes());
+    ods.extend_from_slice(&rle);
+    segment(&mut out, 0, SEG_ODS, &ods);
+
+    // END.
+    segment(&mut out, 0, SEG_END, &[]);
+    out
+}
+
+/// Encode `pixels` (one byte per palette index, row-major) into the
+/// single-pixel-run + end-of-line RLE form `build_demo_display_set`
+/// uses. Shared by the single- and multi-fragment demo builders so both
+/// carry byte-identical object data.
+fn demo_rle(object: (u16, u16), pixels: &[u8]) -> Vec<u8> {
     let w = object.0 as usize;
     let h = object.1 as usize;
+    let mut rle = Vec::new();
     for row in 0..h {
         for c in 0..w {
             let p = pixels[row * w + c];
@@ -1329,18 +1353,102 @@ pub fn build_demo_display_set(
         rle.push(0);
         rle.push(0);
     }
-    let mut ods = Vec::new();
-    ods.extend_from_slice(&1u16.to_be_bytes()); // object id
-    ods.push(0); // object version
-    ods.push(0xC0); // first + last sequence
-    let obj_data_len = (rle.len() + 4) as u32; // width+height (4) + rle
-    ods.push(((obj_data_len >> 16) & 0xFF) as u8);
-    ods.push(((obj_data_len >> 8) & 0xFF) as u8);
-    ods.push((obj_data_len & 0xFF) as u8);
-    ods.extend_from_slice(&object.0.to_be_bytes());
-    ods.extend_from_slice(&object.1.to_be_bytes());
-    ods.extend_from_slice(&rle);
-    segment(&mut out, 0, SEG_ODS, &ods);
+    rle
+}
+
+/// Like [`build_demo_display_set`], but splits the single object's data
+/// across `fragments` ODS segments using the PGS sequence flags
+/// (first / continuation / last). A real PGS muxer fragments any object
+/// whose data exceeds the per-segment size limit; `build_demo_display_set`
+/// only ever emits a first+last (single-segment) object, so this builder
+/// is what exercises the decoder's reassembly path.
+///
+/// The first fragment carries the object_data_length + width + height
+/// header followed by the leading slice of RLE; continuation fragments
+/// carry raw RLE only; the final fragment sets the `last_in_sequence`
+/// flag. `fragments` is clamped to at least 1. The split points fall at
+/// even byte boundaries of the *whole* `(header ++ rle)` payload, so a
+/// boundary can land inside the 7-byte header, confirming the decoder
+/// concatenates fragments before interpreting any field.
+#[doc(hidden)]
+pub fn build_demo_display_set_fragmented(
+    canvas: (u16, u16),
+    object: (u16, u16),
+    position: (u16, u16),
+    palette: &[(u8, [u8; 4])],
+    pixels: &[u8],
+    fragments: usize,
+) -> Vec<u8> {
+    fn segment(out: &mut Vec<u8>, pts_90k: u32, seg_type: u8, body: &[u8]) {
+        out.extend_from_slice(b"PG");
+        out.extend_from_slice(&pts_90k.to_be_bytes());
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out.push(seg_type);
+        out.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        out.extend_from_slice(body);
+    }
+
+    let fragments = fragments.max(1);
+
+    // Reuse build_demo_display_set to emit the PCS / WDS / PDS prefix
+    // verbatim, then splice our fragmented ODS chain in place of its
+    // single ODS. Rather than re-derive the prefix, build the canonical
+    // single-ODS set and copy everything up to (but not including) its
+    // ODS segment, which is the only segment we replace.
+    let canonical = build_demo_display_set(canvas, object, position, palette, pixels);
+    let mut out = Vec::new();
+    let mut cur = 0;
+    while cur < canonical.len() {
+        let (seg, next) = read_segment(&canonical, cur).expect("demo set is well-formed");
+        if seg.seg_type == SEG_ODS || seg.seg_type == SEG_END {
+            break;
+        }
+        out.extend_from_slice(&canonical[cur..next]);
+        cur = next;
+    }
+
+    // Build the full object payload: object_data_length (u24) + width +
+    // height + RLE — identical to the single-segment ODS body minus the
+    // per-fragment object_id / version / sequence-flag prefix.
+    let rle = demo_rle(object, pixels);
+    let obj_data_len = (rle.len() + 4) as u32; // width + height (4) + rle
+    let mut payload = Vec::new();
+    payload.push(((obj_data_len >> 16) & 0xFF) as u8);
+    payload.push(((obj_data_len >> 8) & 0xFF) as u8);
+    payload.push((obj_data_len & 0xFF) as u8);
+    payload.extend_from_slice(&object.0.to_be_bytes());
+    payload.extend_from_slice(&object.1.to_be_bytes());
+    payload.extend_from_slice(&rle);
+
+    // Split `payload` into `fragments` near-equal chunks. Each ODS body
+    // is: object_id (2) + version (1) + sequence_flag (1) + chunk.
+    let chunk_len = payload.len().div_ceil(fragments).max(1);
+    let mut offset = 0;
+    let mut idx = 0;
+    while offset < payload.len() || (idx == 0 && payload.is_empty()) {
+        let end = (offset + chunk_len).min(payload.len());
+        let chunk = &payload[offset..end];
+        let is_first = idx == 0;
+        let is_last = end >= payload.len();
+        let mut flag = 0u8;
+        if is_first {
+            flag |= 0x80;
+        }
+        if is_last {
+            flag |= 0x40;
+        }
+        let mut ods = Vec::new();
+        ods.extend_from_slice(&1u16.to_be_bytes()); // object id
+        ods.push(0); // object version
+        ods.push(flag);
+        ods.extend_from_slice(chunk);
+        segment(&mut out, 0, SEG_ODS, &ods);
+        offset = end;
+        idx += 1;
+        if is_last {
+            break;
+        }
+    }
 
     // END.
     segment(&mut out, 0, SEG_END, &[]);
@@ -1674,5 +1782,135 @@ mod tests {
             "blue pixel not dominant: {:?}",
             b
         );
+    }
+
+    // ---- Fragmented-ODS reassembly --------------------------------------
+    //
+    // A real PGS muxer splits any object whose data overruns the
+    // per-segment size limit across several ODS segments using the
+    // first / continuation / last sequence-flag bits, and the decoder
+    // must concatenate the fragments before interpreting the
+    // object_data_length / width / height header or the RLE. The demo
+    // encoder only ever emits a single first+last ODS, so without these
+    // tests the `parse_ods_into` reassembly branch is unexercised.
+
+    /// Decode a complete `.sup` display-set blob through the public
+    /// decoder and return the single RGBA frame's pixel bytes.
+    fn decode_one(blob: Vec<u8>) -> Vec<u8> {
+        let mut dec = make_decoder(&CodecParameters::video(CodecId::new(PGS_CODEC_ID))).unwrap();
+        let pkt = Packet::new(0, TimeBase::new(1, 90_000), blob).with_pts(0);
+        dec.send_packet(&pkt).unwrap();
+        let Frame::Video(v) = dec.receive_frame().unwrap() else {
+            panic!("expected video frame");
+        };
+        v.planes[0].data.clone()
+    }
+
+    #[test]
+    fn fragmented_ods_matches_single_segment() {
+        // Same object, encoded as 1 ODS vs. 2..=7 ODS fragments, must
+        // decode to byte-identical RGBA. The split points fall at even
+        // boundaries of (header ++ rle), so several of these land inside
+        // the 7-byte width/height header — proving the decoder defers
+        // interpretation until the whole object is reassembled.
+        let pixels = [1u8, 1, 2, 3, 0, 1, 2, 3, 3, 2, 1, 0]; // 4×3
+        let palette = [
+            (0u8, [0u8, 0, 0, 0]),
+            (1u8, [255u8, 0, 0, 255]),
+            (2u8, [0u8, 255, 0, 255]),
+            (3u8, [0u8, 0, 255, 255]),
+        ];
+        let canvas = (4u16, 3u16);
+        let object = (4u16, 3u16);
+
+        let single = decode_one(build_demo_display_set(
+            canvas,
+            object,
+            (0, 0),
+            &palette,
+            &pixels,
+        ));
+
+        for n in 2..=7usize {
+            let multi = decode_one(build_demo_display_set_fragmented(
+                canvas,
+                object,
+                (0, 0),
+                &palette,
+                &pixels,
+                n,
+            ));
+            assert_eq!(
+                multi, single,
+                "fragmented ODS ({n} segments) decoded differently from single-segment"
+            );
+        }
+    }
+
+    #[test]
+    fn fragmented_ods_split_inside_header() {
+        // A tiny 1×1 object whose total payload (7-byte header + a couple
+        // of RLE bytes) is split into more fragments than it has bytes:
+        // every fragment is at most one byte, so the very first boundary
+        // is inside the object_data_length field. Reassembly must still
+        // produce the correct single opaque pixel.
+        let pixels = [1u8];
+        let palette = [(0u8, [0u8, 0, 0, 0]), (1u8, [10u8, 200, 30, 255])];
+        let blob = build_demo_display_set_fragmented((1, 1), (1, 1), (0, 0), &palette, &pixels, 32);
+        let data = decode_one(blob);
+        assert_eq!(data.len(), 4);
+        // Green-dominant, opaque.
+        assert!(
+            data[1] > data[0] && data[1] > data[2] && data[3] == 255,
+            "expected opaque green-dominant pixel, got {:?}",
+            data
+        );
+    }
+
+    #[test]
+    fn incomplete_object_without_last_fragment_is_dropped_not_rendered() {
+        // A first-but-never-last ODS leaves the object incomplete. The
+        // decoder must not render a partial object; it emits the
+        // canvas-sized frame with that composition object absent
+        // (fully transparent here, since it's the only object).
+        let pixels = [1u8, 1, 1, 1]; // 2×2
+        let palette = [(0u8, [0u8, 0, 0, 0]), (1u8, [200u8, 0, 0, 255])];
+        // Build the canonical set, then drop the END-terminating `last`
+        // flag from its ODS by re-emitting only a `first` fragment.
+        let frag2 = build_demo_display_set_fragmented((2, 2), (2, 2), (0, 0), &palette, &pixels, 2);
+        // Keep everything up to and including the FIRST ODS fragment, then
+        // splice in an END — so the decoder sees a first-without-last.
+        let mut truncated = Vec::new();
+        let mut cur = 0;
+        let mut seen_first_ods = false;
+        while cur < frag2.len() {
+            let (seg, next) = read_segment(&frag2, cur).unwrap();
+            if seg.seg_type == SEG_END {
+                break;
+            }
+            truncated.extend_from_slice(&frag2[cur..next]);
+            cur = next;
+            if seg.seg_type == SEG_ODS {
+                seen_first_ods = true;
+                break;
+            }
+        }
+        assert!(seen_first_ods, "expected to capture the first ODS fragment");
+        // Terminating END (13-byte header, empty body).
+        truncated.extend_from_slice(b"PG");
+        truncated.extend_from_slice(&0u32.to_be_bytes());
+        truncated.extend_from_slice(&0u32.to_be_bytes());
+        truncated.push(SEG_END);
+        truncated.extend_from_slice(&0u16.to_be_bytes());
+
+        let data = decode_one(truncated);
+        assert_eq!(data.len(), 2 * 2 * 4);
+        for chunk in data.chunks(4) {
+            assert_eq!(
+                chunk,
+                &[0, 0, 0, 0],
+                "incomplete object must not paint any pixel"
+            );
+        }
     }
 }
