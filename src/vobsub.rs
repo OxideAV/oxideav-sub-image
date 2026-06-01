@@ -42,8 +42,15 @@
 //!
 //! * **Decode only.**
 //! * Handles the standard 4-colour palette + alpha form (every SPU
-//!   uses exactly 4 of the 16 palette entries). Per-line palette
-//!   switching commands (0x07) are not implemented.
+//!   uses exactly 4 of the 16 palette entries). The mid-display
+//!   colour/contrast change command (0x07 CHG_COLCON) is length-skipped
+//!   rather than applied: streams that carry it decode to a bitmap
+//!   coloured by the SPU's base palette/alpha, with the rectangular
+//!   palette/alpha mutations the command requests ignored. The skip
+//!   reads the documented 2-byte parameter-block size (which includes
+//!   the size word itself) so the rest of the control sequence stays
+//!   in lock-step. The `Spu::saw_chg_colcon` flag surfaces the fact
+//!   that an SPU asked for the mutations.
 //! * Palette/alpha defaults are black-text-on-transparent when the
 //!   SPU omits a colour command (malformed streams).
 //! * `.idx` without a palette line falls back to an all-grey fallback
@@ -190,6 +197,12 @@ pub struct Spu {
     /// RLE data offsets for top/bottom fields, relative to start of SPU.
     pub top_rle_off: u16,
     pub bot_rle_off: u16,
+    /// Set to `true` when the control sequence contained at least one
+    /// well-formed CHG_COLCON (0x07) command. The command itself is
+    /// length-skipped — the mid-display palette/alpha mutations it
+    /// requests are not currently applied to the rendered bitmap —
+    /// but callers (and tests) can observe that the SPU asked for them.
+    pub saw_chg_colcon: bool,
 }
 
 /// Parse a SPU (one DVD subtitle unit), producing its control state and
@@ -277,6 +290,38 @@ pub fn parse_and_decode_spu(spu: &[u8]) -> Result<(Spu, Vec<u8>, (u16, u16))> {
                     out.top_rle_off = u16::from_be_bytes([spu[cmd_pos], spu[cmd_pos + 1]]);
                     out.bot_rle_off = u16::from_be_bytes([spu[cmd_pos + 2], spu[cmd_pos + 3]]);
                     cmd_pos += 4;
+                }
+                0x07 => {
+                    // CHG_COLCON — change colour/contrast within rectangular
+                    // sub-areas of the display. We don't currently apply the
+                    // mid-display palette/alpha mutations, but the command is
+                    // self-delimiting: a 2-byte total parameter size (which
+                    // includes the two size bytes themselves) follows the
+                    // command byte, then `size - 2` bytes of LN_CTLI / PX_CTLI
+                    // parameters terminated by the LN_CTLI sentinel
+                    // 0F FF FF FF. Skipping the documented length keeps the
+                    // rest of the control sequence in lock-step instead of
+                    // hard-erroring on streams that carry the command, while
+                    // still rejecting truncated payloads.
+                    if cmd_pos + 2 > spu_len {
+                        return Err(Error::invalid("vobsub SPU: CHG_COLCON size word truncated"));
+                    }
+                    let size = u16::from_be_bytes([spu[cmd_pos], spu[cmd_pos + 1]]) as usize;
+                    // The size includes the two size bytes themselves; a
+                    // value < 2 would underflow when computing the payload
+                    // length, and a value of exactly 2 means zero parameter
+                    // bytes (still a valid edge case to tolerate).
+                    if size < 2 {
+                        return Err(Error::invalid("vobsub SPU: CHG_COLCON size word < 2"));
+                    }
+                    let new_pos = cmd_pos.saturating_add(size);
+                    if new_pos > spu_len {
+                        return Err(Error::invalid(
+                            "vobsub SPU: CHG_COLCON parameters truncated",
+                        ));
+                    }
+                    out.saw_chg_colcon = true;
+                    cmd_pos = new_pos;
                 }
                 0xFF => {
                     break;
@@ -1091,6 +1136,224 @@ timestamp: 00:00:03:000, filepos: 000000040
         let raw = build_demo_spu(2, 2, &[1u8, 1, 1, 1]);
         let out = extract_spu(&raw).unwrap();
         assert_eq!(out, raw);
+    }
+
+    /// Build a tiny SPU that carries one well-formed CHG_COLCON (0x07)
+    /// in its control sequence, in addition to the usual palette / alpha
+    /// / coords / RLE-offsets / start-display / end run. The CHG_COLCON
+    /// parameter block is a single LN_CTLI terminator (`0F FF FF FF`) so
+    /// the documented size word is `0x0006` (size word + 4-byte
+    /// terminator), giving the decoder a real length to skip.
+    ///
+    /// Rebuilds the control block by walking the baseline SPU's commands
+    /// with the documented per-command argument widths (we can't byte-search
+    /// for `0x01` because palette/alpha argument bytes can collide with
+    /// command bytes — every nibble is valid argument data).
+    fn build_spu_with_chg_colcon() -> Vec<u8> {
+        let base = build_demo_spu(2, 2, &[1u8, 1, 1, 1]);
+        let base_ctrl = u16::from_be_bytes([base[2], base[3]]) as usize;
+        let rle_region = &base[4..base_ctrl];
+
+        // Walk the baseline's commands and find where 0x01 (start-display)
+        // sits, taking each command's documented length into account.
+        let cmd_region = &base[base_ctrl + 4..];
+        let mut walk = 0usize;
+        let start_idx;
+        loop {
+            assert!(walk < cmd_region.len(), "ran off end without START");
+            let cmd = cmd_region[walk];
+            match cmd {
+                0x00 | 0x01 => {
+                    start_idx = walk;
+                    break;
+                }
+                0x02 => walk += 1,
+                0x03 | 0x04 => walk += 1 + 2,
+                0x05 => walk += 1 + 6,
+                0x06 => walk += 1 + 4,
+                0xFF => panic!("baseline ended before START"),
+                other => panic!("unexpected baseline cmd 0x{other:02X}"),
+            }
+            if cmd == 0x02 || (0x03..=0x06).contains(&cmd) {
+                // walk already advanced
+            }
+        }
+
+        let mut new_cmds = Vec::new();
+        new_cmds.extend_from_slice(&cmd_region[..start_idx]);
+        // CHG_COLCON: command + 2-byte size (incl. size word) + payload
+        new_cmds.push(0x07);
+        let chg_params: [u8; 4] = [0x0F, 0xFF, 0xFF, 0xFF];
+        let size = (2 + chg_params.len()) as u16;
+        new_cmds.extend_from_slice(&size.to_be_bytes());
+        new_cmds.extend_from_slice(&chg_params);
+        // Append the rest of the baseline cmds (start through 0xFF).
+        new_cmds.extend_from_slice(&cmd_region[start_idx..]);
+        // Sanity: cmd_region already ends with 0xFF so new_cmds does too.
+        assert_eq!(*new_cmds.last().unwrap(), 0xFF);
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&[0, 0]); // placeholder length
+        let new_ctrl_off = 4 + rle_region.len();
+        out.extend_from_slice(&(new_ctrl_off as u16).to_be_bytes());
+        out.extend_from_slice(rle_region);
+        let ctrl_pos = out.len();
+        out.extend_from_slice(&[0, 0]); // delay = 0
+        out.extend_from_slice(&[0, 0]); // next placeholder
+        out.extend_from_slice(&new_cmds);
+        // Patch next-offset to point at this sequence (terminator).
+        out[ctrl_pos + 2] = (ctrl_pos as u16 >> 8) as u8;
+        out[ctrl_pos + 3] = (ctrl_pos as u16 & 0xFF) as u8;
+        let total = out.len() as u16;
+        out[0] = (total >> 8) as u8;
+        out[1] = (total & 0xFF) as u8;
+        out
+    }
+
+    #[test]
+    fn chg_colcon_command_is_skipped_not_error() {
+        let spu = build_spu_with_chg_colcon();
+        let (state, pixels, (w, h)) =
+            parse_and_decode_spu(&spu).expect("CHG_COLCON-bearing SPU should decode");
+        assert_eq!((w, h), (2, 2));
+        // The base palette/alpha selection is unchanged by the
+        // length-skipped CHG_COLCON, so the bitmap is identical to the
+        // CHG_COLCON-free version of the same RLE.
+        let baseline = build_demo_spu(2, 2, &[1u8, 1, 1, 1]);
+        let (_, baseline_px, _) = parse_and_decode_spu(&baseline).unwrap();
+        assert_eq!(pixels, baseline_px);
+        assert!(
+            state.saw_chg_colcon,
+            "Spu.saw_chg_colcon should be true when 0x07 was parsed"
+        );
+        // Baseline SPU's flag stays false.
+        let (baseline_state, _, _) = parse_and_decode_spu(&baseline).unwrap();
+        assert!(!baseline_state.saw_chg_colcon);
+    }
+
+    #[test]
+    fn chg_colcon_truncated_size_word_errors() {
+        // Build a control sequence whose final command is 0x07 with
+        // only 1 trailing byte before the SPU ends — the 2-byte size
+        // word can't be read.
+        let mut out = Vec::new();
+        out.extend_from_slice(&[0, 0]); // placeholder length
+        out.extend_from_slice(&[0, 4]); // control_offset = 4 (no RLE)
+                                        // Control block.
+        out.extend_from_slice(&[0, 0, 0, 0]); // delay + next placeholder
+        out.push(0x07); // CHG_COLCON with no size bytes following
+        let total = out.len() as u16;
+        out[0] = (total >> 8) as u8;
+        out[1] = (total & 0xFF) as u8;
+        // Patch next-offset = ctrl_pos = 4.
+        out[6] = 0;
+        out[7] = 4;
+        let err = parse_and_decode_spu(&out).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("CHG_COLCON size word truncated"),
+            "expected truncated-size error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn chg_colcon_truncated_payload_errors() {
+        // CHG_COLCON with size=0x0010 (announces 14 bytes of params)
+        // but only 2 trailing bytes available — payload truncated.
+        let mut out = Vec::new();
+        out.extend_from_slice(&[0, 0]); // placeholder length
+        out.extend_from_slice(&[0, 4]); // control_offset
+        out.extend_from_slice(&[0, 0, 0, 0]); // delay + next placeholder
+        out.push(0x07);
+        out.extend_from_slice(&[0x00, 0x10]); // size = 16 bytes (way more than left)
+        out.extend_from_slice(&[0xAA, 0xBB]); // 2 trailing bytes
+        let total = out.len() as u16;
+        out[0] = (total >> 8) as u8;
+        out[1] = (total & 0xFF) as u8;
+        out[6] = 0;
+        out[7] = 4;
+        let err = parse_and_decode_spu(&out).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("CHG_COLCON parameters truncated"),
+            "expected payload-truncated error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn chg_colcon_zero_size_word_errors() {
+        // size word of 0 (or 1) would underflow the payload calc.
+        let mut out = Vec::new();
+        out.extend_from_slice(&[0, 0]);
+        out.extend_from_slice(&[0, 4]);
+        out.extend_from_slice(&[0, 0, 0, 0]);
+        out.push(0x07);
+        out.extend_from_slice(&[0x00, 0x00]); // size = 0
+        let total = out.len() as u16;
+        out[0] = (total >> 8) as u8;
+        out[1] = (total & 0xFF) as u8;
+        out[6] = 0;
+        out[7] = 4;
+        let err = parse_and_decode_spu(&out).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("CHG_COLCON size word < 2"),
+            "expected size<2 error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn chg_colcon_zero_payload_size_two_is_tolerated() {
+        // size = 2 means "just the size word, no parameter bytes". The
+        // command is still self-delimiting; decode should succeed and
+        // saw_chg_colcon should be set. We replay the same controlled
+        // rebuild used in `build_spu_with_chg_colcon` but inject a
+        // smaller CHG_COLCON, to keep the test independent of the
+        // baseline's exact command layout.
+        let base = build_demo_spu(2, 2, &[1u8, 1, 1, 1]);
+        let base_ctrl = u16::from_be_bytes([base[2], base[3]]) as usize;
+        let rle_region = &base[4..base_ctrl];
+        let cmd_region = &base[base_ctrl + 4..];
+        let mut walk = 0usize;
+        let start_idx;
+        loop {
+            assert!(walk < cmd_region.len());
+            let cmd = cmd_region[walk];
+            match cmd {
+                0x00 | 0x01 => {
+                    start_idx = walk;
+                    break;
+                }
+                0x02 => walk += 1,
+                0x03 | 0x04 => walk += 1 + 2,
+                0x05 => walk += 1 + 6,
+                0x06 => walk += 1 + 4,
+                _ => panic!("unexpected baseline cmd 0x{cmd:02X}"),
+            }
+        }
+        let mut new_cmds = Vec::new();
+        new_cmds.extend_from_slice(&cmd_region[..start_idx]);
+        new_cmds.extend_from_slice(&[0x07, 0x00, 0x02]); // size = 2, zero payload
+        new_cmds.extend_from_slice(&cmd_region[start_idx..]);
+        assert_eq!(*new_cmds.last().unwrap(), 0xFF);
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&[0, 0]);
+        let new_ctrl_off = 4 + rle_region.len();
+        out.extend_from_slice(&(new_ctrl_off as u16).to_be_bytes());
+        out.extend_from_slice(rle_region);
+        let ctrl_pos = out.len();
+        out.extend_from_slice(&[0, 0, 0, 0]);
+        out.extend_from_slice(&new_cmds);
+        out[ctrl_pos + 2] = (ctrl_pos as u16 >> 8) as u8;
+        out[ctrl_pos + 3] = (ctrl_pos as u16 & 0xFF) as u8;
+        let total = out.len() as u16;
+        out[0] = (total >> 8) as u8;
+        out[1] = (total & 0xFF) as u8;
+
+        let (state, _, (w, h)) = parse_and_decode_spu(&out).unwrap();
+        assert_eq!((w, h), (2, 2));
+        assert!(state.saw_chg_colcon);
     }
 
     #[test]

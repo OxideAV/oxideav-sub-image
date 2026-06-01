@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- VobSub decoder now length-skips the SP_DCSQ CHG_COLCON command
+  (opcode `0x07`) instead of hard-erroring on it. The command's
+  documented self-delimiting form (one command byte + a 2-byte
+  total-parameter-size word that includes the size word itself + a
+  variable-length LN_CTLI / PX_CTLI payload terminated by the
+  `0F FF FF FF` LN_CTLI sentinel) is consumed in lock-step with the
+  rest of the control sequence: the mid-display palette / contrast
+  mutations the command requests are not applied to the rendered
+  bitmap, but SPUs that carry the command now decode their base
+  palette / alpha / coords / RLE successfully where previously every
+  control sequence containing a CHG_COLCON returned
+  `InvalidData("vobsub SPU: unknown command 0x07")`. New
+  `Spu::saw_chg_colcon` flag surfaces the fact that a stream asked
+  for the mutations so callers / tests can observe the gap.
+- Five new unit tests for the CHG_COLCON path: full SPU round-trip
+  through a CHG_COLCON-bearing control sequence asserting that the
+  decoded pixels match the CHG_COLCON-free baseline and the flag is
+  set; CHG_COLCON with a `size = 2` (zero-payload) parameter block
+  tolerated as a valid self-delimiting form; explicit error paths
+  for size-word truncation, payload truncation, and a size word
+  below the minimum legal value of 2.
+
 ## [0.0.7](https://github.com/OxideAV/oxideav-sub-image/compare/v0.0.6...v0.0.7) - 2026-05-29
 
 ### Other

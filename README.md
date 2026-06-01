@@ -8,7 +8,12 @@ Pure-Rust bitmap-subtitle codecs and containers:
   container (DVB subs ride inside MPEG-TS).
 - **VobSub** / DVD SPU (`.idx`+`.sub`) — decode only, container reads
   the `.idx` text index + matched `.sub` payload (MPEG-PS pack + PES
-  private_stream_1 or raw SPU-length-prefixed form).
+  private_stream_1 or raw SPU-length-prefixed form). Mid-display
+  `CHG_COLCON` palette / contrast change commands (opcode `0x07`) are
+  length-skipped — their rectangular palette / alpha mutations are not
+  applied to the rendered bitmap, but streams that carry the command
+  decode their base palette / alpha / RLE successfully and surface the
+  request via `Spu::saw_chg_colcon`.
 
 All three decoders emit RGBA `oxideav_core::VideoFrame` values — one
 frame per display-set. The stream's media kind is `Subtitle` even though
