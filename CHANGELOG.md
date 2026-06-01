@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- DVB subtitle pixel-line decoders are now exercised by a property +
+  negative-input sweep. Each of `decode_2bit_string` /
+  `decode_4bit_string` / `decode_8bit_string` gains a round-trip test
+  against a hand-built minimal-branch encoder (literal-pixel + short
+  zero-pixel + end-of-string forms), a truncated-input test asserting
+  `InvalidData` rather than panic, and a 400-iteration pseudo-random
+  byte sweep asserting termination + bounded output.
+  `parse_pixel_lines` adds tests for end-of-object-line row
+  collection, map-table skip (`0x20`/`0x21`/`0x22` introducer +
+  two-byte body), truncated-map-table rejection, unknown-data-type
+  rejection, and a 400-iteration random-garbage no-panic sweep.
+  `read_segment` adds bad-sync-byte rejection, short-header
+  `NeedMore`, and truncated-body `NeedMore` tests. End-to-end PES
+  round-trips now also cover the 2-bit and 4-bit line blocks
+  (previously only the 8-bit branch had end-to-end coverage). Test
+  count in `src/dvbsub.rs::tests` rises from 2 to 24; the
+  integration test set is unchanged.
+
+### Changed
+
+- Restated the `decode_2bit_string` 01-prefix comment in spec-style
+  terms ("01 prefix + 3-bit length + 2-bit colour → (3 + length)
+  pixels of the carried colour") in place of an attributive cross-
+  reference to other 2-bit-decoder implementations. Behaviour is
+  unchanged.
+
 - VobSub decoder now length-skips the SP_DCSQ CHG_COLCON command
   (opcode `0x07`) instead of hard-erroring on it. The command's
   documented self-delimiting form (one command byte + a 2-byte
