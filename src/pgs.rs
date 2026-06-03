@@ -41,9 +41,13 @@
 //!   skipped silently — PGS allows carrying only palette/WDS updates.
 //! * ODS fragmentation is handled (an object carries `last_in_sequence`
 //!   bits); a PDS version update is treated as a replace.
-//! * Cropped compositions (PCS.object_cropped_flag) fall back to
-//!   compositing the full object — crop rectangles are parsed but not
-//!   applied.
+//! * Cropped compositions (PCS.object_cropped_flag) parse the 8-byte
+//!   cropping rectangle that follows the object entry and apply it as a
+//!   sub-rectangle selection on the Graphics Object before compositing.
+//!   Out-of-range crop coordinates are intersected with the source
+//!   object's actual bounds; a crop that lands entirely outside the
+//!   object paints nothing, and a zero-extent crop rectangle is rejected
+//!   at parse time.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, SeekFrom};
@@ -122,6 +126,25 @@ pub struct CompositionObject {
     pub forced: bool,
     pub x: u16,
     pub y: u16,
+    /// When `cropped` is set, the 8-byte cropping rectangle that follows
+    /// the object entry. The rectangle selects a sub-region of the source
+    /// graphics object (object-coordinate space) which is then composited
+    /// at `(x, y)` on the canvas. Field order matches the rectangle
+    /// layout used elsewhere in the BD-ROM HDMV graphics decoder
+    /// (`x`, `y`, `w`, `h` as four big-endian `u16`s — the same shape the
+    /// WDS window record uses).
+    pub crop: Option<CropRect>,
+}
+
+/// Sub-rectangle of a Graphics Object selected by a Composition Segment's
+/// cropping transform. All four fields are in the source object's
+/// coordinate space.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CropRect {
+    pub x: u16,
+    pub y: u16,
+    pub w: u16,
+    pub h: u16,
 }
 
 fn parse_pcs(body: &[u8]) -> Result<PresentationComposition> {
@@ -150,12 +173,35 @@ fn parse_pcs(body: &[u8]) -> Result<PresentationComposition> {
         let x = u16::from_be_bytes([body[cur + 4], body[cur + 5]]);
         let y = u16::from_be_bytes([body[cur + 6], body[cur + 7]]);
         cur += 8;
-        if cropped {
+        let crop = if cropped {
             if cur + 8 > body.len() {
                 return Err(Error::invalid("PGS PCS: cropped object missing crop rect"));
             }
+            let cx = u16::from_be_bytes([body[cur], body[cur + 1]]);
+            let cy = u16::from_be_bytes([body[cur + 2], body[cur + 3]]);
+            let cw = u16::from_be_bytes([body[cur + 4], body[cur + 5]]);
+            let ch = u16::from_be_bytes([body[cur + 6], body[cur + 7]]);
             cur += 8;
-        }
+            // A zero-sized crop is degenerate; flag rather than silently
+            // produce an empty paint, because a malformed authoring tool
+            // is more likely than a Composition Segment that explicitly
+            // wants nothing rendered (an erase display-set is the
+            // documented way to clear). The position fields are 16-bit
+            // unsigned in object space so checked-arithmetic on the lower
+            // bound is automatic; the upper bound is intersected with the
+            // referenced object's dimensions at composite time.
+            if cw == 0 || ch == 0 {
+                return Err(Error::invalid("PGS PCS: crop rectangle has zero extent"));
+            }
+            Some(CropRect {
+                x: cx,
+                y: cy,
+                w: cw,
+                h: ch,
+            })
+        } else {
+            None
+        };
         objects.push(CompositionObject {
             object_id,
             window_id,
@@ -163,6 +209,7 @@ fn parse_pcs(body: &[u8]) -> Result<PresentationComposition> {
             forced,
             x,
             y,
+            crop,
         });
     }
     Ok(PresentationComposition {
@@ -445,13 +492,41 @@ impl DisplaySet {
             let oy = co.y as usize;
             let ow = obj.width as usize;
             let oh = obj.height as usize;
+            // When a Composition Segment carries an `object_cropped_flag`,
+            // the accompanying cropping rectangle selects a sub-region of
+            // the Graphics Object before compositing. Anything outside the
+            // crop window is discarded; the surviving sub-rectangle is
+            // then placed at the composition `(x, y)` on the canvas.
+            // Out-of-range crop coordinates are intersected with the
+            // object's actual extent — an authoring tool may declare a
+            // crop wider than the object (e.g. for a wipe that runs past
+            // the object's right edge); the intersection yields the
+            // largest sub-rect that exists on the source bitmap.
+            let (sx, sy, sw, sh) = if let Some(c) = co.crop {
+                let cx = (c.x as usize).min(ow);
+                let cy = (c.y as usize).min(oh);
+                let cw = (c.w as usize).min(ow.saturating_sub(cx));
+                let ch = (c.h as usize).min(oh.saturating_sub(cy));
+                (cx, cy, cw, ch)
+            } else {
+                (0, 0, ow, oh)
+            };
+            if sw == 0 || sh == 0 {
+                // Crop reduced to nothing after clipping to the object's
+                // real bounds — there is no source pixel to paint.
+                continue;
+            }
             // Composition objects can overlap; when the topmost palette
             // entry is partially transparent the source blends *over*
             // whatever earlier object already painted, rather than
             // overwriting it (Porter–Duff source-over). Build the object
-            // as rows of palette indices and run the shared compositor.
-            let rows: Vec<Vec<u8>> = (0..oh)
-                .map(|row| obj.pixels[row * ow..row * ow + ow].to_vec())
+            // (or its cropped sub-rect) as rows of palette indices and
+            // run the shared compositor.
+            let rows: Vec<Vec<u8>> = (0..sh)
+                .map(|row| {
+                    let start = (sy + row) * ow + sx;
+                    obj.pixels[start..start + sw].to_vec()
+                })
                 .collect();
             let palette = &self.palette;
             crate::composite::blit_indexed(&mut canvas, width, height, &rows, ox, oy, |idx| {
@@ -1911,6 +1986,322 @@ mod tests {
                 &[0, 0, 0, 0],
                 "incomplete object must not paint any pixel"
             );
+        }
+    }
+
+    // ---- PCS crop-rectangle handling ------------------------------------
+    //
+    // A Composition Segment may carry `object_cropped_flag = 1` followed by
+    // an 8-byte cropping rectangle (`x`, `y`, `w`, `h`, each big-endian
+    // `u16`) that selects a sub-region of the referenced Graphics Object
+    // before it lands on the canvas. The whitepaper figure (Cropping stage
+    // between Bitmap Object and Palette → Display Image) is the only place
+    // this is illustrated in the BDA Part 3 material; field-order is the
+    // same `(x, y, w, h)` shape the WDS window record uses elsewhere in
+    // the same stream.
+
+    /// Build a one-object display-set whose Composition Segment carries an
+    /// `object_cropped_flag` + an 8-byte crop rectangle. Otherwise
+    /// identical to [`build_demo_display_set`].
+    fn build_cropped_display_set(
+        canvas: (u16, u16),
+        object: (u16, u16),
+        position: (u16, u16),
+        crop: (u16, u16, u16, u16),
+        palette: &[(u8, [u8; 4])],
+        pixels: &[u8],
+    ) -> Vec<u8> {
+        // Start from the canonical (uncropped) blob and rewrite only its
+        // PCS segment to add the cropped flag + crop rectangle. Every
+        // other segment (WDS / PDS / ODS / END) is reused unchanged.
+        let canonical = build_demo_display_set(canvas, object, position, palette, pixels);
+        let mut out = Vec::new();
+        let mut cur = 0;
+        let mut rewrote_pcs = false;
+        while cur < canonical.len() {
+            let (seg, next) = read_segment(&canonical, cur).expect("demo blob is well-formed");
+            if seg.seg_type == SEG_PCS && !rewrote_pcs {
+                rewrote_pcs = true;
+                let mut pcs = Vec::new();
+                pcs.extend_from_slice(&canvas.0.to_be_bytes());
+                pcs.extend_from_slice(&canvas.1.to_be_bytes());
+                pcs.push(0); // frame rate
+                pcs.extend_from_slice(&1u16.to_be_bytes()); // composition number
+                pcs.push(0); // composition state (normal)
+                pcs.push(0); // palette update flag
+                pcs.push(0); // palette id
+                pcs.push(1); // one composition object
+                pcs.extend_from_slice(&1u16.to_be_bytes()); // object id
+                pcs.push(0); // window id
+                pcs.push(0x80); // object_cropped_flag set
+                pcs.extend_from_slice(&position.0.to_be_bytes());
+                pcs.extend_from_slice(&position.1.to_be_bytes());
+                pcs.extend_from_slice(&crop.0.to_be_bytes());
+                pcs.extend_from_slice(&crop.1.to_be_bytes());
+                pcs.extend_from_slice(&crop.2.to_be_bytes());
+                pcs.extend_from_slice(&crop.3.to_be_bytes());
+                // Re-emit segment header.
+                out.extend_from_slice(b"PG");
+                out.extend_from_slice(&seg.pts_90k.to_be_bytes());
+                out.extend_from_slice(&seg.dts_90k.to_be_bytes());
+                out.push(SEG_PCS);
+                out.extend_from_slice(&(pcs.len() as u16).to_be_bytes());
+                out.extend_from_slice(&pcs);
+            } else {
+                out.extend_from_slice(&canonical[cur..next]);
+            }
+            cur = next;
+        }
+        assert!(rewrote_pcs, "demo set must have a PCS to rewrite");
+        out
+    }
+
+    #[test]
+    fn crop_rect_parsed_into_composition_object() {
+        // A PCS with object_cropped_flag set must populate `crop` on the
+        // CompositionObject; the byte layout is `(x, y, w, h)` as four
+        // big-endian u16s. Drive parse_pcs directly so we exercise the
+        // parser in isolation of the renderer.
+        let mut body = Vec::new();
+        body.extend_from_slice(&100u16.to_be_bytes()); // width
+        body.extend_from_slice(&50u16.to_be_bytes()); // height
+        body.push(0); // frame rate
+        body.extend_from_slice(&7u16.to_be_bytes()); // composition number
+        body.push(0); // composition state
+        body.push(0); // palette update flag
+        body.push(0); // palette id
+        body.push(1); // one composition object
+        body.extend_from_slice(&3u16.to_be_bytes()); // object id
+        body.push(0); // window id
+        body.push(0x80); // cropped flag set
+        body.extend_from_slice(&20u16.to_be_bytes()); // composition x
+        body.extend_from_slice(&15u16.to_be_bytes()); // composition y
+        body.extend_from_slice(&4u16.to_be_bytes()); // crop x
+        body.extend_from_slice(&5u16.to_be_bytes()); // crop y
+        body.extend_from_slice(&12u16.to_be_bytes()); // crop w
+        body.extend_from_slice(&8u16.to_be_bytes()); // crop h
+
+        let pcs = parse_pcs(&body).expect("parse_pcs should accept a valid cropped object");
+        assert_eq!(pcs.objects.len(), 1);
+        let co = &pcs.objects[0];
+        assert!(co.cropped);
+        assert_eq!(
+            co.crop,
+            Some(CropRect {
+                x: 4,
+                y: 5,
+                w: 12,
+                h: 8
+            })
+        );
+    }
+
+    #[test]
+    fn crop_rect_zero_extent_rejected() {
+        // A crop rectangle with `w == 0` or `h == 0` selects nothing —
+        // authoring tools should use an erase display-set instead. The
+        // parser rejects this as malformed so a bad encoder can't quietly
+        // produce blank frames.
+        for (cw, ch) in [(0u16, 8u16), (12u16, 0u16), (0u16, 0u16)] {
+            let mut body = Vec::new();
+            body.extend_from_slice(&100u16.to_be_bytes());
+            body.extend_from_slice(&50u16.to_be_bytes());
+            body.push(0);
+            body.extend_from_slice(&1u16.to_be_bytes());
+            body.push(0);
+            body.push(0);
+            body.push(0);
+            body.push(1);
+            body.extend_from_slice(&1u16.to_be_bytes());
+            body.push(0);
+            body.push(0x80);
+            body.extend_from_slice(&0u16.to_be_bytes());
+            body.extend_from_slice(&0u16.to_be_bytes());
+            body.extend_from_slice(&0u16.to_be_bytes());
+            body.extend_from_slice(&0u16.to_be_bytes());
+            body.extend_from_slice(&cw.to_be_bytes());
+            body.extend_from_slice(&ch.to_be_bytes());
+            assert!(
+                parse_pcs(&body).is_err(),
+                "zero-extent crop ({cw}x{ch}) must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn crop_rect_truncated_is_rejected() {
+        // PCS declares object_cropped_flag but the segment is one byte
+        // short of carrying the eight-byte crop rectangle.
+        let mut body = Vec::new();
+        body.extend_from_slice(&100u16.to_be_bytes());
+        body.extend_from_slice(&50u16.to_be_bytes());
+        body.push(0);
+        body.extend_from_slice(&1u16.to_be_bytes());
+        body.push(0);
+        body.push(0);
+        body.push(0);
+        body.push(1);
+        body.extend_from_slice(&1u16.to_be_bytes());
+        body.push(0);
+        body.push(0x80);
+        body.extend_from_slice(&0u16.to_be_bytes());
+        body.extend_from_slice(&0u16.to_be_bytes());
+        // Only seven of the eight crop bytes follow.
+        body.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0]);
+        assert!(parse_pcs(&body).is_err());
+    }
+
+    #[test]
+    fn cropped_render_paints_only_sub_rectangle() {
+        // 4×4 object: every pixel is colour 1 (opaque green). A crop of
+        // (1, 1, 2, 2) selects a 2×2 sub-rect in object-space. With the
+        // composition `(x, y) = (0, 0)` the cropped sub-rect lands at the
+        // top-left corner of a 4×4 canvas; the rest of the canvas must
+        // remain fully transparent because cropping discarded those rows
+        // and columns of the source.
+        let pixels = vec![1u8; 4 * 4];
+        let palette = [(0u8, [0u8, 0, 0, 0]), (1u8, [40u8, 220, 40, 255])];
+        let blob =
+            build_cropped_display_set((4, 4), (4, 4), (0, 0), (1, 1, 2, 2), &palette, &pixels);
+        let data = decode_one(blob);
+        assert_eq!(data.len(), 4 * 4 * 4);
+        for row in 0..4usize {
+            for col in 0..4usize {
+                let off = (row * 4 + col) * 4;
+                let chunk = &data[off..off + 4];
+                let inside = row < 2 && col < 2;
+                if inside {
+                    assert_eq!(
+                        chunk[3], 255,
+                        "cropped paint must reach pixel ({col},{row}): {chunk:?}"
+                    );
+                    assert!(
+                        chunk[1] > chunk[0] && chunk[1] > chunk[2],
+                        "expected green-dominant inside the crop, got {chunk:?} at ({col},{row})"
+                    );
+                } else {
+                    assert_eq!(
+                        chunk,
+                        &[0u8, 0, 0, 0],
+                        "pixel outside the crop window must be transparent at ({col},{row})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cropped_render_distinguishes_x_and_y_axes() {
+        // A 4×3 object with two distinct colours per quadrant:
+        //   row 0:  1 1 2 2
+        //   row 1:  1 1 2 2
+        //   row 2:  3 3 4 4
+        // Cropping `(2, 0, 2, 2)` selects the top-right 2×2 (all colour 2);
+        // cropping `(0, 2, 2, 1)` selects the bottom-left 2×1 (all
+        // colour 3). The render output must agree.
+        let pixels = vec![1, 1, 2, 2, 1, 1, 2, 2, 3, 3, 4, 4];
+        let palette = [
+            (0u8, [0u8, 0, 0, 0]),
+            (1u8, [10u8, 10, 10, 255]),
+            (2u8, [255u8, 0, 0, 255]),
+            (3u8, [0u8, 255, 0, 255]),
+            (4u8, [0u8, 0, 255, 255]),
+        ];
+
+        // Top-right crop → red.
+        let blob =
+            build_cropped_display_set((4, 3), (4, 3), (0, 0), (2, 0, 2, 2), &palette, &pixels);
+        let data = decode_one(blob);
+        assert_eq!(data.len(), 4 * 3 * 4);
+        for row in 0..3usize {
+            for col in 0..4usize {
+                let off = (row * 4 + col) * 4;
+                let chunk = &data[off..off + 4];
+                let inside = row < 2 && col < 2;
+                if inside {
+                    assert!(
+                        chunk[0] > chunk[1] && chunk[0] > chunk[2] && chunk[3] == 255,
+                        "expected red at ({col},{row}), got {chunk:?}"
+                    );
+                } else {
+                    assert_eq!(chunk, &[0u8, 0, 0, 0]);
+                }
+            }
+        }
+
+        // Bottom-left crop → green, painted at canvas (0, 0) since the
+        // composition position stays the same — the crop is on source
+        // space, not destination.
+        let blob =
+            build_cropped_display_set((4, 3), (4, 3), (0, 0), (0, 2, 2, 1), &palette, &pixels);
+        let data = decode_one(blob);
+        for col in 0..2usize {
+            let off = col * 4;
+            let chunk = &data[off..off + 4];
+            assert!(
+                chunk[1] > chunk[0] && chunk[1] > chunk[2] && chunk[3] == 255,
+                "expected green at top-left of canvas after vertical-y crop, got {chunk:?}"
+            );
+        }
+        for col in 2..4usize {
+            let off = col * 4;
+            assert_eq!(&data[off..off + 4], &[0u8, 0, 0, 0]);
+        }
+    }
+
+    #[test]
+    fn crop_clipped_to_object_bounds() {
+        // A 4×4 object cropped with a window that overflows the right
+        // and bottom edges — e.g. `(2, 2, 10, 10)` — must reduce to the
+        // intersection with the object's real bounds (here 2×2 starting
+        // at (2, 2)). The render output is then the bottom-right 2×2
+        // sub-image, placed at composition (0, 0).
+        let pixels: Vec<u8> = (0..16u8).map(|i| if i >= 10 { 1 } else { 0 }).collect();
+        // Object layout (one byte per cell):
+        //   row 0: 0 0 0 0
+        //   row 1: 0 0 0 0
+        //   row 2: 1 1 1 1
+        //   row 3: 1 1 1 1
+        // After cropping `(2, 2, 10, 10)` we keep the 2×2 sub-rect at
+        // object (2, 2) — four colour-1 cells.
+        let palette = [(0u8, [0u8, 0, 0, 0]), (1u8, [80u8, 80, 200, 255])];
+        let blob =
+            build_cropped_display_set((4, 4), (4, 4), (0, 0), (2, 2, 10, 10), &palette, &pixels);
+        let data = decode_one(blob);
+        for row in 0..4usize {
+            for col in 0..4usize {
+                let off = (row * 4 + col) * 4;
+                let chunk = &data[off..off + 4];
+                if row < 2 && col < 2 {
+                    assert_eq!(
+                        chunk[3], 255,
+                        "clipped 2×2 must paint top-left ({col},{row}): {chunk:?}"
+                    );
+                } else {
+                    assert_eq!(
+                        chunk,
+                        &[0u8, 0, 0, 0],
+                        "outside-window pixel ({col},{row}) must be transparent"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn crop_entirely_outside_object_paints_nothing() {
+        // Crop starts at (10, 10) on a 4×4 object — there is no source
+        // pixel to read after intersecting with object bounds. The
+        // decoder must drop the composition silently and leave the canvas
+        // fully transparent rather than panic or scribble.
+        let pixels = vec![1u8; 4 * 4];
+        let palette = [(0u8, [0u8, 0, 0, 0]), (1u8, [200u8, 0, 0, 255])];
+        let blob =
+            build_cropped_display_set((4, 4), (4, 4), (0, 0), (10, 10, 2, 2), &palette, &pixels);
+        let data = decode_one(blob);
+        assert_eq!(data.len(), 4 * 4 * 4);
+        for chunk in data.chunks(4) {
+            assert_eq!(chunk, &[0u8, 0, 0, 0]);
         }
     }
 }

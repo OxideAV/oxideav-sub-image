@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- PGS Composition Segments carrying `object_cropped_flag = 1` now
+  **apply** the 8-byte cropping rectangle that trails the object entry,
+  instead of dropping the rectangle bytes on the floor and compositing
+  the full bitmap. `CompositionObject` gains a `crop: Option<CropRect>`
+  field carrying the parsed `(x, y, w, h)` (four big-endian `u16`s in
+  source-object space — the same rectangle layout used by the WDS window
+  record elsewhere in the stream); during render the cropped sub-region
+  of the Graphics Object is selected before placement at the composition
+  `(x, y)`, matching the whitepaper's Cropping → Palette → Display Image
+  pipeline figure. Out-of-range crop coordinates are intersected with
+  the source object's real bounds (so a crop that slightly overhangs the
+  right or bottom edge becomes the largest sub-rect that exists, and a
+  crop landing entirely outside the object paints nothing). Zero-extent
+  crops (`w == 0` or `h == 0`) and truncated 8-byte tails are rejected
+  at parse time rather than silently producing a blank frame.
+- Six new unit tests for the cropping path: a structured-parse assertion
+  against a hand-built PCS that an `object_cropped_flag` populates a
+  `CropRect { x, y, w, h }` matching the on-wire bytes; a zero-extent
+  rejection sweep across `(0,h)`, `(w,0)`, and `(0,0)`; a
+  short-by-one-byte truncation rejection test; an end-to-end render
+  test asserting that cropping a 4×4 opaque object to `(1, 1, 2, 2)`
+  paints only a 2×2 sub-rectangle at the canvas top-left and leaves
+  the rest fully transparent; a per-quadrant axis-distinction test that
+  exercises both an X-axis crop (top-right quadrant) and a Y-axis crop
+  (bottom row) against a 4×3 four-quadrant object and verifies the
+  decoded RGBA matches the cropped quadrant; an over-by-the-edge
+  clipping test that asserts a crop wider+taller than the object reduces
+  to the intersection with object bounds; and an entirely-outside test
+  that asserts a crop starting past the object's far edge paints
+  nothing (and does not panic).
 - VobSub decoder now **applies** the mid-display `CHG_COLCON` palette /
   contrast change command (opcode `0x07`) to the rendered canvas
   rather than length-skipping it. The command's parameter payload is
