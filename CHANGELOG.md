@@ -9,6 +9,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- VobSub decoder now **applies** the mid-display `CHG_COLCON` palette /
+  contrast change command (opcode `0x07`) to the rendered canvas
+  rather than length-skipping it. The command's parameter payload is
+  parsed into a list of `ChgColConBand` (vertically-bounded `LN_CTLI`)
+  + `ChgColConEntry` (horizontal-start-column `PX_CTLI`) values
+  exposed on `Spu::chg_colcon`; during canvas paint each pixel inside
+  a band's `csln..=ctln` display-line range picks up the right-most
+  matching `PX_CTLI`'s replacement palette (4 nibble indices into the
+  16-entry `.idx` palette, one per RLE 2-bit pixel value) and
+  replacement alpha (4 nibbles in the same order) in lieu of the
+  SPU's base `SET_COLOR` / `SET_CONTR` selections. The replacement
+  runs rightwards from the entry's `start_col` to the next entry's
+  `start_col` or the right edge of the display area. Coordinates are
+  in absolute display-line / display-column space (matching the
+  bbox-relative `LN_CTLI` / `PX_CTLI` semantics in the SPU spec); the
+  decoder maps bitmap-local `(x, y)` back to display space via the
+  SPU's `(x1, y1)` origin so bands authored against the full canvas
+  apply correctly to SPUs whose bbox doesn't start at `(0, 0)`. The
+  parser tolerates payloads with or without the explicit
+  `0F FF FF FF` `LN_CTLI` sentinel and rejects truncated `LN_CTLI` /
+  `PX_CTLI`, a non-zero reserved high nibble in the `csln` byte,
+  `ctln < csln`, and non-strictly-increasing `start_col` values
+  inside a band. The `Spu::saw_chg_colcon` flag continues to surface
+  the command's presence.
+- Eleven new unit tests for the CHG_COLCON application path: a
+  bbox-rewriting helper sanity check; structured-parse assertions
+  against a hand-built single-band-two-entries payload; a canvas
+  mutation test asserting the upper half of an opaque pattern goes
+  transparent when a band carries `alpha[pat] = 0` for the matching
+  lines; a horizontal-start-column test asserting `PX_CTLI` start
+  column boundaries land bitmap-local rather than off-by-one; a
+  display-coords-vs-bitmap-local test asserting an SPU rendered at
+  `(50, 100)` interprets `csln = 100` and `start_col = 52` as absolute
+  display coordinates; truncated-LN_CTLI, truncated-PX_CTLI,
+  reserved-high-nibble, inverted-lines, and non-increasing-start-col
+  payload negative-input tests; an unterminated-payload
+  acceptance test; an overlapping-bands lookup test asserting the
+  later band wins; a left-of-start lookup test; and a 200-iteration
+  pseudo-random no-panic sweep through `send_packet` →
+  `receive_frame`.
 - DVB subtitle pixel-line decoders are now exercised by a property +
   negative-input sweep. Each of `decode_2bit_string` /
   `decode_4bit_string` / `decode_8bit_string` gains a round-trip test
@@ -35,27 +75,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reference to other 2-bit-decoder implementations. Behaviour is
   unchanged.
 
-- VobSub decoder now length-skips the SP_DCSQ CHG_COLCON command
-  (opcode `0x07`) instead of hard-erroring on it. The command's
-  documented self-delimiting form (one command byte + a 2-byte
-  total-parameter-size word that includes the size word itself + a
-  variable-length LN_CTLI / PX_CTLI payload terminated by the
-  `0F FF FF FF` LN_CTLI sentinel) is consumed in lock-step with the
-  rest of the control sequence: the mid-display palette / contrast
-  mutations the command requests are not applied to the rendered
-  bitmap, but SPUs that carry the command now decode their base
-  palette / alpha / coords / RLE successfully where previously every
-  control sequence containing a CHG_COLCON returned
-  `InvalidData("vobsub SPU: unknown command 0x07")`. New
-  `Spu::saw_chg_colcon` flag surfaces the fact that a stream asked
-  for the mutations so callers / tests can observe the gap.
-- Five new unit tests for the CHG_COLCON path: full SPU round-trip
-  through a CHG_COLCON-bearing control sequence asserting that the
-  decoded pixels match the CHG_COLCON-free baseline and the flag is
-  set; CHG_COLCON with a `size = 2` (zero-payload) parameter block
-  tolerated as a valid self-delimiting form; explicit error paths
-  for size-word truncation, payload truncation, and a size word
-  below the minimum legal value of 2.
+- VobSub `Spu::saw_chg_colcon` flag — present since the previous
+  release — is now joined by `Spu::chg_colcon`, the parsed
+  `Vec<ChgColConBand>` carrying the mid-display palette / contrast
+  replacements (each band has `csln`, `ctln`, and a `Vec` of
+  `ChgColConEntry { start_col, palette_sel, alpha }`). The earlier
+  length-skip behaviour (added one release ago to stop CHG_COLCON
+  from desync-failing the control sequence) is superseded by the
+  application path described in the new Added entry above; SPUs that
+  carry the command now both decode their base palette / alpha /
+  coords / RLE successfully *and* see the requested rectangular
+  palette / alpha replacements reach the rendered canvas.
 
 ## [0.0.7](https://github.com/OxideAV/oxideav-sub-image/compare/v0.0.6...v0.0.7) - 2026-05-29
 

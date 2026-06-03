@@ -42,15 +42,20 @@
 //!
 //! * **Decode only.**
 //! * Handles the standard 4-colour palette + alpha form (every SPU
-//!   uses exactly 4 of the 16 palette entries). The mid-display
-//!   colour/contrast change command (0x07 CHG_COLCON) is length-skipped
-//!   rather than applied: streams that carry it decode to a bitmap
-//!   coloured by the SPU's base palette/alpha, with the rectangular
-//!   palette/alpha mutations the command requests ignored. The skip
-//!   reads the documented 2-byte parameter-block size (which includes
-//!   the size word itself) so the rest of the control sequence stays
-//!   in lock-step. The `Spu::saw_chg_colcon` flag surfaces the fact
-//!   that an SPU asked for the mutations.
+//!   uses exactly 4 of the 16 palette entries).
+//! * The mid-display colour/contrast change command (0x07 CHG_COLCON)
+//!   is parsed into a list of vertically-bounded `LN_CTLI` bands, each
+//!   carrying one or more `PX_CTLI` (start-column + replacement
+//!   palette/alpha) entries, and **applied** to the rendered bitmap
+//!   during decoder canvas paint: pixels that fall inside a band's
+//!   `csln..=ctln` line range and on/after a `PX_CTLI`'s start-column
+//!   pick up that entry's replacement palette and alpha (running until
+//!   the next `PX_CTLI` in the same band or the right edge of the
+//!   display area). Bands and entries are clipped to the SPU's
+//!   declared bounding box (`x1..=x2`, `y1..=y2`); out-of-bbox bands
+//!   are ignored. The `Spu::saw_chg_colcon` flag still surfaces that
+//!   the command was present, and `Spu::chg_colcon` exposes the parsed
+//!   structure for callers that need it.
 //! * Palette/alpha defaults are black-text-on-transparent when the
 //!   SPU omits a colour command (malformed streams).
 //! * `.idx` without a palette line falls back to an all-grey fallback
@@ -198,11 +203,50 @@ pub struct Spu {
     pub top_rle_off: u16,
     pub bot_rle_off: u16,
     /// Set to `true` when the control sequence contained at least one
-    /// well-formed CHG_COLCON (0x07) command. The command itself is
-    /// length-skipped — the mid-display palette/alpha mutations it
-    /// requests are not currently applied to the rendered bitmap —
-    /// but callers (and tests) can observe that the SPU asked for them.
+    /// well-formed CHG_COLCON (0x07) command. The mid-display palette/
+    /// alpha mutations the command carries are applied to the rendered
+    /// bitmap during decoder canvas paint (see `chg_colcon` below);
+    /// this flag also surfaces the fact that an SPU asked for them so
+    /// tests / callers can branch on it independently of the structured
+    /// data.
     pub saw_chg_colcon: bool,
+    /// Parsed CHG_COLCON parameter blocks, in the order they appeared
+    /// in the control sequence. Each entry is one vertically-bounded
+    /// band (`LN_CTLI`) carrying a list of horizontal start-column
+    /// transitions (`PX_CTLI`). Coordinates are in absolute display
+    /// (line, column) space, not bitmap-local space — the decoder
+    /// intersects them with the SPU's bounding box (`x1..=x2`,
+    /// `y1..=y2`) when applying the mutations to the rendered canvas.
+    pub chg_colcon: Vec<ChgColConBand>,
+}
+
+/// One vertically-bounded band in a CHG_COLCON parameter block — a
+/// `LN_CTLI` plus the `PX_CTLI` entries that follow it.
+#[derive(Clone, Debug, Default)]
+pub struct ChgColConBand {
+    /// Top-most display line covered by this band (inclusive).
+    pub csln: u16,
+    /// Bottom-most display line covered by this band (inclusive).
+    pub ctln: u16,
+    /// Horizontal start-column transitions inside the band, left-to-right.
+    pub entries: Vec<ChgColConEntry>,
+}
+
+/// One `PX_CTLI`: from `start_col` rightwards (up to the next entry or
+/// the right edge of the display area), pixels of each 2-bit RLE value
+/// pick up the replacement palette index from `palette_sel` and the
+/// replacement alpha nibble from `alpha`, in lieu of the SPU's base
+/// SET_COLOR / SET_CONTR selections.
+#[derive(Clone, Debug, Default)]
+pub struct ChgColConEntry {
+    /// Display column where the replacement starts (inclusive).
+    pub start_col: u16,
+    /// Replacement palette indices into the 16-entry `.idx` palette,
+    /// indexed by the 2-bit RLE pixel value (bg / pattern / emp1 / emp2).
+    pub palette_sel: [u8; 4],
+    /// Replacement alpha nibbles (0..15), indexed by the 2-bit RLE
+    /// pixel value, in the same order as `palette_sel`.
+    pub alpha: [u8; 4],
 }
 
 /// Parse a SPU (one DVD subtitle unit), producing its control state and
@@ -292,25 +336,29 @@ pub fn parse_and_decode_spu(spu: &[u8]) -> Result<(Spu, Vec<u8>, (u16, u16))> {
                     cmd_pos += 4;
                 }
                 0x07 => {
-                    // CHG_COLCON — change colour/contrast within rectangular
-                    // sub-areas of the display. We don't currently apply the
-                    // mid-display palette/alpha mutations, but the command is
-                    // self-delimiting: a 2-byte total parameter size (which
-                    // includes the two size bytes themselves) follows the
-                    // command byte, then `size - 2` bytes of LN_CTLI / PX_CTLI
-                    // parameters terminated by the LN_CTLI sentinel
-                    // 0F FF FF FF. Skipping the documented length keeps the
-                    // rest of the control sequence in lock-step instead of
-                    // hard-erroring on streams that carry the command, while
-                    // still rejecting truncated payloads.
+                    // CHG_COLCON — change colour/contrast within
+                    // rectangular sub-areas of the display. The command
+                    // is self-delimiting: a 2-byte total parameter size
+                    // (which includes the two size bytes themselves)
+                    // follows the command byte, then `size - 2` bytes of
+                    // LN_CTLI / PX_CTLI parameters terminated by the
+                    // LN_CTLI sentinel `0F FF FF FF`. We parse the
+                    // payload into structured bands here and apply the
+                    // palette/alpha replacements during canvas paint;
+                    // the original byte-count is still respected so the
+                    // rest of the control sequence stays in lock-step
+                    // even when the parser tolerates an unterminated
+                    // payload (some streams pad the payload area without
+                    // emitting the explicit sentinel).
                     if cmd_pos + 2 > spu_len {
                         return Err(Error::invalid("vobsub SPU: CHG_COLCON size word truncated"));
                     }
                     let size = u16::from_be_bytes([spu[cmd_pos], spu[cmd_pos + 1]]) as usize;
                     // The size includes the two size bytes themselves; a
-                    // value < 2 would underflow when computing the payload
-                    // length, and a value of exactly 2 means zero parameter
-                    // bytes (still a valid edge case to tolerate).
+                    // value < 2 would underflow when computing the
+                    // payload length, and a value of exactly 2 means
+                    // zero parameter bytes (still a valid edge case to
+                    // tolerate).
                     if size < 2 {
                         return Err(Error::invalid("vobsub SPU: CHG_COLCON size word < 2"));
                     }
@@ -320,7 +368,10 @@ pub fn parse_and_decode_spu(spu: &[u8]) -> Result<(Spu, Vec<u8>, (u16, u16))> {
                             "vobsub SPU: CHG_COLCON parameters truncated",
                         ));
                     }
+                    let payload = &spu[cmd_pos + 2..new_pos];
+                    let bands = parse_chg_colcon_payload(payload)?;
                     out.saw_chg_colcon = true;
+                    out.chg_colcon.extend(bands);
                     cmd_pos = new_pos;
                 }
                 0xFF => {
@@ -368,6 +419,142 @@ pub fn parse_and_decode_spu(spu: &[u8]) -> Result<(Spu, Vec<u8>, (u16, u16))> {
         }
     }
     Ok((out, pixels, (width as u16, height as u16)))
+}
+
+/// Parse a CHG_COLCON parameter payload (the bytes *after* the 2-byte
+/// total-size word, i.e. `size - 2` bytes) into a list of bands.
+///
+/// Each band starts with one 4-byte LN_CTLI header in the form
+/// `0sss ntt t` (4-bit nibbles, big-endian), where:
+///
+/// * `sss` (12 bits) is `csln`, the inclusive top-most display line;
+/// * `n` (4 bits) is the number of `PX_CTLI` entries that follow;
+/// * `ttt` (12 bits) is `ctln`, the inclusive bottom-most display line.
+///
+/// Each `PX_CTLI` is 6 bytes: a 2-byte big-endian start column, a 2-byte
+/// SET_COLOR-style nibble pair (`bg|pat`, `emp1|emp2`), and a 2-byte
+/// SET_CONTR-style alpha nibble pair (same byte order). The sentinel
+/// `0F FF FF FF` LN_CTLI terminates the list.
+///
+/// We tolerate two well-formed payload-end shapes: the explicit
+/// sentinel, and a clean exhaustion of the payload bytes (some
+/// authoring tools pad the payload area to a fixed size and rely on the
+/// outer 2-byte size word to bound it). Any other malformation —
+/// truncated LN_CTLI or PX_CTLI, `ctln < csln`, or a non-decreasing
+/// start column inside a band — is reported as `Error::invalid`.
+fn parse_chg_colcon_payload(payload: &[u8]) -> Result<Vec<ChgColConBand>> {
+    let mut bands = Vec::new();
+    let mut pos = 0usize;
+    while pos < payload.len() {
+        // Need at least one LN_CTLI (4 bytes).
+        if pos + 4 > payload.len() {
+            return Err(Error::invalid(
+                "vobsub SPU: CHG_COLCON LN_CTLI header truncated",
+            ));
+        }
+        let h0 = payload[pos];
+        let h1 = payload[pos + 1];
+        let h2 = payload[pos + 2];
+        let h3 = payload[pos + 3];
+        // Sentinel `0F FF FF FF` terminates the list.
+        if h0 == 0x0F && h1 == 0xFF && h2 == 0xFF && h3 == 0xFF {
+            // Sentinel consumed; any bytes after it are payload padding.
+            break;
+        }
+        // Top 4 bits MUST be zero per the spec layout; if they aren't
+        // the byte stream is desynchronised and we'd otherwise produce
+        // junk csln values.
+        if (h0 & 0xF0) != 0 {
+            return Err(Error::invalid(
+                "vobsub SPU: CHG_COLCON LN_CTLI high nibble must be zero",
+            ));
+        }
+        let csln = (((h0 as u16) << 8) | (h1 as u16)) & 0x0FFF;
+        let n = (h2 >> 4) & 0x0F;
+        let ctln = ((((h2 as u16) & 0x0F) << 8) | (h3 as u16)) & 0x0FFF;
+        if ctln < csln {
+            return Err(Error::invalid("vobsub SPU: CHG_COLCON LN_CTLI ctln < csln"));
+        }
+        pos += 4;
+        let mut entries = Vec::with_capacity(n as usize);
+        let mut last_start: Option<u16> = None;
+        for _ in 0..n {
+            if pos + 6 > payload.len() {
+                return Err(Error::invalid("vobsub SPU: CHG_COLCON PX_CTLI truncated"));
+            }
+            let start_col = u16::from_be_bytes([payload[pos], payload[pos + 1]]);
+            let c0 = payload[pos + 2];
+            let c1 = payload[pos + 3];
+            let a0 = payload[pos + 4];
+            let a1 = payload[pos + 5];
+            pos += 6;
+            // PX_CTLI entries inside a band run left-to-right; the next
+            // entry's start_col must be strictly greater than the one
+            // before it. Otherwise a later entry would silently never
+            // get applied (its column range would be empty or inverted).
+            if let Some(prev) = last_start {
+                if start_col <= prev {
+                    return Err(Error::invalid(
+                        "vobsub SPU: CHG_COLCON PX_CTLI start_col not strictly increasing",
+                    ));
+                }
+            }
+            last_start = Some(start_col);
+            entries.push(ChgColConEntry {
+                start_col,
+                // SET_COLOR-byte convention (matches the 0x03 handler):
+                // byte 0 = bg|pattern (high|low nibble),
+                // byte 1 = emp1|emp2.
+                palette_sel: [c0 >> 4, c0 & 0x0F, c1 >> 4, c1 & 0x0F],
+                // SET_CONTR-byte convention (matches the 0x04 handler).
+                alpha: [a0 >> 4, a0 & 0x0F, a1 >> 4, a1 & 0x0F],
+            });
+        }
+        bands.push(ChgColConBand {
+            csln,
+            ctln,
+            entries,
+        });
+    }
+    Ok(bands)
+}
+
+/// Resolve the active replacement palette / alpha for one
+/// canvas-bitmap pixel given the SPU's CHG_COLCON bands. Returns
+/// `Some((palette_sel, alpha))` if any band covers `(disp_x, disp_y)`,
+/// else `None` (meaning: fall back to the base SET_COLOR / SET_CONTR).
+///
+/// `disp_x` / `disp_y` are absolute display coordinates (i.e.
+/// `bitmap_x + spu.x1`, `bitmap_y + spu.y1`).
+///
+/// When multiple bands match the same line, the last one wins — this is
+/// the natural read-order behaviour for a serially-applied list of
+/// replacements. Inside a band, the active entry is the right-most one
+/// whose `start_col` is `<= disp_x`.
+fn chg_colcon_lookup(
+    bands: &[ChgColConBand],
+    disp_x: u16,
+    disp_y: u16,
+) -> Option<([u8; 4], [u8; 4])> {
+    let mut hit: Option<([u8; 4], [u8; 4])> = None;
+    for band in bands {
+        if disp_y < band.csln || disp_y > band.ctln {
+            continue;
+        }
+        // Find the right-most entry whose start_col is <= disp_x.
+        let mut chosen: Option<&ChgColConEntry> = None;
+        for entry in &band.entries {
+            if entry.start_col <= disp_x {
+                chosen = Some(entry);
+            } else {
+                break;
+            }
+        }
+        if let Some(entry) = chosen {
+            hit = Some((entry.palette_sel, entry.alpha));
+        }
+    }
+    hit
 }
 
 /// Decode a VobSub RLE field into the `pixels` buffer. The VobSub RLE
@@ -844,10 +1031,29 @@ impl Decoder for VobSubDecoder {
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
         let (spu, pixels, (w, h)) = parse_and_decode_spu(&packet.data)?;
         let mut canvas = vec![0u8; (w as usize) * (h as usize) * 4];
+        let bbox_x = spu.x1;
+        let bbox_y = spu.y1;
+        let has_chg_colcon = !spu.chg_colcon.is_empty();
         for (i, &idx_4) in pixels.iter().enumerate() {
             let which = idx_4 as usize & 0x03;
-            let pal_idx = spu.palette_sel[which] as usize & 0x0F;
-            let alpha4 = spu.alpha[which] & 0x0F;
+            // Resolve replacement palette/alpha from CHG_COLCON when the
+            // pixel's display-space coordinate falls inside a band.
+            // Bitmap-local (x, y) maps to display-space via the SPU's
+            // (x1, y1) origin.
+            let (pal_arr, alpha_arr) = if has_chg_colcon {
+                let bx = (i % (w as usize)) as u16;
+                let by = (i / (w as usize)) as u16;
+                let disp_x = bbox_x.saturating_add(bx);
+                let disp_y = bbox_y.saturating_add(by);
+                match chg_colcon_lookup(&spu.chg_colcon, disp_x, disp_y) {
+                    Some((p, a)) => (p, a),
+                    None => (spu.palette_sel, spu.alpha),
+                }
+            } else {
+                (spu.palette_sel, spu.alpha)
+            };
+            let pal_idx = pal_arr[which] as usize & 0x0F;
+            let alpha4 = alpha_arr[which] & 0x0F;
             let alpha = alpha4 * 17; // 0..15 → 0..255
             if alpha == 0 {
                 continue;
@@ -1354,6 +1560,495 @@ timestamp: 00:00:03:000, filepos: 000000040
         let (state, _, (w, h)) = parse_and_decode_spu(&out).unwrap();
         assert_eq!((w, h), (2, 2));
         assert!(state.saw_chg_colcon);
+    }
+
+    /// Helper: rebuild a 2×2 SPU with a single CHG_COLCON command,
+    /// supplying a fully-formed parameter payload (including the
+    /// trailing `0F FF FF FF` LN_CTLI sentinel). Caller passes the
+    /// LN_CTLI-and-PX_CTLI byte sequence WITHOUT the sentinel; this
+    /// helper appends it and computes the 2-byte total-size header.
+    ///
+    /// `bbox_x1` / `bbox_y1` are the SPU's top-left display
+    /// coordinates: the test uses them to verify the band/entry
+    /// coordinates are interpreted as absolute display coordinates
+    /// (not bitmap-local). The 2-byte SET_DAREA encoding in
+    /// `build_demo_spu` only handles `(0, 0)`-origin SPUs, so this
+    /// helper rewrites the coords command in-place to point at the
+    /// requested bbox.
+    fn build_spu_with_chg_colcon_payload(
+        width: u16,
+        height: u16,
+        indices: &[u8],
+        bbox_x1: u16,
+        bbox_y1: u16,
+        payload_no_sentinel: &[u8],
+    ) -> Vec<u8> {
+        // Build base SPU with the requested bitmap.
+        let base = build_demo_spu(width, height, indices);
+        let base_ctrl = u16::from_be_bytes([base[2], base[3]]) as usize;
+        let rle_region = &base[4..base_ctrl];
+        let cmd_region = &base[base_ctrl + 4..];
+
+        // Walk commands; record the (start_idx) of the START display
+        // command and rewrite the SET_DAREA coords command in-place so
+        // the SPU's display bbox = (bbox_x1, bbox_y1) ..= (bbox_x1 +
+        // width - 1, bbox_y1 + height - 1).
+        let mut new_cmd_region: Vec<u8> = cmd_region.to_vec();
+        let mut walk = 0usize;
+        let start_idx;
+        loop {
+            assert!(walk < new_cmd_region.len());
+            let cmd = new_cmd_region[walk];
+            match cmd {
+                0x00 | 0x01 => {
+                    start_idx = walk;
+                    break;
+                }
+                0x02 => walk += 1,
+                0x03 | 0x04 => walk += 1 + 2,
+                0x05 => {
+                    let x2 = bbox_x1 + width - 1;
+                    let y2 = bbox_y1 + height - 1;
+                    new_cmd_region[walk + 1] = (bbox_x1 >> 4) as u8;
+                    new_cmd_region[walk + 2] =
+                        (((bbox_x1 & 0x0F) as u8) << 4) | ((x2 >> 8) as u8 & 0x0F);
+                    new_cmd_region[walk + 3] = (x2 & 0xFF) as u8;
+                    new_cmd_region[walk + 4] = (bbox_y1 >> 4) as u8;
+                    new_cmd_region[walk + 5] =
+                        (((bbox_y1 & 0x0F) as u8) << 4) | ((y2 >> 8) as u8 & 0x0F);
+                    new_cmd_region[walk + 6] = (y2 & 0xFF) as u8;
+                    walk += 1 + 6;
+                }
+                0x06 => walk += 1 + 4,
+                _ => panic!("unexpected baseline cmd 0x{cmd:02X}"),
+            }
+        }
+
+        // Build the new command region: prefix + CHG_COLCON +
+        // payload + sentinel + suffix.
+        let mut payload_full = Vec::with_capacity(payload_no_sentinel.len() + 4);
+        payload_full.extend_from_slice(payload_no_sentinel);
+        payload_full.extend_from_slice(&[0x0F, 0xFF, 0xFF, 0xFF]);
+        let size = (2 + payload_full.len()) as u16; // includes size word
+
+        let mut new_cmds = Vec::new();
+        new_cmds.extend_from_slice(&new_cmd_region[..start_idx]);
+        new_cmds.push(0x07);
+        new_cmds.extend_from_slice(&size.to_be_bytes());
+        new_cmds.extend_from_slice(&payload_full);
+        new_cmds.extend_from_slice(&new_cmd_region[start_idx..]);
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&[0, 0]);
+        let new_ctrl_off = 4 + rle_region.len();
+        out.extend_from_slice(&(new_ctrl_off as u16).to_be_bytes());
+        out.extend_from_slice(rle_region);
+        let ctrl_pos = out.len();
+        out.extend_from_slice(&[0, 0, 0, 0]); // delay + next placeholder
+        out.extend_from_slice(&new_cmds);
+        out[ctrl_pos + 2] = (ctrl_pos as u16 >> 8) as u8;
+        out[ctrl_pos + 3] = (ctrl_pos as u16 & 0xFF) as u8;
+        let total = out.len() as u16;
+        out[0] = (total >> 8) as u8;
+        out[1] = (total & 0xFF) as u8;
+        out
+    }
+
+    /// Sanity-check the new bbox-rewriting branch of the helper before
+    /// the more involved CHG_COLCON application tests use it.
+    #[test]
+    fn helper_bbox_rewrite_produces_expected_coords() {
+        // Use empty payload (just sentinel) so this only validates the
+        // SET_DAREA rewrite + control-block plumbing, not the CHG_COLCON
+        // application logic itself.
+        let spu = build_spu_with_chg_colcon_payload(2, 2, &[1u8, 1, 1, 1], 100, 50, &[]);
+        let (state, _, (w, h)) = parse_and_decode_spu(&spu).unwrap();
+        assert_eq!((w, h), (2, 2));
+        assert_eq!((state.x1, state.y1), (100, 50));
+        assert_eq!((state.x2, state.y2), (101, 51));
+        assert!(state.saw_chg_colcon);
+        assert!(
+            state.chg_colcon.is_empty(),
+            "empty payload (sentinel only) should produce zero bands"
+        );
+    }
+
+    #[test]
+    fn chg_colcon_parses_single_band_with_two_entries() {
+        // One LN_CTLI covering display lines 10..=20 with two PX_CTLI:
+        // - col 100: bg→0x5, pat→0x6, emp1→0x7, emp2→0x8;
+        //            alpha bg→0x9, pat→0xA, emp1→0xB, emp2→0xC
+        // - col 200: bg→0x1, pat→0x2, emp1→0x3, emp2→0x4;
+        //            alpha bg→0xF, pat→0xE, emp1→0xD, emp2→0xC
+        //
+        // LN_CTLI: 0 sss n ttt → csln=10, n=2, ctln=20 → 00 0A 20 14
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0x00, 0x0A, 0x20, 0x14]); // LN_CTLI
+
+        payload.extend_from_slice(&100u16.to_be_bytes()); // start_col
+        payload.extend_from_slice(&[0x56, 0x78]); // colors: 5/6, 7/8
+        payload.extend_from_slice(&[0x9A, 0xBC]); // alphas: 9/A, B/C
+
+        payload.extend_from_slice(&200u16.to_be_bytes());
+        payload.extend_from_slice(&[0x12, 0x34]);
+        payload.extend_from_slice(&[0xFE, 0xDC]);
+
+        let spu = build_spu_with_chg_colcon_payload(2, 2, &[1u8, 1, 1, 1], 0, 0, &payload);
+        let (state, _, _) = parse_and_decode_spu(&spu).unwrap();
+        assert_eq!(state.chg_colcon.len(), 1);
+        let band = &state.chg_colcon[0];
+        assert_eq!((band.csln, band.ctln), (10, 20));
+        assert_eq!(band.entries.len(), 2);
+        assert_eq!(band.entries[0].start_col, 100);
+        assert_eq!(band.entries[0].palette_sel, [0x5, 0x6, 0x7, 0x8]);
+        assert_eq!(band.entries[0].alpha, [0x9, 0xA, 0xB, 0xC]);
+        assert_eq!(band.entries[1].start_col, 200);
+        assert_eq!(band.entries[1].palette_sel, [0x1, 0x2, 0x3, 0x4]);
+        assert_eq!(band.entries[1].alpha, [0xF, 0xE, 0xD, 0xC]);
+    }
+
+    #[test]
+    fn chg_colcon_application_mutates_canvas_alpha_inside_band() {
+        // Build a 4×4 SPU at display origin (0, 0) filled with pattern
+        // (RLE index 1). Base palette[1]=red, base alpha[1]=0xF
+        // (opaque). CHG_COLCON band covering lines 0..=1 (top half)
+        // sets alpha[1]=0 from column 0 onward.
+        //
+        // Result: rows 0 + 1 should be all-transparent (alpha=0),
+        // rows 2 + 3 should stay solid red opaque.
+        let indices = vec![1u8; 4 * 4];
+        let mut payload = Vec::new();
+        // LN_CTLI: csln=0, n=1, ctln=1 → 00 00 10 01
+        payload.extend_from_slice(&[0x00, 0x00, 0x10, 0x01]);
+        payload.extend_from_slice(&0u16.to_be_bytes()); // start_col=0
+                                                        // colors: keep base (bg=0, pat=1, emp1=3, emp2=2). Byte 0
+                                                        // (bg|pat) = 0x01, byte 1 (emp1|emp2) = 0x32.
+        payload.extend_from_slice(&[0x01, 0x32]);
+        // alphas: bg=0, pat=0 (transparent), emp1=0xF, emp2=0xF.
+        payload.extend_from_slice(&[0x00, 0xFF]);
+
+        let spu = build_spu_with_chg_colcon_payload(4, 4, &indices, 0, 0, &payload);
+
+        // Decoder setup: palette[1]=red.
+        let mut params = CodecParameters::video(CodecId::new(VOBSUB_CODEC_ID));
+        let mut extra = vec![0u8; 48];
+        extra[3] = 255; // palette[1] R
+        params.extradata = extra;
+        let mut dec = make_decoder(&params).unwrap();
+        let pkt = Packet::new(0, TimeBase::new(1, 1_000_000), spu).with_pts(0);
+        dec.send_packet(&pkt).unwrap();
+        let frame = dec.receive_frame().unwrap();
+        let Frame::Video(v) = frame else {
+            panic!();
+        };
+        // Row 0: all transparent.
+        for col in 0..4 {
+            let dst = col * 4;
+            assert_eq!(
+                v.planes[0].data[dst + 3],
+                0,
+                "row 0 col {col} should be transparent"
+            );
+        }
+        // Row 1: same.
+        for col in 0..4 {
+            let dst = (4 + col) * 4;
+            assert_eq!(
+                v.planes[0].data[dst + 3],
+                0,
+                "row 1 col {col} should be transparent"
+            );
+        }
+        // Row 2: solid red opaque.
+        for col in 0..4 {
+            let dst = (8 + col) * 4;
+            assert_eq!(&v.planes[0].data[dst..dst + 4], &[255, 0, 0, 255]);
+        }
+        // Row 3: solid red opaque.
+        for col in 0..4 {
+            let dst = (12 + col) * 4;
+            assert_eq!(&v.planes[0].data[dst..dst + 4], &[255, 0, 0, 255]);
+        }
+    }
+
+    #[test]
+    fn chg_colcon_application_respects_horizontal_start_column() {
+        // 4×1 SPU at (0, 0), all pattern. Band covers row 0 only with
+        // one PX_CTLI at start_col=2 making pattern transparent. Expect
+        // cols 0 + 1 = red opaque, cols 2 + 3 = transparent.
+        let indices = vec![1u8; 4];
+        let mut payload = Vec::new();
+        // LN_CTLI: csln=0, n=1, ctln=0
+        payload.extend_from_slice(&[0x00, 0x00, 0x10, 0x00]);
+        payload.extend_from_slice(&2u16.to_be_bytes()); // start_col=2
+        payload.extend_from_slice(&[0x01, 0x32]); // colors unchanged
+        payload.extend_from_slice(&[0x00, 0xFF]); // pat alpha=0
+
+        let spu = build_spu_with_chg_colcon_payload(4, 1, &indices, 0, 0, &payload);
+        let mut params = CodecParameters::video(CodecId::new(VOBSUB_CODEC_ID));
+        let mut extra = vec![0u8; 48];
+        extra[3] = 255;
+        params.extradata = extra;
+        let mut dec = make_decoder(&params).unwrap();
+        let pkt = Packet::new(0, TimeBase::new(1, 1_000_000), spu).with_pts(0);
+        dec.send_packet(&pkt).unwrap();
+        let Frame::Video(v) = dec.receive_frame().unwrap() else {
+            panic!();
+        };
+        assert_eq!(&v.planes[0].data[0..4], &[255, 0, 0, 255]);
+        assert_eq!(&v.planes[0].data[4..8], &[255, 0, 0, 255]);
+        assert_eq!(v.planes[0].data[11], 0, "col 2 should be transparent");
+        assert_eq!(v.planes[0].data[15], 0, "col 3 should be transparent");
+    }
+
+    #[test]
+    fn chg_colcon_application_is_in_display_coords_not_bitmap_local() {
+        // SPU rendered at display origin (50, 100), 4 cols × 2 rows of
+        // pattern. Band covers display lines 100..=100 with one
+        // PX_CTLI at display start_col=52 (i.e. bitmap-local col 2)
+        // making pattern transparent.
+        // Expect bitmap-local row 0 cols 0+1 opaque, cols 2+3
+        // transparent; row 1 fully opaque.
+        let indices = vec![1u8; 4 * 2];
+        let mut payload = Vec::new();
+        // LN_CTLI: csln=100, n=1, ctln=100. csln is 12-bit big-endian
+        // in the low nibble of byte 0 + byte 1; ctln is 12-bit in the
+        // low nibble of byte 2 + byte 3. 100 = 0x064, so:
+        //   byte 0 = 0x00 (high nibble reserved zero, low nibble csln[11:8])
+        //   byte 1 = 0x64 (csln[7:0])
+        //   byte 2 = 0x10 (n=1, ctln[11:8]=0)
+        //   byte 3 = 0x64 (ctln[7:0])
+        payload.extend_from_slice(&[0x00, 0x64, 0x10, 0x64]);
+        payload.extend_from_slice(&52u16.to_be_bytes()); // start_col=52
+        payload.extend_from_slice(&[0x01, 0x32]);
+        payload.extend_from_slice(&[0x00, 0xFF]);
+
+        let spu = build_spu_with_chg_colcon_payload(4, 2, &indices, 50, 100, &payload);
+        let mut params = CodecParameters::video(CodecId::new(VOBSUB_CODEC_ID));
+        let mut extra = vec![0u8; 48];
+        extra[3] = 255;
+        params.extradata = extra;
+        let mut dec = make_decoder(&params).unwrap();
+        let pkt = Packet::new(0, TimeBase::new(1, 1_000_000), spu).with_pts(0);
+        dec.send_packet(&pkt).unwrap();
+        let Frame::Video(v) = dec.receive_frame().unwrap() else {
+            panic!();
+        };
+        // Row 0 (display y=100): cols 0,1 (display 50,51) opaque,
+        // cols 2,3 (display 52,53) transparent.
+        assert_eq!(&v.planes[0].data[0..4], &[255, 0, 0, 255]);
+        assert_eq!(&v.planes[0].data[4..8], &[255, 0, 0, 255]);
+        assert_eq!(v.planes[0].data[11], 0);
+        assert_eq!(v.planes[0].data[15], 0);
+        // Row 1 (display y=101): band doesn't cover, all opaque.
+        for col in 0..4 {
+            let dst = (4 + col) * 4;
+            assert_eq!(&v.planes[0].data[dst..dst + 4], &[255, 0, 0, 255]);
+        }
+    }
+
+    #[test]
+    fn chg_colcon_payload_rejects_truncated_ln_ctli() {
+        // 3 bytes — can't fit a 4-byte LN_CTLI.
+        let err = parse_chg_colcon_payload(&[0x00, 0x0A, 0x10]).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("LN_CTLI header truncated"), "got: {msg}");
+    }
+
+    #[test]
+    fn chg_colcon_payload_rejects_non_zero_high_nibble() {
+        // h0 high nibble must be 0 (top 4 bits of csln are reserved).
+        let err = parse_chg_colcon_payload(&[0x80, 0x00, 0x10, 0x05]).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("LN_CTLI high nibble must be zero"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn chg_colcon_payload_rejects_inverted_lines() {
+        // csln=20, ctln=10 → ctln < csln.
+        let err = parse_chg_colcon_payload(&[0x00, 0x14, 0x10, 0x0A, 0x0F, 0xFF, 0xFF, 0xFF])
+            .unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("ctln < csln"), "got: {msg}");
+    }
+
+    #[test]
+    fn chg_colcon_payload_rejects_truncated_px_ctli() {
+        // LN_CTLI announces 1 PX_CTLI but only 3 bytes of PX_CTLI follow.
+        let err =
+            parse_chg_colcon_payload(&[0x00, 0x00, 0x10, 0x05, 0x00, 0x00, 0x12]).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("PX_CTLI truncated"), "got: {msg}");
+    }
+
+    #[test]
+    fn chg_colcon_payload_rejects_non_increasing_px_ctli() {
+        // Two PX_CTLI with start_col=10 then start_col=5.
+        let mut p = Vec::new();
+        p.extend_from_slice(&[0x00, 0x00, 0x20, 0x10]); // csln=0,n=2,ctln=16
+        p.extend_from_slice(&10u16.to_be_bytes());
+        p.extend_from_slice(&[0, 0, 0, 0]);
+        p.extend_from_slice(&5u16.to_be_bytes());
+        p.extend_from_slice(&[0, 0, 0, 0]);
+        let err = parse_chg_colcon_payload(&p).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("not strictly increasing"), "got: {msg}");
+    }
+
+    #[test]
+    fn chg_colcon_payload_accepts_payload_without_explicit_sentinel() {
+        // One LN_CTLI + one PX_CTLI, then payload ends exactly. Should
+        // be accepted (some authoring tools omit the sentinel and rely
+        // on the outer 2-byte size word).
+        let mut p = Vec::new();
+        p.extend_from_slice(&[0x00, 0x00, 0x10, 0x05]); // csln=0,n=1,ctln=5
+        p.extend_from_slice(&0u16.to_be_bytes()); // start_col=0
+        p.extend_from_slice(&[0x12, 0x34, 0xAB, 0xCD]);
+        let bands = parse_chg_colcon_payload(&p).expect("payload-end without sentinel accepted");
+        assert_eq!(bands.len(), 1);
+        assert_eq!(bands[0].entries.len(), 1);
+    }
+
+    #[test]
+    fn chg_colcon_lookup_last_match_wins_when_bands_overlap() {
+        // Two overlapping bands; the second should win for a pixel
+        // covered by both.
+        let bands = vec![
+            ChgColConBand {
+                csln: 0,
+                ctln: 10,
+                entries: vec![ChgColConEntry {
+                    start_col: 0,
+                    palette_sel: [1, 1, 1, 1],
+                    alpha: [1, 1, 1, 1],
+                }],
+            },
+            ChgColConBand {
+                csln: 5,
+                ctln: 15,
+                entries: vec![ChgColConEntry {
+                    start_col: 0,
+                    palette_sel: [2, 2, 2, 2],
+                    alpha: [2, 2, 2, 2],
+                }],
+            },
+        ];
+        // y=7 is covered by both; second band wins.
+        let (pal, alpha) = chg_colcon_lookup(&bands, 50, 7).unwrap();
+        assert_eq!(pal, [2, 2, 2, 2]);
+        assert_eq!(alpha, [2, 2, 2, 2]);
+        // y=2 is covered only by band 0.
+        let (pal, _) = chg_colcon_lookup(&bands, 50, 2).unwrap();
+        assert_eq!(pal, [1, 1, 1, 1]);
+        // y=12 is covered only by band 1.
+        let (pal, _) = chg_colcon_lookup(&bands, 50, 12).unwrap();
+        assert_eq!(pal, [2, 2, 2, 2]);
+        // y=20 is outside both.
+        assert!(chg_colcon_lookup(&bands, 50, 20).is_none());
+    }
+
+    #[test]
+    fn chg_colcon_lookup_no_match_above_first_start_col() {
+        // PX_CTLI starts at col 50; lookup at col 49 should miss.
+        let bands = vec![ChgColConBand {
+            csln: 0,
+            ctln: 10,
+            entries: vec![ChgColConEntry {
+                start_col: 50,
+                palette_sel: [3, 3, 3, 3],
+                alpha: [3, 3, 3, 3],
+            }],
+        }];
+        assert!(chg_colcon_lookup(&bands, 49, 5).is_none());
+        let (pal, _) = chg_colcon_lookup(&bands, 50, 5).unwrap();
+        assert_eq!(pal, [3, 3, 3, 3]);
+        let (pal, _) = chg_colcon_lookup(&bands, 9999, 5).unwrap();
+        assert_eq!(pal, [3, 3, 3, 3]);
+    }
+
+    #[test]
+    fn chg_colcon_application_random_no_panic_sweep() {
+        // 200 iterations: random bitmap + random in-bounds CHG_COLCON
+        // band/entries. Must never panic and must produce a canvas of
+        // the expected size.
+        let mut rng = 0xC0FFEEu32;
+        let mut lcg = || {
+            rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
+            rng
+        };
+        for _ in 0..200 {
+            let w = 1 + (lcg() % 8) as u16;
+            let h = 1 + (lcg() % 8) as u16;
+            let pixels: Vec<u8> = (0..(w as usize) * (h as usize))
+                .map(|_| (lcg() & 0x03) as u8)
+                .collect();
+            // Build a CHG_COLCON payload with 1..=3 LN_CTLI bands, each
+            // with 1..=2 PX_CTLI entries with strictly-increasing
+            // start_col values.
+            let bbox_x1 = 0;
+            let bbox_y1 = 0;
+            let bbox_x2 = bbox_x1 + w - 1;
+            let bbox_y2 = bbox_y1 + h - 1;
+            let mut payload = Vec::new();
+            let nb = 1 + (lcg() % 3);
+            for _ in 0..nb {
+                let csln = bbox_y1 + (lcg() % h as u32) as u16;
+                let ctln_lo = csln;
+                let ctln_hi = bbox_y2;
+                let ctln = ctln_lo + (lcg() % (ctln_hi - ctln_lo + 1) as u32) as u16;
+                let ne = 1 + (lcg() % 2);
+                let mut starts: Vec<u16> = Vec::new();
+                let mut sc = bbox_x1;
+                for _ in 0..ne {
+                    if sc > bbox_x2 {
+                        break;
+                    }
+                    starts.push(sc);
+                    sc = sc.saturating_add(1 + (lcg() % 3) as u16);
+                }
+                if starts.is_empty() {
+                    continue;
+                }
+                payload.extend_from_slice(&[
+                    (csln >> 8) as u8 & 0x0F,
+                    (csln & 0xFF) as u8,
+                    (((starts.len() as u8) & 0x0F) << 4) | ((ctln >> 8) as u8 & 0x0F),
+                    (ctln & 0xFF) as u8,
+                ]);
+                for s in &starts {
+                    payload.extend_from_slice(&s.to_be_bytes());
+                    payload.extend_from_slice(&[
+                        (lcg() & 0xFF) as u8,
+                        (lcg() & 0xFF) as u8,
+                        (lcg() & 0xFF) as u8,
+                        (lcg() & 0xFF) as u8,
+                    ]);
+                }
+            }
+            if payload.is_empty() {
+                continue;
+            }
+            let spu = build_spu_with_chg_colcon_payload(w, h, &pixels, bbox_x1, bbox_y1, &payload);
+            let mut params = CodecParameters::video(CodecId::new(VOBSUB_CODEC_ID));
+            params.extradata = vec![0u8; 48];
+            let mut dec = make_decoder(&params).unwrap();
+            let pkt = Packet::new(0, TimeBase::new(1, 1_000_000), spu).with_pts(0);
+            if dec.send_packet(&pkt).is_err() {
+                continue; // malformed coords / band layout; OK to reject
+            }
+            let frame = dec.receive_frame().unwrap();
+            let Frame::Video(v) = frame else {
+                panic!();
+            };
+            assert_eq!(
+                v.planes[0].data.len(),
+                (w as usize) * (h as usize) * 4,
+                "canvas size mismatch"
+            );
+        }
     }
 
     #[test]
