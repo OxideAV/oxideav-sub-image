@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- PGS PCS `composition_state` / `palette_update_flag` / `palette_id`
+  bytes are now parsed onto `PresentationComposition` instead of
+  silently dropped. Three named constants
+  (`COMP_STATE_NORMAL = 0x00`, `COMP_STATE_ACQUISITION = 0x40`,
+  `COMP_STATE_EPOCH_START = 0x80`) and an `is_random_access(state)`
+  helper let consumers classify a display-set against random-access
+  semantics without inspecting raw bytes. The PGS `.sup` demuxer
+  routes that classification onto `Packet::flags.keyframe`: only sets
+  whose PCS reports `Acquisition Point` or `Epoch Start` are flagged
+  as keyframes, so a seeker that rounds to the nearest keyframe lands
+  on a display-set that decodes standalone. Mid-epoch `Normal Case`
+  packets and packets carrying an unrecognised composition_state byte
+  stay un-flagged. Encoder behaviour is unchanged — every emitted
+  display-set is still a self-contained `Epoch Start`, so its packets
+  round-trip back to `keyframe = true` on demux.
+- Nine new unit tests for the PCS-classification path: structured-parse
+  assertions that `composition_state` / `palette_update_flag` / `palette_id`
+  surface verbatim through `parse_pcs`; assertions that `Acquisition
+  Point` and `Epoch Start` report as random-access while `Normal Case`
+  and an out-of-range byte do not; a `palette_update_flag` lower-bits
+  test confirming reserved bits do not flip the flag; demuxer
+  classification tests asserting that a five-set stream interleaving
+  all three composition_states yields `[true, false, true, false,
+  false]` keyframe flags, that an `Acquisition Point` followed by a
+  `Normal Case` set drops the flag back to false (state must not be
+  sticky across display-set boundaries), and that an unknown
+  composition_state byte does not promote a packet to a keyframe; plus
+  an encoder-output round-trip asserting `make_encoder` emits
+  `COMP_STATE_EPOCH_START` on every set.
+
 - PGS Composition Segments carrying `object_cropped_flag = 1` now
   **apply** the 8-byte cropping rectangle that trails the object entry,
   instead of dropping the rectangle bytes on the floor and compositing

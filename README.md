@@ -34,6 +34,18 @@ bitmap-subtitle nature of these codecs to downstream consumers (player,
 mixer, file writer) without losing the fact that what arrives is a
 pre-rendered RGBA picture.
 
+The PGS demuxer classifies each emitted display-set against the PCS
+`composition_state` byte and flags `Packet::flags.keyframe` only when
+the set is a real random-access point (`Acquisition Point` or
+`Epoch Start`). Mid-epoch `Normal Case` updates depend on palette /
+object state carried by an earlier set and stay un-flagged, so seekers
+that round to the nearest keyframe land on a set that decodes
+standalone. The parsed `composition_state`, `palette_update_flag`, and
+`palette_id` fields are surfaced on `PresentationComposition`; the
+`COMP_STATE_NORMAL` / `COMP_STATE_ACQUISITION` / `COMP_STATE_EPOCH_START`
+constants and the `is_random_access(state)` helper let downstream
+consumers act on the classification without inspecting raw bytes.
+
 When a display-set stacks overlapping objects (multiple PGS composition
 objects, multiple DVB regions/objects) and the topmost pixel is only
 partially transparent, the painted source is alpha-composited *over* the

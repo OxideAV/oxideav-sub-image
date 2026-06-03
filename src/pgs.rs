@@ -69,6 +69,46 @@ pub const SEG_PCS: u8 = 0x16;
 pub const SEG_WDS: u8 = 0x17;
 pub const SEG_END: u8 = 0x80;
 
+// --- composition-state identifiers ---------------------------------------
+//
+// The PCS carries a 1-byte `composition_state` field that classifies the
+// display-set with respect to random access. Three distinct values appear
+// in HDMV streams:
+//
+// * `Normal Case` (0x00) — a per-frame update inside an open epoch. The
+//   display-set may rely on palette / object data carried by an earlier
+//   set in the same epoch and is *not* a safe seek target on its own.
+// * `Acquisition Point` (0x40) — a refresh that carries the full state
+//   needed to resume rendering without consulting earlier sets in the
+//   epoch. Suitable as a random-access entry point.
+// * `Epoch Start` (0x80) — begins a brand-new presentation epoch; all
+//   prior state is discarded. Also suitable as a random-access entry
+//   point (and the strongest form of one).
+//
+// Both `Acquisition Point` and `Epoch Start` are random-access points;
+// `Normal Case` is not. The [`PgsDemuxer`] uses this distinction to set
+// the per-packet `keyframe` flag accurately so seekers can land on a set
+// that decodes standalone instead of mid-epoch garbage.
+/// PCS composition_state — a per-frame update inside an open epoch.
+/// Not a random-access point.
+pub const COMP_STATE_NORMAL: u8 = 0x00;
+/// PCS composition_state — a refresh carrying the full state needed to
+/// resume rendering. A random-access point.
+pub const COMP_STATE_ACQUISITION: u8 = 0x40;
+/// PCS composition_state — begins a brand-new epoch and discards prior
+/// state. The strongest random-access point.
+pub const COMP_STATE_EPOCH_START: u8 = 0x80;
+
+/// Returns `true` when the given PCS `composition_state` byte marks a
+/// random-access point — i.e. a display-set that decodes standalone
+/// without depending on earlier sets in the same epoch. `Acquisition
+/// Point` and `Epoch Start` both qualify; `Normal Case` does not.
+#[inline]
+#[must_use]
+pub fn is_random_access(composition_state: u8) -> bool {
+    composition_state == COMP_STATE_ACQUISITION || composition_state == COMP_STATE_EPOCH_START
+}
+
 /// One parsed display-set segment, carrying only the bytes we need.
 #[derive(Clone, Debug)]
 pub struct RawSegment {
@@ -115,6 +155,20 @@ pub struct PresentationComposition {
     pub width: u16,
     pub height: u16,
     pub composition_number: u16,
+    /// Random-access classification of this display-set. One of
+    /// [`COMP_STATE_NORMAL`], [`COMP_STATE_ACQUISITION`], or
+    /// [`COMP_STATE_EPOCH_START`]. Other values pass through verbatim
+    /// for callers that want to inspect the raw byte.
+    pub composition_state: u8,
+    /// Set when the PCS announces that only the palette is being updated;
+    /// the object graphics are reused from the previous display-set in
+    /// the same epoch. Surfaced here so callers that build their own
+    /// render path can short-circuit object reload.
+    pub palette_update_flag: bool,
+    /// `palette_id` referenced by the composition. Each PDS in the same
+    /// display-set is keyed by this id, so callers that need to track
+    /// per-id palette state see the current selection here.
+    pub palette_id: u8,
     pub objects: Vec<CompositionObject>,
 }
 
@@ -155,9 +209,17 @@ fn parse_pcs(body: &[u8]) -> Result<PresentationComposition> {
     let height = u16::from_be_bytes([body[2], body[3]]);
     // body[4] = frame-rate (ignored)
     let composition_number = u16::from_be_bytes([body[5], body[6]]);
-    // body[7] = composition state (ignored for now)
-    // body[8] = palette_update_flag (ignored)
-    // body[9] = palette_id (ignored — stored on the PDS itself)
+    // body[7] = composition_state. Carried through so the demuxer can
+    // tell `Normal Case` (mid-epoch update) apart from `Acquisition
+    // Point` / `Epoch Start` (random-access entry points). Unknown
+    // values pass through unchanged — they're surfaced for downstream
+    // consumers rather than rejected.
+    let composition_state = body[7];
+    // body[8] = palette_update_flag (top bit). The lower bits are
+    // reserved; the field is logically a single boolean.
+    let palette_update_flag = (body[8] & 0x80) != 0;
+    // body[9] = palette_id referenced by this display-set's PDS.
+    let palette_id = body[9];
     let n_objects = body[10] as usize;
     let mut cur = 11;
     let mut objects = Vec::with_capacity(n_objects);
@@ -216,6 +278,9 @@ fn parse_pcs(body: &[u8]) -> Result<PresentationComposition> {
         width,
         height,
         composition_number,
+        composition_state,
+        palette_update_flag,
+        palette_id,
         objects,
     })
 }
@@ -570,6 +635,7 @@ fn open_pgs(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result
     let mut cur = 0usize;
     let mut ds_start_pts: Option<u32> = None;
     let mut ds_buf: Vec<u8> = Vec::new();
+    let mut ds_random_access: bool = false;
     let mut last_canvas: Option<(u16, u16)> = None;
     while cur < buf.len() {
         let (seg, next) = match read_segment(&buf, cur) {
@@ -580,10 +646,15 @@ fn open_pgs(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result
             ds_start_pts = Some(seg.pts_90k);
         }
         ds_buf.extend_from_slice(&buf[cur..next]);
-        // Snoop on PCS to capture the canvas size for stream metadata.
+        // Snoop on PCS to capture the canvas size for stream metadata and
+        // classify the display-set's random-access state. A set whose PCS
+        // marks Acquisition Point or Epoch Start decodes standalone and
+        // is a valid seek target; a Normal Case set depends on earlier
+        // palette / object data inside the same epoch and is not.
         if seg.seg_type == SEG_PCS {
             if let Ok(pcs) = parse_pcs(&seg.body) {
                 last_canvas = Some((pcs.width, pcs.height));
+                ds_random_access = is_random_access(pcs.composition_state);
             }
         }
         cur = next;
@@ -592,8 +663,12 @@ fn open_pgs(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result
             let mut packet = Packet::new(0, time_base, std::mem::take(&mut ds_buf));
             packet.pts = Some(pts as i64);
             packet.dts = Some(pts as i64);
-            packet.flags.keyframe = true;
+            packet.flags.keyframe = ds_random_access;
             packets.push_back(packet);
+            // Reset the per-display-set classification before the next
+            // set's PCS arrives; a display-set without a PCS (malformed
+            // or palette-only) carries no random-access classification.
+            ds_random_access = false;
         }
     }
     // Give successive packets a synthetic duration (end - start) and
@@ -2303,5 +2378,226 @@ mod tests {
         for chunk in data.chunks(4) {
             assert_eq!(chunk, &[0u8, 0, 0, 0]);
         }
+    }
+
+    // --- PCS composition_state surfacing -------------------------------
+
+    /// Build a minimal PCS body with explicit `composition_state` and
+    /// `palette_update_flag` bytes, zero composition objects, otherwise
+    /// the canonical canvas / composition-number layout. Used by the
+    /// composition-state tests below.
+    fn build_pcs_body(
+        canvas: (u16, u16),
+        composition_number: u16,
+        composition_state: u8,
+        palette_update_flag: bool,
+        palette_id: u8,
+    ) -> Vec<u8> {
+        let mut pcs = Vec::new();
+        pcs.extend_from_slice(&canvas.0.to_be_bytes());
+        pcs.extend_from_slice(&canvas.1.to_be_bytes());
+        pcs.push(0); // frame rate
+        pcs.extend_from_slice(&composition_number.to_be_bytes());
+        pcs.push(composition_state);
+        pcs.push(if palette_update_flag { 0x80 } else { 0x00 });
+        pcs.push(palette_id);
+        pcs.push(0); // zero composition objects
+        pcs
+    }
+
+    #[test]
+    fn pcs_normal_state_parses_into_surface_fields() {
+        // Normal Case (0x00) is the default Composition-Number-only update
+        // shape; nothing on the random-access surface should fire.
+        let body = build_pcs_body((1920, 1080), 7, COMP_STATE_NORMAL, false, 0);
+        let pcs = parse_pcs(&body).unwrap();
+        assert_eq!(pcs.composition_state, COMP_STATE_NORMAL);
+        assert!(!pcs.palette_update_flag);
+        assert_eq!(pcs.palette_id, 0);
+        assert!(
+            !is_random_access(pcs.composition_state),
+            "Normal Case must not be reported as a random-access point"
+        );
+    }
+
+    #[test]
+    fn pcs_acquisition_point_is_random_access() {
+        // Acquisition Point (0x40) carries the full state needed to
+        // resume rendering and is a valid seek target.
+        let body = build_pcs_body((720, 480), 1, COMP_STATE_ACQUISITION, false, 0);
+        let pcs = parse_pcs(&body).unwrap();
+        assert_eq!(pcs.composition_state, COMP_STATE_ACQUISITION);
+        assert!(is_random_access(pcs.composition_state));
+    }
+
+    #[test]
+    fn pcs_epoch_start_is_random_access() {
+        // Epoch Start (0x80) begins a brand-new epoch — the strongest
+        // form of random-access point.
+        let body = build_pcs_body((1280, 720), 1, COMP_STATE_EPOCH_START, false, 0);
+        let pcs = parse_pcs(&body).unwrap();
+        assert_eq!(pcs.composition_state, COMP_STATE_EPOCH_START);
+        assert!(is_random_access(pcs.composition_state));
+    }
+
+    #[test]
+    fn pcs_palette_update_flag_and_id_round_trip() {
+        // The palette-update bit lives in the top bit of body[8]; the
+        // palette_id byte lives at body[9]. Both should round-trip through
+        // the parser unchanged.
+        let body = build_pcs_body((1920, 1080), 3, COMP_STATE_NORMAL, true, 42);
+        let pcs = parse_pcs(&body).unwrap();
+        assert!(
+            pcs.palette_update_flag,
+            "top-bit-set palette_update_flag must surface as true"
+        );
+        assert_eq!(pcs.palette_id, 42);
+    }
+
+    #[test]
+    fn pcs_palette_update_flag_lower_bits_are_ignored() {
+        // The lower 7 bits of body[8] are reserved per the field layout —
+        // they must not flip `palette_update_flag` on/off. Build a PCS
+        // body with the reserved bits set but the top bit clear and
+        // assert the parser still reports the flag as false.
+        let mut body = build_pcs_body((1920, 1080), 3, COMP_STATE_NORMAL, false, 0);
+        body[8] = 0x7F; // reserved bits set, top bit clear
+        let pcs = parse_pcs(&body).unwrap();
+        assert!(
+            !pcs.palette_update_flag,
+            "lower-bit noise in body[8] must not enable palette_update_flag"
+        );
+    }
+
+    #[test]
+    fn pcs_unknown_composition_state_passes_through_and_is_not_random_access() {
+        // The HDMV spec defines three composition_state values; anything
+        // else should pass through without being misclassified as a
+        // random-access point. The parser surfaces it for downstream
+        // consumers to act on as they see fit.
+        let body = build_pcs_body((720, 480), 1, 0xAB, false, 0);
+        let pcs = parse_pcs(&body).unwrap();
+        assert_eq!(pcs.composition_state, 0xAB);
+        assert!(!is_random_access(pcs.composition_state));
+    }
+
+    // --- Demuxer keyframe wiring ---------------------------------------
+
+    /// Build a tiny `.sup` byte stream containing N display-sets with
+    /// the given composition_state bytes, each ending with an END
+    /// segment. Each set is a PCS with zero composition objects (no
+    /// PDS / WDS / ODS needed) — the demuxer only cares about
+    /// segmentation + PCS classification when assembling packets.
+    fn build_sup_stream(states: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (i, &state) in states.iter().enumerate() {
+            let pts = (i as u32 + 1) * 9_000; // 100 ms steps at 90 kHz
+            let body = build_pcs_body((1920, 1080), i as u16, state, false, 0);
+            push_segment(&mut out, pts, SEG_PCS, &body);
+            push_segment(&mut out, pts, SEG_END, &[]);
+        }
+        out
+    }
+
+    #[test]
+    fn demuxer_marks_only_random_access_packets_as_keyframes() {
+        // Build a stream that interleaves all three composition_state
+        // classes: Epoch Start, Normal Case, Acquisition Point, Normal
+        // Case, Normal Case. The demuxer must mark packets 0 and 2 as
+        // keyframes (random-access entry points) and leave the others
+        // un-flagged.
+        let states = [
+            COMP_STATE_EPOCH_START,
+            COMP_STATE_NORMAL,
+            COMP_STATE_ACQUISITION,
+            COMP_STATE_NORMAL,
+            COMP_STATE_NORMAL,
+        ];
+        let stream = build_sup_stream(&states);
+        let resolver = oxideav_core::NullCodecResolver;
+        let input: Box<dyn ReadSeek> = Box::new(std::io::Cursor::new(stream));
+        let mut dmx = open_pgs(input, &resolver).unwrap();
+        let mut keyframe_flags = Vec::new();
+        loop {
+            match dmx.next_packet() {
+                Ok(pkt) => keyframe_flags.push(pkt.flags.keyframe),
+                Err(Error::Eof) => break,
+                Err(e) => panic!("unexpected demux error: {e:?}"),
+            }
+        }
+        assert_eq!(
+            keyframe_flags,
+            vec![true, false, true, false, false],
+            "expected only Epoch Start + Acquisition Point packets to be keyframes",
+        );
+    }
+
+    #[test]
+    fn demuxer_clears_random_access_state_between_packets() {
+        // A random-access display-set followed by a Normal Case set must
+        // see the second packet's `keyframe` flag drop back to false —
+        // i.e. the demuxer must not carry the classification across
+        // display-set boundaries. The regression this guards against is
+        // a stuck flag that would mark every set after the first
+        // Acquisition Point as a keyframe forever.
+        let states = [COMP_STATE_ACQUISITION, COMP_STATE_NORMAL];
+        let stream = build_sup_stream(&states);
+        let resolver = oxideav_core::NullCodecResolver;
+        let input: Box<dyn ReadSeek> = Box::new(std::io::Cursor::new(stream));
+        let mut dmx = open_pgs(input, &resolver).unwrap();
+        let p0 = dmx.next_packet().unwrap();
+        let p1 = dmx.next_packet().unwrap();
+        assert!(p0.flags.keyframe, "first set is Acquisition Point");
+        assert!(!p1.flags.keyframe, "second set is Normal Case");
+    }
+
+    #[test]
+    fn demuxer_unknown_composition_state_is_not_a_keyframe() {
+        // An out-of-range composition_state byte must not be promoted to
+        // a keyframe. The demuxer treats `is_random_access` as the only
+        // promotion gate, so an unknown classification means "not a safe
+        // seek target."
+        let states = [0xCDu8];
+        let stream = build_sup_stream(&states);
+        let resolver = oxideav_core::NullCodecResolver;
+        let input: Box<dyn ReadSeek> = Box::new(std::io::Cursor::new(stream));
+        let mut dmx = open_pgs(input, &resolver).unwrap();
+        let pkt = dmx.next_packet().unwrap();
+        assert!(
+            !pkt.flags.keyframe,
+            "unknown composition_state must not promote a packet to a keyframe"
+        );
+    }
+
+    #[test]
+    fn encoder_emits_epoch_start_so_decoded_packets_are_random_access() {
+        // The encoder writes 0x80 (Epoch Start) for every emitted display
+        // set — each `send_frame` call produces a packet that decodes
+        // standalone, so it must be classified as a random-access point.
+        // Verify by feeding the encoder output back through the parser
+        // path: each set must report Epoch Start.
+        let pixels: Vec<u8> = (0..(4 * 3 * 4))
+            .map(|i| if i % 4 == 3 { 255 } else { 200 })
+            .collect();
+        let frame = Frame::Video(VideoFrame {
+            pts: Some(0),
+            planes: vec![VideoPlane {
+                stride: 4 * 4,
+                data: pixels,
+            }],
+        });
+        let params = CodecParameters::video(CodecId::new(PGS_CODEC_ID));
+        let mut enc = make_encoder(&params).unwrap();
+        enc.send_frame(&frame).unwrap();
+        let packet = enc.receive_packet().unwrap();
+
+        let (seg, _next) = read_segment(&packet.data, 0).unwrap();
+        assert_eq!(seg.seg_type, SEG_PCS);
+        let pcs = parse_pcs(&seg.body).unwrap();
+        assert_eq!(
+            pcs.composition_state, COMP_STATE_EPOCH_START,
+            "encoder must emit Epoch Start on every set (each call is standalone)"
+        );
+        assert!(is_random_access(pcs.composition_state));
     }
 }
