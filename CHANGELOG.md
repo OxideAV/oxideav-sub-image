@@ -9,6 +9,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- VobSub SPU control-sequence traversal now latches `Spu::start_delay_raw`
+  from the `SP_DCSQ_STM` of the DCSQ that actually carries the
+  `STA_DSP` (`0x01`) or `FSTA_DSP` (`0x00`) command, instead of
+  unconditionally locking onto the first DCSQ's STM. Typical SPUs put
+  palette / alpha / `SET_DAREA` / `SET_DSPXA` in DCSQ #0 with
+  `STM = 0` and schedule the on-display event in DCSQ #1 with a
+  non-zero STM (the delay before the cue appears); the earlier
+  first-DCSQ rule reported a permanently zero start delay on that
+  common shape. The first start-display command encountered wins;
+  redundant retriggers in later DCSQs are tolerated but do not
+  overwrite the latched delay.
+- `Spu::forced_display: bool` surfaces the SPU control sequence's
+  `FSTA_DSP` (Forced Start Display, command `0x00`). A forced
+  subtitle is one a player should display even when subtitles are
+  otherwise disabled — typically used for translations of on-screen
+  signs / foreign-language dialogue inside an otherwise untranslated
+  soundtrack. The flag captures presence anywhere in the DCSQ chain
+  and is independent of `STA_DSP` / `STP_DSP`. The previous
+  behaviour silently dropped FSTA_DSP on the floor; consumers had no
+  way to tell a forced cue from a regular one.
+- `STP_DSP` (`0x02`) now overwrites `Spu::stop_delay_raw` on every
+  occurrence rather than capturing only the first; when an authoring
+  tool revises the end time inside a later DCSQ, the revised value
+  wins. The change preserves the *latest stop wins* semantics
+  documented for the command and lines the field up with the new
+  STA_DSP first-encountered-wins rule on the start side.
+- The DCSQ-chain walker now bails when `SP_NXT_DCSQ_SA` does not
+  advance the cursor — the spec's "if this is the last SP_DCSQ, it
+  points to itself" rule — guarding against an infinite loop on
+  malformed back-pointers. Behaviour-preserving for well-formed SPUs.
+- Eight new unit tests in `src/vobsub.rs::tests`: a sanity check that
+  the new `build_spu_with_dcsq_chain` helper produces a decodable
+  setup-only SPU with `start_delay_raw == 0` and
+  `forced_display == false`; a regression test that an STA_DSP in
+  the second DCSQ latches `start_delay_raw` to that DCSQ's STM and
+  not to the first DCSQ's STM (the headline shape this commit
+  fixes); a forced-display test confirming FSTA_DSP raises
+  `forced_display` and latches `start_delay_raw` to its DCSQ's STM;
+  an STP_DSP last-write-wins assertion across two stop-bearing
+  DCSQs; a first-start-wins test across two STA_DSP-bearing DCSQs;
+  a mixed-order test asserting that STA_DSP followed by FSTA_DSP
+  still raises `forced_display` without re-latching the start delay;
+  a 16-deep self-pointer-terminator chain that confirms the
+  traversal does not spin; and an unknown-command rejection test
+  inside a non-first DCSQ to lock in the post-`first_seq` error
+  shape.
+
 - PGS PCS `composition_state` / `palette_update_flag` / `palette_id`
   bytes are now parsed onto `PresentationComposition` instead of
   silently dropped. Three named constants

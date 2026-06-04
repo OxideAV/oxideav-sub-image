@@ -8,24 +8,44 @@ Pure-Rust bitmap-subtitle codecs and containers:
   container (DVB subs ride inside MPEG-TS).
 - **VobSub** / DVD SPU (`.idx`+`.sub`) — decode only, container reads
   the `.idx` text index + matched `.sub` payload (MPEG-PS pack + PES
-  private_stream_1 or raw SPU-length-prefixed form). Mid-display
-  `CHG_COLCON` palette / contrast change commands (opcode `0x07`) are
-  parsed into structured `LN_CTLI` (vertically-bounded band) +
-  `PX_CTLI` (horizontal start-column transition) entries and
-  **applied** to the rendered bitmap: each pixel inside a band's
-  `csln..=ctln` line range picks up the right-most matching
-  `PX_CTLI`'s replacement 4-entry palette / 4-entry alpha in lieu of
-  the SPU's base `SET_COLOR` / `SET_CONTR` selections, running
-  rightward until the next `PX_CTLI` or the right edge of the display
-  area. Coordinates are absolute display-line / display-column space
-  and are intersected with the SPU's bounding box. The parser
-  tolerates payloads with or without the explicit `0F FF FF FF`
-  `LN_CTLI` sentinel; it rejects truncated `LN_CTLI` / `PX_CTLI`, a
-  non-zero reserved high nibble, `ctln < csln`, and a
-  non-strictly-increasing `start_col` inside a band.
-  `Spu::saw_chg_colcon` still surfaces that the command was present,
-  and the parsed bands are exposed on `Spu::chg_colcon` for callers
-  that need them.
+  private_stream_1 or raw SPU-length-prefixed form). The SPU's
+  Display Control Sequence chain is walked end-to-end; each DCSQ
+  contributes its `SP_DCSQ_STM` (delay before its commands take
+  effect) to whichever event-trigger command appears inside it, not
+  to the first DCSQ unconditionally. `STA_DSP` (`0x01`) latches
+  `Spu::start_delay_raw` to *its* DCSQ's STM the first time it is
+  seen — typical streams put setup (palette / alpha / coords /
+  `SET_DSPXA`) in DCSQ #0 with `STM = 0` and schedule the on-display
+  event in DCSQ #1 with a non-zero STM, so reading the first DCSQ
+  would have permanently reported a zero start delay. `FSTA_DSP`
+  (`0x00`) follows the same latching rule and additionally raises
+  `Spu::forced_display`, which surfaces the spec's *Forced Start
+  Display* flag (subtitle a player should show even when subtitles
+  are otherwise disabled — typically used for on-screen-sign
+  translations). `STP_DSP` (`0x02`) writes `Spu::stop_delay_raw`
+  unconditionally on every occurrence so that an authoring tool's
+  revised end time inside a later DCSQ wins. The traversal exits
+  when a DCSQ's `SP_NXT_DCSQ_SA` does not advance the cursor — the
+  spec's "if this is the last SP_DCSQ, it points to itself"
+  terminator.
+
+  Mid-display `CHG_COLCON` palette / contrast change commands
+  (opcode `0x07`) are parsed into structured `LN_CTLI`
+  (vertically-bounded band) + `PX_CTLI` (horizontal start-column
+  transition) entries and **applied** to the rendered bitmap: each
+  pixel inside a band's `csln..=ctln` line range picks up the
+  right-most matching `PX_CTLI`'s replacement 4-entry palette /
+  4-entry alpha in lieu of the SPU's base `SET_COLOR` / `SET_CONTR`
+  selections, running rightward until the next `PX_CTLI` or the
+  right edge of the display area. Coordinates are absolute
+  display-line / display-column space and are intersected with the
+  SPU's bounding box. The parser tolerates payloads with or without
+  the explicit `0F FF FF FF` `LN_CTLI` sentinel; it rejects
+  truncated `LN_CTLI` / `PX_CTLI`, a non-zero reserved high nibble,
+  `ctln < csln`, and a non-strictly-increasing `start_col` inside a
+  band. `Spu::saw_chg_colcon` still surfaces that the command was
+  present, and the parsed bands are exposed on `Spu::chg_colcon`
+  for callers that need them.
 
 All three decoders emit RGBA `oxideav_core::VideoFrame` values — one
 frame per display-set. The stream's media kind is `Subtitle` even though

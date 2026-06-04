@@ -29,9 +29,9 @@
 //!
 //! Commands:
 //!
-//! | 0x00 | force-display |
-//! | 0x01 | start-display |
-//! | 0x02 | stop-display |
+//! | 0x00 | FSTA_DSP — force start display (no args) — sets [`Spu::forced_display`] and latches [`Spu::start_delay_raw`] from its DCSQ's STM if no earlier start command has been seen |
+//! | 0x01 | STA_DSP — start display (no args) — latches [`Spu::start_delay_raw`] from its DCSQ's STM if no earlier start command has been seen |
+//! | 0x02 | STP_DSP — stop display (no args) — overwrites [`Spu::stop_delay_raw`] with its DCSQ's STM |
 //! | 0x03 | palette sel   | 2 bytes: (bg<<4|pat, emp2<<4|emp1) |
 //! | 0x04 | alpha         | 2 bytes: (bg<<4|pat, emp2<<4|emp1) |
 //! | 0x05 | coords        | 6 bytes: x1:12 x2:12 y1:12 y2:12 |
@@ -196,9 +196,29 @@ pub struct Spu {
     /// alpha values (bg, pat, emp1, emp2), 0..15.
     pub alpha: [u8; 4],
     /// start-display delay in 1024/90000 s units from start of SPU.
+    ///
+    /// The delay is taken from the `SP_DCSQ_STM` of the Display Control
+    /// Sequence that actually carries the `STA_DSP` (0x01) or
+    /// `FSTA_DSP` (0x00) command — *not* from the very first DCSQ.
+    /// In typical streams the first DCSQ sets palette / alpha / coords
+    /// / pixel-data addresses with `STM = 0` and a *later* DCSQ then
+    /// schedules the on-display event with a non-zero `STM`; locking
+    /// onto the first DCSQ's STM would have reported a permanently
+    /// zero start time in that common shape.
     pub start_delay_raw: u16,
-    /// stop-display delay (same unit).
+    /// stop-display delay (same unit). Taken from the `SP_DCSQ_STM` of
+    /// the DCSQ carrying the `STP_DSP` (0x02) command.
     pub stop_delay_raw: u16,
+    /// `true` when the control sequence carried at least one
+    /// `FSTA_DSP` (Forced Start Display, command `0x00`). A forced
+    /// subtitle is one a player should display even when the user has
+    /// subtitles disabled — typically used for translations of
+    /// on-screen signs / foreign-language dialogue inside an otherwise
+    /// untranslated soundtrack. The flag is independent of
+    /// `STA_DSP` / `STP_DSP` (an SPU may carry both forced and
+    /// non-forced start events at different times); it captures
+    /// presence only.
+    pub forced_display: bool,
     /// RLE data offsets for top/bottom fields, relative to start of SPU.
     pub top_rle_off: u16,
     pub bot_rle_off: u16,
@@ -264,7 +284,14 @@ pub fn parse_and_decode_spu(spu: &[u8]) -> Result<(Spu, Vec<u8>, (u16, u16))> {
 
     let mut out = Spu::default();
     let mut pos = ctrl_off;
-    let mut first_seq = true;
+    // Track whether `start_delay_raw` has been latched. The spec lets
+    // either `FSTA_DSP` (forced) or `STA_DSP` (regular) trigger
+    // on-display; whichever appears first inside the SPU's control
+    // sequence is the one whose DCSQ delay we keep. A later DCSQ that
+    // *also* asserts start-display is treated as a redundant retrigger
+    // and ignored. STP_DSP overwrites unconditionally — the latest
+    // stop-display in DCSQ traversal order is the actual end time.
+    let mut start_latched = false;
     loop {
         if pos + 4 > spu_len {
             break;
@@ -276,15 +303,39 @@ pub fn parse_and_decode_spu(spu: &[u8]) -> Result<(Spu, Vec<u8>, (u16, u16))> {
             let cmd = spu[cmd_pos];
             cmd_pos += 1;
             match cmd {
-                0x00 => {} // force-display
-                0x01 => {
-                    // start-display
-                    if first_seq {
+                0x00 => {
+                    // FSTA_DSP — Forced Start Display. The SPU asks the
+                    // player to show this cue even when subtitles are
+                    // otherwise disabled. The flag captures presence
+                    // anywhere in the control sequence; the timing of
+                    // the forced display is the DCSQ's STM, which we
+                    // latch into `start_delay_raw` on the same rules
+                    // that govern STA_DSP.
+                    out.forced_display = true;
+                    if !start_latched {
                         out.start_delay_raw = delay;
+                        start_latched = true;
+                    }
+                }
+                0x01 => {
+                    // STA_DSP — Start Display. The DCSQ's STM is the
+                    // delay (in 1024/90000 s units from the SPU's PTS)
+                    // before the bitmap appears on screen. We latch the
+                    // *first* start-display encountered in DCSQ
+                    // traversal order; subsequent start-display
+                    // commands inside the same SPU are tolerated but
+                    // do not overwrite the latched value.
+                    if !start_latched {
+                        out.start_delay_raw = delay;
+                        start_latched = true;
                     }
                 }
                 0x02 => {
-                    // stop-display
+                    // STP_DSP — Stop Display. The latest stop in DCSQ
+                    // traversal order wins; an authoring tool that
+                    // emits multiple stops (e.g. when revising the
+                    // end time inside one SPU) intends the last one
+                    // to take effect.
                     out.stop_delay_raw = delay;
                 }
                 0x03 => {
@@ -386,7 +437,9 @@ pub fn parse_and_decode_spu(spu: &[u8]) -> Result<(Spu, Vec<u8>, (u16, u16))> {
                 }
             }
         }
-        first_seq = false;
+        // The last DCSQ in the chain has `SP_NXT_DCSQ_SA` pointing at
+        // itself (per the SPU spec). Bail out on any non-advancing
+        // pointer to avoid spinning on a self-referential terminator.
         if next <= pos {
             break;
         }
@@ -2049,6 +2102,245 @@ timestamp: 00:00:03:000, filepos: 000000040
                 "canvas size mismatch"
             );
         }
+    }
+
+    /// Build an SPU whose control-sequence area is a chain of DCSQs the
+    /// caller spells out as `(stm, commands)` pairs. The RLE bitmap is a
+    /// fixed 2×2 paint of palette index 1 (taken from the standard demo
+    /// builder); this helper exists to exercise the control-sequence /
+    /// DCSQ-traversal logic, not RLE coverage. Each `commands` slice is
+    /// the command-bytes payload between the 4-byte DCSQ header (STM +
+    /// next-pointer) and the next DCSQ; callers are responsible for
+    /// terminating with `0xFF` themselves where appropriate. The final
+    /// DCSQ in the chain has its next-pointer rewritten to point at
+    /// itself, matching the spec's "if this is the last SP_DCSQ, it
+    /// points to itself" rule.
+    fn build_spu_with_dcsq_chain(dcsqs: &[(u16, &[u8])]) -> Vec<u8> {
+        // Borrow the demo's RLE bytes verbatim so we have a known-good
+        // SET_COLOR / SET_CONTR / SET_DAREA / SET_DSPXA wired up before
+        // the caller's DCSQs run. The demo packs top-field bytes first
+        // and bottom-field bytes second; we recover both offsets by
+        // pulling them straight out of the demo's SET_DSPXA (command
+        // 0x06) so the relative positions inside our copy of the RLE
+        // region stay valid even if the demo's RLE size changes.
+        let base = build_demo_spu(2, 2, &[1u8, 1, 1, 1]);
+        let base_ctrl = u16::from_be_bytes([base[2], base[3]]) as usize;
+        let rle = base[4..base_ctrl].to_vec();
+        let (base_top_off, base_bot_off) = {
+            // Walk the base's first (and only) DCSQ commands looking for
+            // the SET_DSPXA opcode, then read its 4-byte argument.
+            let walk_from = base_ctrl + 4;
+            let mut w = walk_from;
+            let (mut top, mut bot) = (4u16, 4u16);
+            while w < base.len() {
+                let cmd = base[w];
+                w += 1;
+                match cmd {
+                    0x00..=0x02 => {}
+                    0x03 | 0x04 => w += 2,
+                    0x05 => w += 6,
+                    0x06 => {
+                        top = u16::from_be_bytes([base[w], base[w + 1]]);
+                        bot = u16::from_be_bytes([base[w + 2], base[w + 3]]);
+                        w += 4;
+                    }
+                    0xFF => break,
+                    _ => unreachable!("base demo SPU should only use known commands"),
+                }
+            }
+            (top, bot)
+        };
+
+        // The first DCSQ carries the standard palette / alpha / coords /
+        // RLE-offsets so the rest of `parse_and_decode_spu` runs end to
+        // end. Build its body once. Our RLE region starts at the same
+        // offset (4) as the base's, so the offsets are reused verbatim.
+        let top_off = base_top_off;
+        let bot_off = base_bot_off;
+        let mut first_body: Vec<u8> = vec![
+            0x03, // SET_COLOR
+            0x01, // bg=0, pat=1
+            0x32, // emp1=3, emp2=2
+            0x04, // SET_CONTR
+            0x0F, // bg=0, pat=0xF
+            0xFF, // emp1=0xF, emp2=0xF
+            0x05, // SET_DAREA — coords (x1=0, x2=1, y1=0, y2=1)
+            0, 0, 1, 0, 0, 1,    //
+            0x06, // SET_DSPXA — top/bottom RLE offsets
+        ];
+        first_body.extend_from_slice(&top_off.to_be_bytes());
+        first_body.extend_from_slice(&bot_off.to_be_bytes());
+        first_body.push(0xFF); // CMD_END (this DCSQ ends without an STA_DSP)
+
+        // Assemble the SPU header + RLE + DCSQ chain.
+        let mut out: Vec<u8> = Vec::new();
+        out.extend_from_slice(&[0, 0]); // placeholder SPU length
+        out.extend_from_slice(&[0, 0]); // placeholder ctrl offset
+        out.extend_from_slice(&rle);
+        let ctrl_off = out.len();
+        out[2] = (ctrl_off >> 8) as u8;
+        out[3] = (ctrl_off & 0xFF) as u8;
+
+        // First record the offset of every DCSQ so we can write
+        // accurate next-pointers in a second pass.
+        let mut dcsq_offsets: Vec<usize> = Vec::with_capacity(1 + dcsqs.len());
+
+        // Emit the implicit setup DCSQ first.
+        dcsq_offsets.push(out.len());
+        out.extend_from_slice(&[0, 0]); // STM = 0
+        out.extend_from_slice(&[0, 0]); // next placeholder
+        out.extend_from_slice(&first_body);
+
+        // Then each caller-supplied DCSQ.
+        for (stm, body) in dcsqs {
+            dcsq_offsets.push(out.len());
+            out.extend_from_slice(&stm.to_be_bytes());
+            out.extend_from_slice(&[0, 0]); // next placeholder
+            out.extend_from_slice(body);
+        }
+
+        // Patch every DCSQ's next-pointer to the *following* DCSQ's
+        // offset, except the last which points to itself.
+        for (i, &dcsq_pos) in dcsq_offsets.iter().enumerate() {
+            let next_pos = if i + 1 < dcsq_offsets.len() {
+                dcsq_offsets[i + 1]
+            } else {
+                dcsq_pos
+            };
+            let next_u16 = next_pos as u16;
+            out[dcsq_pos + 2] = (next_u16 >> 8) as u8;
+            out[dcsq_pos + 3] = (next_u16 & 0xFF) as u8;
+        }
+
+        // Finalise the outer SPU length.
+        let total = out.len() as u16;
+        out[0] = (total >> 8) as u8;
+        out[1] = (total & 0xFF) as u8;
+        out
+    }
+
+    #[test]
+    fn dcsq_chain_helper_produces_decodable_setup_only_spu() {
+        // Sanity check: with an empty chain, the helper still produces a
+        // single setup DCSQ whose CMD_END terminates cleanly, and the
+        // SPU decodes its 2×2 bitmap as before. No STA_DSP appears, so
+        // start_latched stays false and `start_delay_raw` remains 0.
+        let spu = build_spu_with_dcsq_chain(&[]);
+        let (state, pixels, (w, h)) = parse_and_decode_spu(&spu).unwrap();
+        assert_eq!((w, h), (2, 2));
+        assert_eq!(pixels, vec![1, 1, 1, 1]);
+        assert_eq!(state.start_delay_raw, 0);
+        assert_eq!(state.stop_delay_raw, 0);
+        assert!(!state.forced_display);
+    }
+
+    #[test]
+    fn sta_dsp_latches_delay_from_owning_dcsq_not_first() {
+        // Realistic SPU shape: the *first* DCSQ does setup with STM=0
+        // and *no* STA_DSP, and a later DCSQ schedules STA_DSP with a
+        // non-zero STM (the delay before the cue appears). The latched
+        // `start_delay_raw` must be the second DCSQ's STM, not the
+        // first DCSQ's (which would always be zero on this shape and
+        // therefore useless as a scheduling signal).
+        let spu = build_spu_with_dcsq_chain(&[(0x1234, &[0x01, 0xFF])]);
+        let (state, _, _) = parse_and_decode_spu(&spu).unwrap();
+        assert_eq!(
+            state.start_delay_raw, 0x1234,
+            "start_delay_raw must come from the STA_DSP-bearing DCSQ"
+        );
+        assert!(
+            !state.forced_display,
+            "STA_DSP alone must not set the forced_display flag"
+        );
+    }
+
+    #[test]
+    fn fsta_dsp_sets_forced_display_and_latches_delay() {
+        // FSTA_DSP (0x00) is the spec's forced-start opcode — the SPU
+        // asks the player to display the cue even when subtitles are
+        // disabled. The flag captures presence, and the same
+        // first-encountered-start latching rule applies to the DCSQ's
+        // STM as for STA_DSP.
+        let spu = build_spu_with_dcsq_chain(&[(0x00AB, &[0x00, 0xFF])]);
+        let (state, _, _) = parse_and_decode_spu(&spu).unwrap();
+        assert!(state.forced_display, "FSTA_DSP must set forced_display");
+        assert_eq!(
+            state.start_delay_raw, 0x00AB,
+            "FSTA_DSP must also latch start_delay_raw"
+        );
+    }
+
+    #[test]
+    fn stp_dsp_overwrites_with_latest_dcsq_stm() {
+        // STP_DSP differs from STA_DSP in that the spec text reads the
+        // latest stop-display as the authoritative one. Multiple stops
+        // across separate DCSQs end up reporting the final STM.
+        let spu = build_spu_with_dcsq_chain(&[(0x0010, &[0x02, 0xFF]), (0x0050, &[0x02, 0xFF])]);
+        let (state, _, _) = parse_and_decode_spu(&spu).unwrap();
+        assert_eq!(
+            state.stop_delay_raw, 0x0050,
+            "later STP_DSP must overwrite earlier stop delay"
+        );
+    }
+
+    #[test]
+    fn first_start_wins_when_two_dcsqs_both_assert_sta_dsp() {
+        // The first start-display command encountered in DCSQ traversal
+        // order wins; a later DCSQ's STA_DSP is a redundant retrigger
+        // and does not overwrite the latched delay.
+        let spu = build_spu_with_dcsq_chain(&[(0x0030, &[0x01, 0xFF]), (0x0099, &[0x01, 0xFF])]);
+        let (state, _, _) = parse_and_decode_spu(&spu).unwrap();
+        assert_eq!(
+            state.start_delay_raw, 0x0030,
+            "first STA_DSP's DCSQ STM must be the latched start delay"
+        );
+    }
+
+    #[test]
+    fn fsta_dsp_after_sta_dsp_still_sets_forced_flag_without_relatching_delay() {
+        // If an SPU somehow contains both a regular STA_DSP first and a
+        // forced FSTA_DSP later, the `forced_display` flag still
+        // surfaces (it captures presence anywhere in the chain), and
+        // the `start_delay_raw` stays at the first-encountered start
+        // command's DCSQ STM. This shape isn't common but we shouldn't
+        // silently lose the forced annotation.
+        let spu = build_spu_with_dcsq_chain(&[(0x0010, &[0x01, 0xFF]), (0x0080, &[0x00, 0xFF])]);
+        let (state, _, _) = parse_and_decode_spu(&spu).unwrap();
+        assert_eq!(state.start_delay_raw, 0x0010, "first start wins");
+        assert!(
+            state.forced_display,
+            "FSTA_DSP anywhere in the chain must set forced_display"
+        );
+    }
+
+    #[test]
+    fn self_referential_terminator_does_not_spin() {
+        // The mpucoder SPU spec says the last DCSQ's
+        // `SP_NXT_DCSQ_SA` points at itself — the helper does that on
+        // every chain. Even with a long chain we must reach the end in
+        // bounded time. (Without the `next <= pos` guard this loops
+        // forever.)
+        let bodies: Vec<&[u8]> = (0..16).map(|_| &[0x01u8, 0xFFu8][..]).collect();
+        let chain: Vec<(u16, &[u8])> = bodies.iter().map(|b| (0x0001u16, *b)).collect();
+        let spu = build_spu_with_dcsq_chain(&chain);
+        // Termination check is implicit: this returning at all means we
+        // didn't spin on the self-pointer of the final DCSQ.
+        let _ = parse_and_decode_spu(&spu).unwrap();
+    }
+
+    #[test]
+    fn unknown_command_in_later_dcsq_errors_not_panics() {
+        // Verify the unknown-command escape still produces a tidy
+        // Error::invalid even when the unknown opcode lives in a
+        // *non-first* DCSQ — this exercises the path now that
+        // `first_seq` is gone.
+        let spu = build_spu_with_dcsq_chain(&[(0x0010, &[0xAB, 0xFF])]);
+        let err = parse_and_decode_spu(&spu).unwrap_err();
+        let s = format!("{}", err);
+        assert!(
+            s.contains("unknown command"),
+            "unexpected error variant: {s}"
+        );
     }
 
     #[test]
