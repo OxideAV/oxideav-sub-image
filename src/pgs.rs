@@ -201,6 +201,60 @@ pub struct CropRect {
     pub h: u16,
 }
 
+/// One window declared by a Window Definition Segment. Coordinates are in
+/// canvas-pixel space and a window is the only region a composition object
+/// keyed to its `window_id` is permitted to paint into — any object pixels
+/// that would land outside this rectangle are dropped at render time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WindowDefinition {
+    pub window_id: u8,
+    pub x: u16,
+    pub y: u16,
+    pub w: u16,
+    pub h: u16,
+}
+
+/// Parse a Window Definition Segment body into the per-window list. The
+/// body layout is `number_of_windows: u8` followed by exactly that many
+/// 9-byte records `(window_id: u8, x: u16, y: u16, w: u16, h: u16)`,
+/// all big-endian. An empty body, a count that does not match the
+/// remaining bytes exactly, or a zero-extent window (`w == 0` or
+/// `h == 0`) is rejected — zero-extent is a malformed authoring tool
+/// rather than a deliberate "this window paints nothing".
+pub fn parse_wds(body: &[u8]) -> Result<Vec<WindowDefinition>> {
+    if body.is_empty() {
+        return Err(Error::invalid("PGS WDS: empty body"));
+    }
+    let count = body[0] as usize;
+    let expected = 1 + 9 * count;
+    if body.len() != expected {
+        return Err(Error::invalid(
+            "PGS WDS: declared window count does not match body length",
+        ));
+    }
+    let mut windows = Vec::with_capacity(count);
+    let mut cur = 1;
+    for _ in 0..count {
+        let window_id = body[cur];
+        let x = u16::from_be_bytes([body[cur + 1], body[cur + 2]]);
+        let y = u16::from_be_bytes([body[cur + 3], body[cur + 4]]);
+        let w = u16::from_be_bytes([body[cur + 5], body[cur + 6]]);
+        let h = u16::from_be_bytes([body[cur + 7], body[cur + 8]]);
+        cur += 9;
+        if w == 0 || h == 0 {
+            return Err(Error::invalid("PGS WDS: window has zero extent"));
+        }
+        windows.push(WindowDefinition {
+            window_id,
+            x,
+            y,
+            w,
+            h,
+        });
+    }
+    Ok(windows)
+}
+
 fn parse_pcs(body: &[u8]) -> Result<PresentationComposition> {
     if body.len() < 11 {
         return Err(Error::invalid("PGS PCS: body too short"));
@@ -499,6 +553,12 @@ struct DisplaySet {
     palette: Palette,
     object_fragments: HashMap<u16, Vec<u8>>,
     objects: HashMap<u16, Object>,
+    /// Window rectangles declared by the WDS, keyed by `window_id`. Each
+    /// composition object references one of these; pixels painted outside
+    /// the matching rectangle are dropped at render time. Empty when no
+    /// WDS has been seen yet — `render` then treats the whole canvas as
+    /// paintable, matching the prior behaviour.
+    windows: HashMap<u8, WindowDefinition>,
     /// Last-known canvas size (carried over between display-sets when
     /// a PCS-less reset arrives).
     last_canvas: Option<(u16, u16)>,
@@ -513,10 +573,17 @@ impl DisplaySet {
                 self.last_canvas = Some((pcs.width, pcs.height));
                 self.pcs = Some(pcs);
             }
-            // We don't clip to the declared windows — only validate that a
-            // body is present at all.
-            SEG_WDS if seg.body.is_empty() => {
-                return Err(Error::invalid("PGS WDS: empty body"));
+            SEG_WDS => {
+                // Parse the declared windows into a typed table keyed by
+                // `window_id` so render-time clipping can look up each
+                // composition object's permitted paint area in O(1). A
+                // zero-window WDS (the "erase" form) is valid and yields
+                // an empty table; `parse_wds` rejects truncated bodies.
+                let windows = parse_wds(&seg.body)?;
+                self.windows.clear();
+                for w in windows {
+                    self.windows.insert(w.window_id, w);
+                }
             }
             SEG_PDS => {
                 parse_pds_into(&seg.body, &mut self.palette)?;
@@ -581,22 +648,70 @@ impl DisplaySet {
                 // real bounds — there is no source pixel to paint.
                 continue;
             }
+            // Intersect the planned paint rectangle on the canvas
+            // (`ox..ox+sw`, `oy..oy+sh`) with the window declared for
+            // this composition object's `window_id`. PGS windows are
+            // the only canvas regions a composition object is allowed
+            // to paint into; pixels that would fall outside get dropped
+            // by trimming the source slice before the blit. When no
+            // WDS has been parsed yet, the table is empty and the
+            // whole canvas is treated as paintable — preserving the
+            // earlier "no window clipping" behaviour for callers that
+            // build display-sets without a WDS.
+            let (paint_sx, paint_sy, paint_sw, paint_sh, paint_ox, paint_oy) =
+                if let Some(win) = self.windows.get(&co.window_id) {
+                    let wx = win.x as usize;
+                    let wy = win.y as usize;
+                    let ww = win.w as usize;
+                    let wh = win.h as usize;
+                    // Canvas-space paint rectangle requested by this
+                    // composition object.
+                    let px0 = ox;
+                    let py0 = oy;
+                    let px1 = ox.saturating_add(sw);
+                    let py1 = oy.saturating_add(sh);
+                    // Canvas-space window rectangle.
+                    let wx1 = wx.saturating_add(ww);
+                    let wy1 = wy.saturating_add(wh);
+                    let nx0 = px0.max(wx);
+                    let ny0 = py0.max(wy);
+                    let nx1 = px1.min(wx1);
+                    let ny1 = py1.min(wy1);
+                    if nx0 >= nx1 || ny0 >= ny1 {
+                        // The composition object lands entirely outside
+                        // its declared window — nothing to paint.
+                        continue;
+                    }
+                    let dx = nx0 - px0;
+                    let dy = ny0 - py0;
+                    let nw = nx1 - nx0;
+                    let nh = ny1 - ny0;
+                    (sx + dx, sy + dy, nw, nh, nx0, ny0)
+                } else {
+                    (sx, sy, sw, sh, ox, oy)
+                };
             // Composition objects can overlap; when the topmost palette
             // entry is partially transparent the source blends *over*
             // whatever earlier object already painted, rather than
             // overwriting it (Porter–Duff source-over). Build the object
             // (or its cropped sub-rect) as rows of palette indices and
             // run the shared compositor.
-            let rows: Vec<Vec<u8>> = (0..sh)
+            let rows: Vec<Vec<u8>> = (0..paint_sh)
                 .map(|row| {
-                    let start = (sy + row) * ow + sx;
-                    obj.pixels[start..start + sw].to_vec()
+                    let start = (paint_sy + row) * ow + paint_sx;
+                    obj.pixels[start..start + paint_sw].to_vec()
                 })
                 .collect();
             let palette = &self.palette;
-            crate::composite::blit_indexed(&mut canvas, width, height, &rows, ox, oy, |idx| {
-                palette.entries[idx as usize]
-            });
+            crate::composite::blit_indexed(
+                &mut canvas,
+                width,
+                height,
+                &rows,
+                paint_ox,
+                paint_oy,
+                |idx| palette.entries[idx as usize],
+            );
         }
         Ok(Some(canvas))
     }
@@ -2375,6 +2490,187 @@ mod tests {
             build_cropped_display_set((4, 4), (4, 4), (0, 0), (10, 10, 2, 2), &palette, &pixels);
         let data = decode_one(blob);
         assert_eq!(data.len(), 4 * 4 * 4);
+        for chunk in data.chunks(4) {
+            assert_eq!(chunk, &[0u8, 0, 0, 0]);
+        }
+    }
+
+    // --- WDS typed parser + render-time window clipping ----------------
+
+    #[test]
+    fn wds_parses_typed_window_list() {
+        // One window at (10, 20) sized 30×40 with id 7. The body layout
+        // is `count` followed by `count` × 9-byte records.
+        let body: Vec<u8> = vec![
+            0x01, // 1 window
+            0x07, // window_id
+            0x00, 0x0A, // x = 10
+            0x00, 0x14, // y = 20
+            0x00, 0x1E, // w = 30
+            0x00, 0x28, // h = 40
+        ];
+        let wins = parse_wds(&body).unwrap();
+        assert_eq!(wins.len(), 1);
+        assert_eq!(
+            wins[0],
+            WindowDefinition {
+                window_id: 7,
+                x: 10,
+                y: 20,
+                w: 30,
+                h: 40
+            }
+        );
+    }
+
+    #[test]
+    fn wds_zero_windows_yields_empty_list() {
+        // The "erase" form WDS carries a single byte: count = 0. It is
+        // valid and parses to an empty list (the renderer falls back to
+        // "no clipping" in that case).
+        let body: Vec<u8> = vec![0];
+        let wins = parse_wds(&body).unwrap();
+        assert!(wins.is_empty());
+    }
+
+    #[test]
+    fn wds_rejects_truncated_body() {
+        // Count says 1 window but only 8 of the 9 record bytes follow.
+        let body: Vec<u8> = vec![0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        assert!(parse_wds(&body).is_err());
+    }
+
+    #[test]
+    fn wds_rejects_trailing_bytes() {
+        // Count says 0 but a stray byte follows — the body length must
+        // match the declared count exactly so a malformed stream is
+        // caught early rather than silently dropped.
+        let body: Vec<u8> = vec![0x00, 0x00];
+        assert!(parse_wds(&body).is_err());
+    }
+
+    #[test]
+    fn wds_rejects_empty_body() {
+        // A WDS body must always carry at least the count byte.
+        assert!(parse_wds(&[]).is_err());
+    }
+
+    #[test]
+    fn wds_rejects_zero_extent_window() {
+        // A window with w = 0 or h = 0 is a malformed authoring tool —
+        // not a deliberate "this window paints nothing" — and is
+        // rejected at parse time.
+        let body: Vec<u8> = vec![
+            0x01, 0x00, // id
+            0x00, 0x00, // x
+            0x00, 0x00, // y
+            0x00, 0x00, // w = 0
+            0x00, 0x10, // h
+        ];
+        assert!(parse_wds(&body).is_err());
+    }
+
+    /// Build a single-display-set blob whose WDS declares an explicit
+    /// window rectangle rather than the canonical full-canvas window
+    /// emitted by [`build_demo_display_set`]. Used to drive the
+    /// render-time window-clipping test below.
+    fn build_demo_display_set_with_window(
+        canvas: (u16, u16),
+        object: (u16, u16),
+        position: (u16, u16),
+        window: (u16, u16, u16, u16),
+        palette: &[(u8, [u8; 4])],
+        pixels: &[u8],
+    ) -> Vec<u8> {
+        // Rewrite the WDS in the canonical blob to carry `window` rather
+        // than the full-canvas default. Every other segment is left
+        // unchanged so the only behavioural difference is the window
+        // table the decoder records.
+        let canonical = build_demo_display_set(canvas, object, position, palette, pixels);
+        let mut out = Vec::new();
+        let mut cur = 0;
+        let mut rewrote_wds = false;
+        while cur < canonical.len() {
+            let (seg, next) = read_segment(&canonical, cur).expect("demo blob is well-formed");
+            if seg.seg_type == SEG_WDS && !rewrote_wds {
+                rewrote_wds = true;
+                let mut wds = Vec::new();
+                wds.push(1); // one window
+                wds.push(0); // window id
+                wds.extend_from_slice(&window.0.to_be_bytes());
+                wds.extend_from_slice(&window.1.to_be_bytes());
+                wds.extend_from_slice(&window.2.to_be_bytes());
+                wds.extend_from_slice(&window.3.to_be_bytes());
+                out.extend_from_slice(b"PG");
+                out.extend_from_slice(&seg.pts_90k.to_be_bytes());
+                out.extend_from_slice(&seg.dts_90k.to_be_bytes());
+                out.push(SEG_WDS);
+                out.extend_from_slice(&(wds.len() as u16).to_be_bytes());
+                out.extend_from_slice(&wds);
+            } else {
+                out.extend_from_slice(&canonical[cur..next]);
+            }
+            cur = next;
+        }
+        assert!(rewrote_wds, "demo set must have a WDS to rewrite");
+        out
+    }
+
+    #[test]
+    fn window_clip_drops_object_pixels_outside_window() {
+        // 4×4 canvas, 4×4 fully-opaque object positioned at (0, 0). The
+        // WDS declares a 2×2 window at (1, 1), so only the four pixels
+        // at (1,1), (2,1), (1,2), (2,2) of the canvas should be painted.
+        // Everything else stays transparent.
+        let pixels = vec![1u8; 4 * 4];
+        let palette = [(0u8, [0u8, 0, 0, 0]), (1u8, [200u8, 50, 25, 255])];
+        let blob = build_demo_display_set_with_window(
+            (4, 4),
+            (4, 4),
+            (0, 0),
+            (1, 1, 2, 2),
+            &palette,
+            &pixels,
+        );
+        let data = decode_one(blob);
+        assert_eq!(data.len(), 4 * 4 * 4);
+        for row in 0..4usize {
+            for col in 0..4usize {
+                let chunk = &data[(row * 4 + col) * 4..(row * 4 + col) * 4 + 4];
+                let inside = (1..=2).contains(&row) && (1..=2).contains(&col);
+                if inside {
+                    assert_eq!(
+                        chunk[3], 255,
+                        "pixel inside the window must be opaque at ({col},{row})"
+                    );
+                } else {
+                    assert_eq!(
+                        chunk,
+                        &[0u8, 0, 0, 0],
+                        "pixel outside the window must be fully transparent at ({col},{row})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn window_clip_drops_object_landing_entirely_outside() {
+        // 8×8 canvas, 2×2 object at (5, 5), WDS window at (0, 0) sized
+        // 4×4. The object lands wholly outside the window and the canvas
+        // must remain fully transparent.
+        let pixels = vec![1u8; 2 * 2];
+        let palette = [(0u8, [0u8, 0, 0, 0]), (1u8, [200u8, 50, 25, 255])];
+        let blob = build_demo_display_set_with_window(
+            (8, 8),
+            (2, 2),
+            (5, 5),
+            (0, 0, 4, 4),
+            &palette,
+            &pixels,
+        );
+        let data = decode_one(blob);
+        assert_eq!(data.len(), 8 * 8 * 4);
         for chunk in data.chunks(4) {
             assert_eq!(chunk, &[0u8, 0, 0, 0]);
         }

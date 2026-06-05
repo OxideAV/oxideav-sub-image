@@ -66,6 +66,20 @@ standalone. The parsed `composition_state`, `palette_update_flag`, and
 constants and the `is_random_access(state)` helper let downstream
 consumers act on the classification without inspecting raw bytes.
 
+The Window Definition Segment is parsed into a typed
+`Vec<WindowDefinition>` (exposed via the `parse_wds` helper) and the
+decoder retains the table keyed by `window_id`. Each composition object
+references one window, and that window is the only canvas region the
+object is permitted to paint into — at render time the planned paint
+rectangle is intersected with the matching window, and any source
+pixels that would land outside get trimmed before the blit. Objects
+that land entirely outside their window paint nothing, and a
+display-set whose WDS declares zero windows (the canonical "erase"
+form) keeps the prior whole-canvas paint area for backward
+compatibility. The parser rejects a body whose declared window count
+does not match the remaining bytes exactly, a zero-extent window, and
+an empty body.
+
 When a display-set stacks overlapping objects (multiple PGS composition
 objects, multiple DVB regions/objects) and the topmost pixel is only
 partially transparent, the painted source is alpha-composited *over* the

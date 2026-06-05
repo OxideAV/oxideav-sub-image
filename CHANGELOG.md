@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `pgs::WindowDefinition` and the `pgs::parse_wds` helper expose the
+  Window Definition Segment as a typed `Vec<WindowDefinition>` with
+  `(window_id, x, y, w, h)` in canvas-pixel space. The parser rejects
+  empty bodies, a declared window count that does not match the
+  remaining body bytes exactly, and zero-extent windows.
+- The PGS decoder now retains the WDS window table keyed by
+  `window_id` and clips each composition object's paint rectangle to
+  the intersection of the canvas and its assigned window. Pixels that
+  would land outside the window are dropped before the blit; objects
+  that land entirely outside paint nothing. A display-set whose WDS
+  carries zero windows (the canonical "erase" form) preserves the
+  prior whole-canvas paint area for backward compatibility.
 - VobSub SPU control-sequence traversal now latches `Spu::start_delay_raw`
   from the `SP_DCSQ_STM` of the DCSQ that actually carries the
   `STA_DSP` (`0x01`) or `FSTA_DSP` (`0x00`) command, instead of
