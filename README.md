@@ -5,7 +5,16 @@ Pure-Rust bitmap-subtitle codecs and containers:
 - **PGS** (HDMV / Blu-ray `.sup`) — decode + encode, standalone `.sup`
   container.
 - **DVB subtitles** (ETSI EN 300 743) — decode only, no standalone
-  container (DVB subs ride inside MPEG-TS).
+  container (DVB subs ride inside MPEG-TS). The region composition
+  segment's `region_fill_flag` is honoured: when set, the region
+  rectangle is pre-painted with the depth-appropriate
+  `region_n-bit_pixel_code` (8/4/2-bit, translated through the
+  region's CLUT) *before* any objects composite on top, matching the
+  spec's "fill the region area with the colour given by the n-bit
+  pixel code" wording. Cleared, the rectangle stays at the canvas's
+  transparent background. The pre-fill is clipped to the canvas, so a
+  region declared past the right or bottom edge writes only its
+  in-bounds intersection.
 - **VobSub** / DVD SPU (`.idx`+`.sub`) — decode only, container reads
   the `.idx` text index + matched `.sub` payload (MPEG-PS pack + PES
   private_stream_1 or raw SPU-length-prefixed form). The SPU's

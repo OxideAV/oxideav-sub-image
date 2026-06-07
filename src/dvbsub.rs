@@ -27,6 +27,12 @@
 //!   region z-order (first region wins).
 //! * Page timeouts are accepted but not enforced here — caller uses the
 //!   accompanying packet duration.
+//! * `region_fill_flag` (ETSI EN 300 743 §7.2.3) is honoured: when set,
+//!   the region rectangle is pre-painted with the depth-appropriate
+//!   `region_n-bit_pixel_code` *before* any objects composite on top.
+//!   Cleared, the rectangle stays at the canvas's transparent
+//!   background. The fill is clipped to the canvas; out-of-bounds
+//!   region rectangles only paint their in-bounds intersection.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -140,16 +146,30 @@ fn parse_page_composition(body: &[u8]) -> Result<Vec<PageRegion>> {
 
 #[derive(Clone, Debug)]
 struct Region {
-    #[allow(dead_code)]
     width: u16,
-    #[allow(dead_code)]
     height: u16,
-    /// Colour-depth declared by the region: 2, 4, or 8 bits. We
-    /// currently render without caring (the pixel-coded streams carry
-    /// their own depth), but parsing validates the byte.
-    #[allow(dead_code)]
+    /// Colour-depth declared by the region: 2, 4, or 8 bits. Used to
+    /// pick which `region_n-bit_pixel_code` is treated as the fill
+    /// colour when `fill` is set; the pixel-coded object streams still
+    /// carry their own depth so this byte is otherwise purely
+    /// validatory.
     depth_bits: u8,
     clut_id: u8,
+    /// `region_fill_flag` (ETSI EN 300 743 §7.2.3): when true the
+    /// region rectangle is pre-painted with the depth-appropriate
+    /// `region_n-bit_pixel_code` *before* objects composite on top.
+    /// When false the rectangle starts fully transparent.
+    fill: bool,
+    /// `region_8-bit_pixel_code` — the CLUT index used to fill the
+    /// region when `fill` is true and `depth_bits == 8`.
+    fill_code_8: u8,
+    /// `region_4-bit_pixel_code` — packed into the high nibble of the
+    /// final byte of the region-composition header (ETSI EN 300 743
+    /// §7.2.3). Used when `fill` is true and `depth_bits == 4`.
+    fill_code_4: u8,
+    /// `region_2-bit_pixel_code` — bits 5..6 of the final header byte.
+    /// Used when `fill` is true and `depth_bits == 2`.
+    fill_code_2: u8,
     objects: Vec<RegionObject>,
 }
 
@@ -165,10 +185,12 @@ fn parse_region_composition(body: &[u8]) -> Result<(u8, Region)> {
         return Err(Error::invalid("DVB region_composition: body too short"));
     }
     let region_id = body[0];
-    // body[1] version + fill flag
+    // body[1] = region_version_number (4) + region_fill_flag (1) + reserved (3).
+    // The fill flag is bit 3 (mask 0x08) per ETSI EN 300 743 §7.2.3.
+    let fill = (body[1] & 0x08) != 0;
     let width = u16::from_be_bytes([body[2], body[3]]);
     let height = u16::from_be_bytes([body[4], body[5]]);
-    // body[6] = region_level_of_compatibility (3) + region_depth (3)
+    // body[6] = region_level_of_compatibility (3) + region_depth (3) + reserved (2)
     let region_depth = (body[6] >> 2) & 0x07;
     let depth_bits = match region_depth {
         1 => 2,
@@ -177,7 +199,11 @@ fn parse_region_composition(body: &[u8]) -> Result<(u8, Region)> {
         _ => 4, // default-ish
     };
     let clut_id = body[7];
-    // body[8..10] = 8-bit_pixel_code + 4-bit_pixel_code + 2-bit_pixel_code
+    // body[8] = region_8-bit_pixel_code
+    // body[9] = (region_4-bit_pixel_code << 4) | (region_2-bit_pixel_code << 2) | reserved (2)
+    let fill_code_8 = body[8];
+    let fill_code_4 = (body[9] >> 4) & 0x0F;
+    let fill_code_2 = (body[9] >> 2) & 0x03;
     let mut cur = 10;
     let mut objects = Vec::new();
     while cur + 6 <= body.len() {
@@ -205,6 +231,10 @@ fn parse_region_composition(body: &[u8]) -> Result<(u8, Region)> {
             height,
             depth_bits,
             clut_id,
+            fill,
+            fill_code_8,
+            fill_code_4,
+            fill_code_2,
             objects,
         },
     ))
@@ -693,6 +723,40 @@ impl Decoder for DvbSubDecoder {
                 continue;
             };
             let clut = cluts.get(&region.clut_id).cloned().unwrap_or_default();
+            // ETSI EN 300 743 §7.2.3: when region_fill_flag is set, the
+            // region rectangle is pre-filled with the depth-appropriate
+            // `region_n-bit_pixel_code` *before* the region's objects
+            // composite on top. Without this the rectangle stays at the
+            // canvas's transparent background, so a stream that relies on
+            // a solid backdrop (e.g. an opaque banner with text objects
+            // overlaid) would render with show-through holes. Fill is
+            // bounded to the region's declared `width` × `height` at the
+            // page-composition `(x, y)`, intersected with the canvas.
+            if region.fill {
+                let fill_idx = match region.depth_bits {
+                    2 => region.fill_code_2,
+                    4 => region.fill_code_4,
+                    _ => region.fill_code_8,
+                };
+                let fill_rgba = clut.entries[fill_idx as usize];
+                // A zero alpha after CLUT lookup means the declared fill
+                // colour is transparent, which is the same as not filling
+                // — short-circuit so the canvas keeps any pixels from a
+                // lower-z-order region.
+                if fill_rgba[3] != 0 {
+                    let rx0 = (pr.x as usize).min(width);
+                    let ry0 = (pr.y as usize).min(height);
+                    let rx1 = (pr.x as usize + region.width as usize).min(width);
+                    let ry1 = (pr.y as usize + region.height as usize).min(height);
+                    for y in ry0..ry1 {
+                        let row_off = (y * width + rx0) * 4;
+                        let row_end = (y * width + rx1) * 4;
+                        for px in canvas[row_off..row_end].chunks_exact_mut(4) {
+                            px.copy_from_slice(&fill_rgba);
+                        }
+                    }
+                }
+            }
             for ro in &region.objects {
                 let Some(obj) = objects.get(&ro.object_id) else {
                     continue;
@@ -1469,5 +1533,266 @@ mod tests {
             Error::NeedMore => {}
             other => panic!("expected NeedMore, got {other:?}"),
         }
+    }
+
+    // --- region_composition coverage -------------------------------
+
+    /// `region_fill_flag` (bit 3 of body[1]) decodes to the typed `fill`
+    /// boolean, together with the three depth-keyed pixel codes packed
+    /// into body[8] (8-bit) and body[9] (4-bit high nibble, 2-bit bits
+    /// 5..6). The depth is read from body[6] bits 4..2 and exposed as
+    /// `depth_bits` so the renderer can pick the right fill index.
+    #[test]
+    fn region_composition_decodes_fill_flag_and_pixel_codes() {
+        // region_id=7, version=0, fill=1; width=5, height=4; depth=3
+        // (8-bit); CLUT id=2; 8-bit code=0xAB; 4-bit code=0xC; 2-bit
+        // code=0x2; no objects.
+        let body = vec![
+            0x07, // region_id
+            0x08, // version (0) << 4 | fill (1) << 3 | reserved
+            0x00,
+            0x05, // width
+            0x00,
+            0x04,     // height
+            (3 << 2), // region_depth = 3 (8-bit), level=0, reserved=0
+            0x02,     // clut_id
+            0xAB,     // region_8-bit_pixel_code
+            // region_4-bit_pixel_code in high nibble (0xC), 2-bit code in bits 5..6 (0b10),
+            // reserved (2 bits) = 0 → 0xC8.
+            0xC8,
+        ];
+        let (id, region) = parse_region_composition(&body).unwrap();
+        assert_eq!(id, 7);
+        assert!(region.fill);
+        assert_eq!(region.width, 5);
+        assert_eq!(region.height, 4);
+        assert_eq!(region.depth_bits, 8);
+        assert_eq!(region.clut_id, 2);
+        assert_eq!(region.fill_code_8, 0xAB);
+        assert_eq!(region.fill_code_4, 0x0C);
+        assert_eq!(region.fill_code_2, 0x02);
+        assert!(region.objects.is_empty());
+    }
+
+    /// fill_flag unset: the rectangle stays at the canvas background
+    /// (zero RGBA) — the renderer must skip the pre-fill step even
+    /// when the per-depth pixel codes point at non-transparent CLUT
+    /// entries.
+    #[test]
+    fn region_composition_fill_flag_cleared() {
+        let body = vec![
+            0x00, // region_id
+            0x00, // version=0, fill=0
+            0x00,
+            0x02,
+            0x00,
+            0x02, // width=2, height=2
+            (3 << 2),
+            0x00,
+            0x05, // 8-bit code = 5 — would map to white if fill were set
+            0x00,
+        ];
+        let (_, region) = parse_region_composition(&body).unwrap();
+        assert!(!region.fill);
+        assert_eq!(region.fill_code_8, 5);
+    }
+
+    /// End-to-end: a region with `region_fill_flag` set pre-paints the
+    /// region rectangle with the CLUT entry that the depth-appropriate
+    /// pixel code selects, *before* any objects composite on top. The
+    /// canvas pixels outside the region stay transparent.
+    #[test]
+    fn region_fill_flag_prepaints_region_rectangle() {
+        // 4×3 canvas. One 2×2 region at (1, 0), 8-bit depth, fill = 1,
+        // fill_code_8 = 1 (= white). No objects.
+        fn seg(out: &mut Vec<u8>, t: u8, body: &[u8]) {
+            out.push(0x0F);
+            out.push(t);
+            out.extend_from_slice(&1u16.to_be_bytes());
+            out.extend_from_slice(&(body.len() as u16).to_be_bytes());
+            out.extend_from_slice(body);
+        }
+        let mut pes = vec![0x20, 0x00];
+        // DDS: width-1=3, height-1=2 → 4×3 canvas.
+        seg(
+            &mut pes,
+            SEG_DISPLAY_DEFINITION,
+            &[0, 0x00, 0x03, 0x00, 0x02],
+        );
+        // PCS: region 0 at (1, 0).
+        let mut page = vec![0, 0, 0, 0xFF];
+        page.extend_from_slice(&1u16.to_be_bytes()); // x = 1
+        page.extend_from_slice(&0u16.to_be_bytes()); // y = 0
+        seg(&mut pes, SEG_PAGE_COMPOSITION, &page);
+        // RCS: region 0, fill=1, w=2, h=2, depth=8-bit, clut=0,
+        // fill_code_8 = 1, no objects.
+        let rcs = vec![
+            0x00,
+            0x08, // version=0, fill=1
+            0x00,
+            0x02, // width = 2
+            0x00,
+            0x02, // height = 2
+            (3 << 2),
+            0x00, // depth=8-bit, clut=0
+            0x01,
+            0x00, // pixel codes (8-bit=1, 4-bit=0, 2-bit=0)
+        ];
+        seg(&mut pes, SEG_REGION_COMPOSITION, &rcs);
+        // CLUT 0: entry 1 = white (Y=255, Cb=Cr=128, T=0).
+        let clut = vec![0, 0, 1, 0xFF, 255, 128, 128, 0];
+        seg(&mut pes, SEG_CLUT_DEFINITION, &clut);
+        seg(&mut pes, SEG_END_OF_DISPLAY_SET, &[]);
+
+        let params = CodecParameters::video(CodecId::new(DVBSUB_CODEC_ID));
+        let mut dec = make_decoder(&params).unwrap();
+        let pkt = Packet::new(0, TimeBase::new(1, 90_000), pes).with_pts(0);
+        dec.send_packet(&pkt).unwrap();
+        let Frame::Video(v) = dec.receive_frame().unwrap() else {
+            panic!("expected video frame");
+        };
+        let d = &v.planes[0].data;
+        let px = |x: usize, y: usize| &d[(y * 4 + x) * 4..(y * 4 + x) * 4 + 4];
+        // Inside the 2×2 region at (1..3, 0..2): white-ish, opaque.
+        for (rx, ry) in [(1, 0), (2, 0), (1, 1), (2, 1)] {
+            let p = px(rx, ry);
+            assert!(
+                p[0] > 200 && p[1] > 200 && p[2] > 200 && p[3] == 255,
+                "expected opaque white at ({}, {}), got {:?}",
+                rx,
+                ry,
+                p
+            );
+        }
+        // Column 0 is left of the region — still transparent canvas.
+        assert_eq!(px(0, 0), &[0, 0, 0, 0]);
+        assert_eq!(px(0, 1), &[0, 0, 0, 0]);
+        // Row 2 is below the region — still transparent canvas.
+        assert_eq!(px(0, 2), &[0, 0, 0, 0]);
+        assert_eq!(px(1, 2), &[0, 0, 0, 0]);
+        assert_eq!(px(2, 2), &[0, 0, 0, 0]);
+    }
+
+    /// Same shape as the previous test but with `region_fill_flag = 0`:
+    /// the region rectangle is *not* pre-painted, so the canvas stays
+    /// fully transparent end-to-end. Confirms the renderer keys off
+    /// `fill`, not the presence of a non-zero CLUT entry.
+    #[test]
+    fn region_fill_flag_cleared_leaves_canvas_transparent() {
+        fn seg(out: &mut Vec<u8>, t: u8, body: &[u8]) {
+            out.push(0x0F);
+            out.push(t);
+            out.extend_from_slice(&1u16.to_be_bytes());
+            out.extend_from_slice(&(body.len() as u16).to_be_bytes());
+            out.extend_from_slice(body);
+        }
+        let mut pes = vec![0x20, 0x00];
+        seg(
+            &mut pes,
+            SEG_DISPLAY_DEFINITION,
+            &[0, 0x00, 0x03, 0x00, 0x02],
+        );
+        let mut page = vec![0, 0, 0, 0xFF];
+        page.extend_from_slice(&1u16.to_be_bytes());
+        page.extend_from_slice(&0u16.to_be_bytes());
+        seg(&mut pes, SEG_PAGE_COMPOSITION, &page);
+        // RCS with fill flag cleared but pixel code still 1.
+        let rcs = vec![
+            0x00,
+            0x00, // version=0, fill=0
+            0x00,
+            0x02,
+            0x00,
+            0x02,
+            (3 << 2),
+            0x00,
+            0x01,
+            0x00,
+        ];
+        seg(&mut pes, SEG_REGION_COMPOSITION, &rcs);
+        let clut = vec![0, 0, 1, 0xFF, 255, 128, 128, 0];
+        seg(&mut pes, SEG_CLUT_DEFINITION, &clut);
+        seg(&mut pes, SEG_END_OF_DISPLAY_SET, &[]);
+
+        let params = CodecParameters::video(CodecId::new(DVBSUB_CODEC_ID));
+        let mut dec = make_decoder(&params).unwrap();
+        let pkt = Packet::new(0, TimeBase::new(1, 90_000), pes).with_pts(0);
+        dec.send_packet(&pkt).unwrap();
+        let Frame::Video(v) = dec.receive_frame().unwrap() else {
+            panic!("expected video frame");
+        };
+        for chunk in v.planes[0].data.chunks(4) {
+            assert_eq!(chunk, &[0, 0, 0, 0]);
+        }
+    }
+
+    /// The region rectangle is clipped to the canvas: a region declared
+    /// at (3, 1) with width 4 and height 4 against a 4×3 canvas writes
+    /// only the in-bounds 1×2 strip and never indexes out of the
+    /// canvas buffer.
+    #[test]
+    fn region_fill_clips_to_canvas() {
+        fn seg(out: &mut Vec<u8>, t: u8, body: &[u8]) {
+            out.push(0x0F);
+            out.push(t);
+            out.extend_from_slice(&1u16.to_be_bytes());
+            out.extend_from_slice(&(body.len() as u16).to_be_bytes());
+            out.extend_from_slice(body);
+        }
+        let mut pes = vec![0x20, 0x00];
+        // 4×3 canvas.
+        seg(
+            &mut pes,
+            SEG_DISPLAY_DEFINITION,
+            &[0, 0x00, 0x03, 0x00, 0x02],
+        );
+        let mut page = vec![0, 0, 0, 0xFF];
+        page.extend_from_slice(&3u16.to_be_bytes()); // x = 3 (last column)
+        page.extend_from_slice(&1u16.to_be_bytes()); // y = 1
+        seg(&mut pes, SEG_PAGE_COMPOSITION, &page);
+        // Region declared as 4×4 — extends past the canvas in both axes.
+        let rcs = vec![
+            0x00,
+            0x08, // fill=1
+            0x00,
+            0x04, // width = 4
+            0x00,
+            0x04, // height = 4
+            (3 << 2),
+            0x00,
+            0x01,
+            0x00,
+        ];
+        seg(&mut pes, SEG_REGION_COMPOSITION, &rcs);
+        let clut = vec![0, 0, 1, 0xFF, 255, 128, 128, 0];
+        seg(&mut pes, SEG_CLUT_DEFINITION, &clut);
+        seg(&mut pes, SEG_END_OF_DISPLAY_SET, &[]);
+
+        let params = CodecParameters::video(CodecId::new(DVBSUB_CODEC_ID));
+        let mut dec = make_decoder(&params).unwrap();
+        let pkt = Packet::new(0, TimeBase::new(1, 90_000), pes).with_pts(0);
+        dec.send_packet(&pkt).unwrap();
+        let Frame::Video(v) = dec.receive_frame().unwrap() else {
+            panic!("expected video frame");
+        };
+        let d = &v.planes[0].data;
+        let px = |x: usize, y: usize| &d[(y * 4 + x) * 4..(y * 4 + x) * 4 + 4];
+        // (3, 1) and (3, 2) are inside both region and canvas →
+        // pre-painted white.
+        for (rx, ry) in [(3, 1), (3, 2)] {
+            let p = px(rx, ry);
+            assert!(
+                p[3] == 255 && p[0] > 200,
+                "expected opaque white at ({}, {}), got {:?}",
+                rx,
+                ry,
+                p
+            );
+        }
+        // (3, 0) is above the region — still transparent.
+        assert_eq!(px(3, 0), &[0, 0, 0, 0]);
+        // (0, 1) and (2, 1) are left of the region — still transparent.
+        assert_eq!(px(0, 1), &[0, 0, 0, 0]);
+        assert_eq!(px(2, 1), &[0, 0, 0, 0]);
     }
 }

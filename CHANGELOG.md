@@ -186,6 +186,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   count in `src/dvbsub.rs::tests` rises from 2 to 24; the
   integration test set is unchanged.
 
+- DVB subtitle `region_composition_segment` now honours
+  `region_fill_flag` (ETSI EN 300 743 §7.2.3). When the flag is set,
+  the region rectangle is pre-painted with the depth-appropriate
+  `region_n-bit_pixel_code` (8/4/2-bit), translated through the
+  region's CLUT, *before* any objects composite on top — matching the
+  spec's "fill the region area with the colour given by the n-bit
+  pixel code" wording. Cleared, the rectangle stays at the canvas's
+  transparent background, exactly as before. The pre-fill rectangle
+  is clipped to the canvas, so a region declared past the right or
+  bottom edge writes only its in-bounds intersection (no buffer
+  overrun on malformed streams). The byte layout the parser already
+  inspected to advance past the three pixel-code bytes is now
+  preserved on the typed `Region` (`fill: bool`,
+  `fill_code_8 / fill_code_4 / fill_code_2: u8`), removing the
+  `#[allow(dead_code)]` on `width` / `height` / `depth_bits`. Five
+  new unit tests cover the path: a structured-parse assertion that
+  `region_fill_flag = 1` + the three pixel-code bytes decode to the
+  expected typed fields; the cleared-flag counterpart asserting `fill
+  = false` survives a non-zero pixel-code byte; an end-to-end render
+  test against a 4×3 canvas with a 2×2 fill region at (1, 0) +
+  CLUT-1 = white, asserting the four region pixels go opaque white
+  and the six off-region pixels stay transparent; the
+  cleared-flag end-to-end test asserting an identical RCS but with
+  the flag cleared leaves the whole canvas transparent (the
+  renderer keys off `fill`, not the CLUT entry); and a clip-to-canvas
+  test placing a 4×4 region at (3, 1) against a 4×3 canvas and
+  asserting only the in-bounds 1×2 strip is painted.
+
 ### Changed
 
 - Restated the `decode_2bit_string` 01-prefix comment in spec-style
