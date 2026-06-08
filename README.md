@@ -89,6 +89,19 @@ compatibility. The parser rejects a body whose declared window count
 does not match the remaining bytes exactly, a zero-extent window, and
 an empty body.
 
+Palette Definition Segments are kept in independent slots keyed by
+their on-wire `palette_id`, so a display-set carrying several PDS for
+different ids (the BD-ROM HDMV authoring shape for colour-change /
+fade effects, where a content tool writes both halves of the effect
+side-by-side and lets the PCS pick which one is current) no longer
+collapses into one shared table. The render path consults the PCS's
+`palette_id` byte and looks the matching slot up at composite time; a
+PCS that references a slot no PDS has populated falls back to the
+default all-transparent palette so a malformed stream stays defined.
+A repeated PDS for an already-populated slot still adds / replaces
+individual entries on top of whatever the earlier PDS wrote, matching
+the per-entry-delta rule a `palette_version_number` bump implies.
+
 When a display-set stacks overlapping objects (multiple PGS composition
 objects, multiple DVB regions/objects) and the topmost pixel is only
 partially transparent, the painted source is alpha-composited *over* the

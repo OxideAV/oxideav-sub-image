@@ -40,7 +40,14 @@
 //! * Objects referenced by a composition but not yet seen via ODS are
 //!   skipped silently — PGS allows carrying only palette/WDS updates.
 //! * ODS fragmentation is handled (an object carries `last_in_sequence`
-//!   bits); a PDS version update is treated as a replace.
+//!   bits); a PDS version update is treated as a per-entry replace
+//!   within the named `palette_id` slot.
+//! * Multi-PDS display-sets keep each PDS in its own `palette_id`-keyed
+//!   slot; render-time palette selection follows the PCS's `palette_id`
+//!   byte rather than the last PDS seen, so two PDS with different ids
+//!   in the same set do not trample each other (a content authoring
+//!   tool may carry both halves of a fade / colour-change effect
+//!   side-by-side and let the PCS pick which one is current).
 //! * Cropped compositions (PCS.object_cropped_flag) parse the 8-byte
 //!   cropping rectangle that follows the object entry and apply it as a
 //!   sub-rectangle selection on the Graphics Object before compositing.
@@ -372,13 +379,30 @@ fn ycbcr_to_rgba(y: u8, cr: u8, cb: u8, a: u8) -> [u8; 4] {
     ]
 }
 
-fn parse_pds_into(body: &[u8], palette: &mut Palette) -> Result<()> {
+/// Parse one PDS body into the keyed palette table, returning the
+/// `palette_id` the body declared. body[0] is the `palette_id` byte
+/// (the PCS uses this to pick which palette to render against) and
+/// body[1] is the `palette_version_number` (informational; a version
+/// update is treated as a replace per the PDS contract). Subsequent
+/// 5-byte entries (index, Y, Cr, Cb, alpha) update that palette's
+/// table — entries the PDS does not touch retain their prior value,
+/// matching the BD-ROM HDMV graphics decoder rule that a PDS
+/// describes *deltas* against the named palette rather than replacing
+/// it wholesale.
+///
+/// Two PDS with different `palette_id`s in the same display-set now
+/// land in independent slots rather than trampling each other; the
+/// later PCS selects which slot to render against via its
+/// `palette_id` field. A second PDS for the same `palette_id` adds /
+/// replaces entries on top of whatever the first one wrote, again
+/// per the entry-delta rule.
+fn parse_pds_into(body: &[u8], palettes: &mut HashMap<u8, Palette>) -> Result<u8> {
     if body.len() < 2 {
         return Err(Error::invalid("PGS PDS: too short"));
     }
-    // body[0] = palette_id, body[1] = palette_version. We fold all
-    // palettes into one shared table — real streams rarely use more
-    // than the id-0 palette per display-set.
+    let palette_id = body[0];
+    // body[1] = palette_version_number (informational).
+    let palette = palettes.entry(palette_id).or_default();
     let mut cur = 2;
     while cur + 5 <= body.len() {
         let idx = body[cur] as usize;
@@ -389,7 +413,7 @@ fn parse_pds_into(body: &[u8], palette: &mut Palette) -> Result<()> {
         palette.entries[idx] = ycbcr_to_rgba(y, cr, cb, a);
         cur += 5;
     }
-    Ok(())
+    Ok(palette_id)
 }
 
 // --- ODS ---------------------------------------------------------------
@@ -550,7 +574,12 @@ struct DisplaySet {
     pcs: Option<PresentationComposition>,
     // Accepted last-known PTS in 90 kHz units.
     pts_90k: u32,
-    palette: Palette,
+    /// Palettes keyed by `palette_id`. A display-set may carry several
+    /// PDS slots (e.g. an effect that fades between two palettes), and
+    /// the PCS picks which slot to render against via its own
+    /// `palette_id` byte. The map starts empty; `parse_pds_into`
+    /// populates a slot the first time it sees a given `palette_id`.
+    palettes: HashMap<u8, Palette>,
     object_fragments: HashMap<u16, Vec<u8>>,
     objects: HashMap<u16, Object>,
     /// Window rectangles declared by the WDS, keyed by `window_id`. Each
@@ -586,7 +615,12 @@ impl DisplaySet {
                 }
             }
             SEG_PDS => {
-                parse_pds_into(&seg.body, &mut self.palette)?;
+                // The returned `palette_id` is currently informational —
+                // render-time selection looks the slot up by the PCS's
+                // `palette_id` byte. We still parse it so a malformed
+                // body[0] errors out (via the short-body branch above)
+                // rather than silently mis-keying the slot.
+                let _palette_id = parse_pds_into(&seg.body, &mut self.palettes)?;
             }
             SEG_ODS => {
                 parse_ods_into(&seg.body, &mut self.object_fragments, &mut self.objects)?;
@@ -616,6 +650,17 @@ impl DisplaySet {
             return Err(Error::invalid("PGS PCS: zero-sized canvas"));
         }
         let mut canvas = vec![0u8; width * height * 4];
+        // The PCS picks which palette slot to render against via its
+        // `palette_id` byte. A display-set authoring tool can carry
+        // several PDS with different `palette_id`s in the same set —
+        // e.g. for a fade or a colour-change effect between epochs —
+        // and the PCS selects which one applies. If no PDS with that
+        // id has been seen yet, fall back to the default
+        // (all-transparent) palette so the render stays defined; the
+        // visible result will be a transparent canvas with the object
+        // shape implied only by its alpha-0 entries.
+        let fallback = Palette::default();
+        let palette = self.palettes.get(&pcs.palette_id).unwrap_or(&fallback);
         for co in &pcs.objects {
             let Some(obj) = self.objects.get(&co.object_id) else {
                 continue;
@@ -702,7 +747,6 @@ impl DisplaySet {
                     obj.pixels[start..start + paint_sw].to_vec()
                 })
                 .collect();
-            let palette = &self.palette;
             crate::composite::blit_indexed(
                 &mut canvas,
                 width,
@@ -2895,5 +2939,246 @@ mod tests {
             "encoder must emit Epoch Start on every set (each call is standalone)"
         );
         assert!(is_random_access(pcs.composition_state));
+    }
+
+    // --- PDS palette_id keying ----------------------------------------
+    //
+    // PDS bodies declare their `palette_id` in body[0]. The PCS picks
+    // which palette slot to render against via its own `palette_id`
+    // byte. A display-set may carry several PDS with different ids
+    // (e.g. a fade between two palettes); those must NOT fold into a
+    // single shared table — otherwise a later PDS that declares only
+    // entry #1 for `palette_id == 1` would silently corrupt the
+    // `palette_id == 0` table that the PCS is actually referencing.
+
+    /// Build a single PDS body carrying the given palette_id, version,
+    /// and (idx, Y, Cr, Cb, A) entries. Used by the PDS-keying tests
+    /// below; keeps the on-wire byte layout in one place so the test
+    /// helper and the production parser stay in sync.
+    fn build_pds_body(palette_id: u8, version: u8, entries: &[(u8, u8, u8, u8, u8)]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(2 + entries.len() * 5);
+        out.push(palette_id);
+        out.push(version);
+        for (idx, y, cr, cb, a) in entries {
+            out.push(*idx);
+            out.push(*y);
+            out.push(*cr);
+            out.push(*cb);
+            out.push(*a);
+        }
+        out
+    }
+
+    #[test]
+    fn parse_pds_surfaces_palette_id_and_keys_into_table() {
+        // body[0] = palette_id; the parser must return it AND key its
+        // entries into the matching slot. Two PDS bodies with different
+        // ids land in independent slots.
+        let mut palettes: HashMap<u8, Palette> = HashMap::new();
+        let body0 = build_pds_body(0, 0, &[(1, 0xFF, 0x80, 0x80, 0xFF)]);
+        let body1 = build_pds_body(7, 0, &[(1, 0x00, 0x80, 0x80, 0xFF)]);
+
+        let id0 = parse_pds_into(&body0, &mut palettes).unwrap();
+        let id1 = parse_pds_into(&body1, &mut palettes).unwrap();
+        assert_eq!(id0, 0, "first PDS reports palette_id 0");
+        assert_eq!(id1, 7, "second PDS reports palette_id 7");
+
+        // Slot 0 holds the white entry from body0; slot 7 holds the
+        // black entry from body1. They must not have trampled each
+        // other — the BT.601 YCbCr→RGB conversion is lossy at the LSB,
+        // so check via the alpha + luma roundabout rather than exact
+        // RGB triples.
+        let pal0 = palettes.get(&0).expect("slot 0 must exist after PDS#0");
+        let pal7 = palettes.get(&7).expect("slot 7 must exist after PDS#7");
+        assert_eq!(pal0.entries[1][3], 0xFF, "slot 0 entry 1 alpha");
+        assert!(
+            pal0.entries[1][0] > 200,
+            "slot 0 entry 1 should be near white"
+        );
+        assert_eq!(pal7.entries[1][3], 0xFF, "slot 7 entry 1 alpha");
+        assert!(
+            pal7.entries[1][0] < 32,
+            "slot 7 entry 1 should be near black"
+        );
+    }
+
+    #[test]
+    fn parse_pds_rejects_too_short_body() {
+        // A PDS with fewer than 2 bytes can't even carry the id + version
+        // pair the header demands; reject rather than silently treating
+        // it as a zero-id, zero-version, no-entries no-op.
+        let mut palettes: HashMap<u8, Palette> = HashMap::new();
+        let err = parse_pds_into(&[0x00], &mut palettes).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("PDS"),
+            "expected a PDS-flavoured error, got {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_pds_second_pds_for_same_id_merges_entries() {
+        // A PDS describes per-entry deltas against the named slot:
+        // the first PDS for id 0 writes entry 1, a second PDS for id 0
+        // writes entry 2 — both entries must survive on the same slot.
+        let mut palettes: HashMap<u8, Palette> = HashMap::new();
+        let first = build_pds_body(0, 0, &[(1, 0xFF, 0x80, 0x80, 0xFF)]);
+        let second = build_pds_body(0, 1, &[(2, 0x80, 0x80, 0x80, 0x7F)]);
+        parse_pds_into(&first, &mut palettes).unwrap();
+        parse_pds_into(&second, &mut palettes).unwrap();
+        let pal = palettes.get(&0).unwrap();
+        assert_eq!(pal.entries[1][3], 0xFF, "first PDS's entry 1 must survive");
+        assert_eq!(
+            pal.entries[2][3], 0x7F,
+            "second PDS's entry 2 must land alongside"
+        );
+    }
+
+    /// Build a complete PGS display-set carrying:
+    /// * one PCS that names `pcs_palette_id`
+    /// * one WDS covering the full canvas
+    /// * two PDS, one for `palette_id == 0` and one for
+    ///   `palette_id == 1`, each with a single non-transparent entry at
+    ///   index 1 (the colours differ so the render output reveals which
+    ///   slot the renderer actually used)
+    /// * one ODS painting a 1×1 object of palette-index 1 at (0, 0)
+    /// * the terminating END
+    ///
+    /// `(red_at_id0, blue_at_id1)` is the colour layout: slot 0 paints
+    /// red, slot 1 paints blue. The PCS's palette_id field then decides
+    /// whether the rendered pixel ends up red or blue — which is the
+    /// behaviour the new keying rule asserts.
+    fn build_dualpds_display_set(pcs_palette_id: u8) -> Vec<u8> {
+        let mut out = Vec::new();
+        // PCS — 1×1 canvas, one composition object, palette_id selected.
+        let mut pcs = Vec::new();
+        pcs.extend_from_slice(&1u16.to_be_bytes()); // canvas w
+        pcs.extend_from_slice(&1u16.to_be_bytes()); // canvas h
+        pcs.push(0); // frame rate
+        pcs.extend_from_slice(&1u16.to_be_bytes()); // composition_number
+        pcs.push(COMP_STATE_EPOCH_START);
+        pcs.push(0); // palette_update_flag
+        pcs.push(pcs_palette_id); // <-- the byte under test
+        pcs.push(1); // one composition object
+        pcs.extend_from_slice(&1u16.to_be_bytes()); // object_id
+        pcs.push(0); // window_id
+        pcs.push(0); // flags
+        pcs.extend_from_slice(&0u16.to_be_bytes()); // x
+        pcs.extend_from_slice(&0u16.to_be_bytes()); // y
+        push_segment(&mut out, 0, SEG_PCS, &pcs);
+
+        // WDS covering the full 1×1 canvas.
+        let mut wds = Vec::new();
+        wds.push(1);
+        wds.push(0); // window_id
+        wds.extend_from_slice(&0u16.to_be_bytes());
+        wds.extend_from_slice(&0u16.to_be_bytes());
+        wds.extend_from_slice(&1u16.to_be_bytes());
+        wds.extend_from_slice(&1u16.to_be_bytes());
+        push_segment(&mut out, 0, SEG_WDS, &wds);
+
+        // Slot 0 = opaque red (Y=76, Cr=255, Cb=85 is roughly red in
+        // BT.601 — but we can't rely on exact RGB recovery because the
+        // YCbCr→RGB path quantises. Pick clearly-different luma values
+        // so the slot identification is unambiguous via the Y channel.)
+        let pds0 = build_pds_body(0, 0, &[(1, 0x4C, 0xFF, 0x55, 0xFF)]);
+        push_segment(&mut out, 0, SEG_PDS, &pds0);
+        // Slot 1 = opaque blue (low Y so the rendered green channel is
+        // far from slot 0's red green channel — distinguishable at the
+        // byte level).
+        let pds1 = build_pds_body(1, 0, &[(1, 0x1D, 0x80, 0xFF, 0xFF)]);
+        push_segment(&mut out, 0, SEG_PDS, &pds1);
+
+        // ODS — 1×1 object, single pixel of palette-index 1.
+        let rle = encode_rle(&[1u8], 1, 1);
+        let mut ods = Vec::new();
+        ods.extend_from_slice(&1u16.to_be_bytes()); // object_id
+        ods.push(0); // object_version
+        ods.push(0xC0); // first + last
+        let obj_data_len = (rle.len() + 4) as u32;
+        ods.push(((obj_data_len >> 16) & 0xFF) as u8);
+        ods.push(((obj_data_len >> 8) & 0xFF) as u8);
+        ods.push((obj_data_len & 0xFF) as u8);
+        ods.extend_from_slice(&1u16.to_be_bytes()); // w
+        ods.extend_from_slice(&1u16.to_be_bytes()); // h
+        ods.extend_from_slice(&rle);
+        push_segment(&mut out, 0, SEG_ODS, &ods);
+
+        // END.
+        push_segment(&mut out, 0, SEG_END, &[]);
+        out
+    }
+
+    /// Drive a single .sup byte stream through the public decoder and
+    /// return the 4-byte RGBA pixel at (0, 0). The dual-PDS tests assert
+    /// against that one pixel because the renderer's choice of palette
+    /// slot is the only thing under test.
+    fn decode_first_pixel(stream: Vec<u8>) -> [u8; 4] {
+        let resolver = oxideav_core::NullCodecResolver;
+        let input: Box<dyn ReadSeek> = Box::new(std::io::Cursor::new(stream));
+        let mut dmx = open_pgs(input, &resolver).unwrap();
+        let params = &dmx.streams()[0].params;
+        let mut dec = make_decoder(params).unwrap();
+        let pkt = dmx.next_packet().unwrap();
+        dec.send_packet(&pkt).unwrap();
+        let frame = match dec.receive_frame().unwrap() {
+            Frame::Video(vf) => vf,
+            other => panic!("expected Frame::Video, got {other:?}"),
+        };
+        let data = &frame.planes[0].data;
+        assert!(
+            data.len() >= 4,
+            "decoded plane should hold at least one RGBA pixel"
+        );
+        [data[0], data[1], data[2], data[3]]
+    }
+
+    #[test]
+    fn render_selects_palette_via_pcs_palette_id_byte() {
+        // Same dual-PDS display-set rendered twice: once with the PCS
+        // pointing at slot 0, once at slot 1. The rendered pixel must
+        // differ — proving the renderer keys off the PCS byte rather
+        // than the last PDS seen (which would tie both renders to slot
+        // 1's palette).
+        let stream0 = build_dualpds_display_set(0);
+        let stream1 = build_dualpds_display_set(1);
+        let px0 = decode_first_pixel(stream0);
+        let px1 = decode_first_pixel(stream1);
+        assert_eq!(px0[3], 0xFF, "slot 0 fully opaque");
+        assert_eq!(px1[3], 0xFF, "slot 1 fully opaque");
+        assert_ne!(
+            (px0[0], px0[1], px0[2]),
+            (px1[0], px1[1], px1[2]),
+            "same display-set, different PCS palette_id, must render different colour"
+        );
+        // Slot 0 was authored as red-ish (high Cr); the renderer must
+        // produce a pixel where the red channel dominates.
+        assert!(
+            px0[0] > px0[2],
+            "slot 0 should render red-dominant; got {:?}",
+            px0
+        );
+        // Slot 1 was authored as blue-ish (high Cb); blue channel
+        // dominant in the rendered RGBA.
+        assert!(
+            px1[2] > px1[0],
+            "slot 1 should render blue-dominant; got {:?}",
+            px1
+        );
+    }
+
+    #[test]
+    fn render_uses_default_palette_when_pcs_references_missing_id() {
+        // PCS picks palette_id 9 but no PDS for slot 9 was sent. The
+        // renderer falls back to the default (all-transparent) palette
+        // so the output stays defined — the painted pixel ends up
+        // alpha-0 even though the ODS carries an opaque-coloured
+        // palette index.
+        let stream = build_dualpds_display_set(9);
+        let px = decode_first_pixel(stream);
+        assert_eq!(
+            px[3], 0x00,
+            "missing palette_id must render through the transparent default"
+        );
     }
 }

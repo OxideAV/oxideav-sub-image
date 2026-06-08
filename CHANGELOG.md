@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- PGS Palette Definition Segments are now kept in independent slots
+  keyed by their on-wire `palette_id` byte, instead of folding all
+  PDS entries into a single shared 256-entry table. The render path
+  consults the PCS's `palette_id` field to pick which slot to render
+  against: a display-set that carries one PDS at `palette_id == 0`
+  and a second PDS at `palette_id == 1` (the shape an authoring tool
+  uses for a colour-change or fade effect, where the next epoch's
+  PCS will reference the other slot to swap palettes without
+  reloading the bitmap) now leaves the two palettes side-by-side
+  rather than letting the second PDS overwrite the first. Before
+  this change a PCS referencing slot 0 would see slot 1's last-PDS
+  bytes — silently wrong for any stream that authored more than one
+  palette per set. The keyed map preserves the existing entry-delta
+  rule for a same-id repeat (a second PDS for the same `palette_id`
+  adds / replaces individual entries on top of whatever the first
+  one wrote). A PCS whose `palette_id` references a slot no PDS
+  populated falls back to the default (all-transparent) palette, so
+  the render stays defined on malformed streams without panicking.
+- Five new unit tests in `src/pgs.rs::tests` cover the keying path:
+  a structured-parse assertion that `parse_pds_into` surfaces
+  `palette_id` and routes two ids into independent slots; a
+  short-body rejection test; a same-id additive-merge test
+  confirming a second PDS for an existing slot adds entry deltas
+  without clobbering earlier ones; an end-to-end render test
+  asserting the same dual-PDS display-set rendered with PCS
+  `palette_id == 0` vs. `palette_id == 1` produces visibly
+  different pixels (red-dominant vs. blue-dominant); and a
+  missing-id render test asserting a PCS pointing at an unpopulated
+  slot renders fully transparent rather than crashing.
 - `pgs::WindowDefinition` and the `pgs::parse_wds` helper expose the
   Window Definition Segment as a typed `Vec<WindowDefinition>` with
   `(window_id, x, y, w, h)` in canvas-pixel space. The parser rejects
