@@ -23,8 +23,12 @@
 //! * **Decode only.** Pixel-coded objects are supported; *character*-
 //!   coded objects (2‐byte UTF-style segments used for teletext-style
 //!   streams) currently return `Error::Unsupported`.
-//! * Single-region displays are handled; multi-region displays stack by
-//!   region z-order (first region wins).
+//! * Multi-region displays are composited in page-composition list
+//!   order: each referenced region paints onto the canvas in the order
+//!   it appears in the page-composition segment, blending over whatever
+//!   an earlier region already wrote (Porter–Duff source-over), so a
+//!   later region with a partially-transparent CLUT entry shows the
+//!   region beneath it through rather than discarding it.
 //! * Page timeouts are accepted but not enforced here — caller uses the
 //!   accompanying packet duration.
 //! * `region_fill_flag` (ETSI EN 300 743 §7.2.3) is honoured: when set,
@@ -983,6 +987,138 @@ mod tests {
             "expected red-dominant, got {:?}",
             r0c1
         );
+    }
+
+    /// Frame a single DVB segment (`0x0F`, type, page_id, length, body).
+    fn dvb_segment(out: &mut Vec<u8>, seg_type: u8, body: &[u8]) {
+        out.push(0x0F);
+        out.push(seg_type);
+        out.extend_from_slice(&1u16.to_be_bytes()); // page_id
+        out.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        out.extend_from_slice(body);
+    }
+
+    /// One 8-bit-coded object body carrying a single top-field row of
+    /// `row` pixels (no bottom field). `object_id` identifies it for the
+    /// region's object reference.
+    fn dvb_object_8bit(object_id: u16, row: &[u8]) -> Vec<u8> {
+        let mut obj = Vec::new();
+        obj.extend_from_slice(&object_id.to_be_bytes());
+        obj.push(0); // version + coding_method(0) + flags
+        let mut top = vec![0x12]; // 8-bit pixel-code-string data type
+        top.extend_from_slice(&encode_8bit_literal(row));
+        top.push(0xF0); // end-of-object-line
+        obj.extend_from_slice(&(top.len() as u16).to_be_bytes()); // top length
+        obj.extend_from_slice(&0u16.to_be_bytes()); // bottom length = 0
+        obj.extend_from_slice(&top);
+        obj
+    }
+
+    /// A region-composition body: `region_id`, 8-bit depth, `clut_id`,
+    /// and a single object reference at the region origin.
+    fn dvb_region_8bit(region_id: u8, clut_id: u8, w: u16, h: u16, object_id: u16) -> Vec<u8> {
+        let mut region = Vec::new();
+        region.push(region_id);
+        region.push(0); // version + fill_flag(0)
+        region.extend_from_slice(&w.to_be_bytes());
+        region.extend_from_slice(&h.to_be_bytes());
+        region.push(3 << 2); // region_depth = 3 (8-bit)
+        region.push(clut_id);
+        region.push(0); // region_8-bit_pixel_code
+        region.push(0); // region_4/2-bit_pixel_code
+                        // object reference at (0,0), obj_type = 0.
+        region.extend_from_slice(&object_id.to_be_bytes());
+        region.extend_from_slice(&0u16.to_be_bytes()); // x
+        region.extend_from_slice(&0u16.to_be_bytes()); // y
+        region
+    }
+
+    /// One full-precision CLUT entry: entry 1 → the given Y/Cr/Cb/T.
+    fn dvb_clut_entry1(clut_id: u8, y: u8, cr: u8, cb: u8, t: u8) -> Vec<u8> {
+        vec![
+            clut_id, 0, /* entry_id */ 1, /* flags: full-precision */ 0x01, y, cr, cb, t,
+        ]
+    }
+
+    #[test]
+    fn multi_region_overlap_composites_in_page_order() {
+        // Two single-pixel regions at the same page position (0,0). The
+        // earlier page-list region paints an opaque colour; the later one
+        // paints a half-transparent colour on top. The spec composites
+        // page regions in list order with Porter–Duff source-over, so the
+        // result is a *blend* of the two — not the first region alone.
+        let mut out = vec![0x20, 0x00]; // data_identifier + stream_id
+
+        // DDS: 2×1 canvas (encoded as max-index width/height-1).
+        let mut dds = Vec::new();
+        dds.push(0);
+        dds.extend_from_slice(&1u16.to_be_bytes()); // width - 1  → 2
+        dds.extend_from_slice(&0u16.to_be_bytes()); // height - 1 → 1
+        dvb_segment(&mut out, SEG_DISPLAY_DEFINITION, &dds);
+
+        // Page composition: region 0 then region 1, both at (0,0).
+        let mut page = vec![0 /* timeout */, 0 /* version/state */];
+        for region_id in [0u8, 1] {
+            page.push(region_id);
+            page.push(0xFF); // reserved
+            page.extend_from_slice(&0u16.to_be_bytes()); // x
+            page.extend_from_slice(&0u16.to_be_bytes()); // y
+        }
+        dvb_segment(&mut out, SEG_PAGE_COMPOSITION, &page);
+
+        // Region 0 → opaque white (CLUT 0). Region 1 → half-transparent
+        // red (CLUT 1) layered on top.
+        dvb_segment(
+            &mut out,
+            SEG_REGION_COMPOSITION,
+            &dvb_region_8bit(0, 0, 1, 1, 100),
+        );
+        dvb_segment(
+            &mut out,
+            SEG_REGION_COMPOSITION,
+            &dvb_region_8bit(1, 1, 1, 1, 101),
+        );
+
+        // CLUT 0 entry 1 → opaque white (T = 0 → alpha 255).
+        dvb_segment(
+            &mut out,
+            SEG_CLUT_DEFINITION,
+            &dvb_clut_entry1(0, 255, 128, 128, 0),
+        );
+        // CLUT 1 entry 1 → half-transparent red (T = 128 → alpha ~127).
+        dvb_segment(
+            &mut out,
+            SEG_CLUT_DEFINITION,
+            &dvb_clut_entry1(1, 81, 240, 90, 128),
+        );
+
+        // Object 100 paints colour 1 in region 0; object 101 in region 1.
+        dvb_segment(&mut out, SEG_OBJECT_DATA, &dvb_object_8bit(100, &[1]));
+        dvb_segment(&mut out, SEG_OBJECT_DATA, &dvb_object_8bit(101, &[1]));
+
+        dvb_segment(&mut out, SEG_END_OF_DISPLAY_SET, &[]);
+
+        let params = CodecParameters::video(CodecId::new(DVBSUB_CODEC_ID));
+        let mut dec = make_decoder(&params).unwrap();
+        let pkt = Packet::new(0, TimeBase::new(1, 90_000), out).with_pts(0);
+        dec.send_packet(&pkt).unwrap();
+        let Frame::Video(v) = dec.receive_frame().unwrap() else {
+            panic!("expected video frame");
+        };
+        let px = &v.planes[0].data[0..4];
+        // If only the first region won, the pixel would be pure opaque
+        // white (R≈G≈B, all high). Source-over of a half-transparent red
+        // pulls green/blue down below red while keeping red high.
+        assert!(
+            px[0] > px[1] && px[0] > px[2],
+            "expected red-biased blend from the second region, got {px:?}"
+        );
+        assert!(
+            px[1] < 255 && px[2] < 255,
+            "expected the top region to darken green/blue, got {px:?}"
+        );
+        // Final pixel is opaque (the underlying region was opaque white).
+        assert_eq!(px[3], 255, "expected opaque result, got {px:?}");
     }
 
     #[test]

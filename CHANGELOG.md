@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- DVB subtitle multi-region compositing is now covered by a regression
+  test (`dvbsub::tests::multi_region_overlap_composites_in_page_order`):
+  a display set that references two overlapping regions in the
+  page-composition segment paints them in list order with Porter–Duff
+  source-over, so a later region carrying a partially-transparent CLUT
+  entry blends over the region beneath it rather than discarding it.
+
+### Changed
+
+- Corrected the DVB subtitle module/README documentation: multi-region
+  displays composite in page-composition list order (each region over
+  the previous, source-over), not "first region wins" as the previous
+  note implied. The decoder already behaved this way; only the prose
+  was stale.
+
+### Added (PGS)
+
 - PGS Palette Definition Segments are now kept in independent slots
   keyed by their on-wire `palette_id` byte, instead of folding all
   PDS entries into a single shared 256-entry table. The render path

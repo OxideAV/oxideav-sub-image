@@ -14,7 +14,11 @@ Pure-Rust bitmap-subtitle codecs and containers:
   pixel code" wording. Cleared, the rectangle stays at the canvas's
   transparent background. The pre-fill is clipped to the canvas, so a
   region declared past the right or bottom edge writes only its
-  in-bounds intersection.
+  in-bounds intersection. A display set that references several regions
+  composites them in page-composition list order: each region paints
+  over whatever an earlier region already wrote (Porter–Duff
+  source-over), so a later region's partially-transparent CLUT entries
+  show the region beneath through rather than discarding it.
 - **VobSub** / DVD SPU (`.idx`+`.sub`) — decode only, container reads
   the `.idx` text index + matched `.sub` payload (MPEG-PS pack + PES
   private_stream_1 or raw SPU-length-prefixed form). The SPU's
