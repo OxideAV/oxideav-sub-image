@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- DVB subtitles: full WRITE direction (ETSI EN 300 743). New public
+  segment writers in `dvbsub` — `write_segment` framing,
+  `write_display_definition`, `write_page_composition`,
+  `write_region_composition` (via `RegionCompositionDef`: fill flag,
+  per-depth fill pixel codes, pixel-coded object placements),
+  `write_clut_definition` (via `ClutEntryDef`: 4-byte full-range and
+  packed 2-byte forms) and `write_object_data` (top/bottom field
+  split, optional map-table prefixes) — each the inverse of the
+  corresponding decoder parse. True run-length 2/4/8-bit
+  pixel-code-string encoders (`encode_2bit_pixel_string` /
+  `encode_4bit_pixel_string` / `encode_8bit_pixel_string`) cover every
+  counted-run form, the single-pixel-of-colour-0 codes, end-of-string
+  termination and byte alignment, with runs longer than a form's
+  maximum chunked greedily. `rgba_to_clut_ycbcrt` is the integer
+  inverse of the decode-side BT.601 CLUT transform (greys bit-exact,
+  colours within ±2 LSBs, alpha exact). `dvbsub::make_encoder` (also
+  registered through `register_codecs`) turns RGBA frames into
+  complete display-set PES payloads — DDS + PCS + RCS + CLUT + ODS +
+  END — picking the smallest pixel depth that fits the quantised
+  palette (≤ 4 entries → 2-bit, ≤ 16 → 4-bit, else 8-bit, with a
+  3-3-2-2 reduction fallback past 255 distinct colours), cropping to
+  the tight bounding box of non-transparent pixels, and emitting an
+  erase page (no regions) for a fully-transparent frame. All writers
+  are pinned by encode→decode roundtrips through the existing decode
+  path: per-form run-length boundary sweeps, randomised rows,
+  even/odd/single-row field interleave, map-table transparency, CLUT
+  short-vs-full form agreement, and nine end-to-end encoder→decoder
+  integration tests.
+
 - DVB subtitle multi-region compositing is now covered by a regression
   test (`dvbsub::tests::multi_region_overlap_composites_in_page_order`):
   a display set that references two overlapping regions in the

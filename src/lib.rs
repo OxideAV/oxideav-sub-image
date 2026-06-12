@@ -15,10 +15,11 @@
 //!
 //! ## Scope
 //!
-//! * PGS supports both decode and encode.
-//! * DVB subtitles and VobSub are decode-only for now. DVB subs need a
-//!   TS-aware muxer upstream; VobSub needs the `.idx`+`.sub` pair written
-//!   in lock-step which this crate doesn't yet expose.
+//! * PGS and DVB subtitles support both decode and encode. The DVB
+//!   encoder produces the display-set PES payload; riding MPEG-TS needs
+//!   a TS-aware muxer upstream.
+//! * VobSub is decode-only for now: it needs the `.idx`+`.sub` pair
+//!   written in lock-step which this crate doesn't yet expose.
 //! * One RGBA [`oxideav_core::VideoFrame`] is emitted per display-set
 //!   (cue change) — either the full video-canvas-sized frame (PGS/DVB)
 //!   or the bitmap's own rectangle (VobSub).
@@ -92,31 +93,39 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
         );
     }
 
-    // PGS encoder. The other two formats are decode-only for now: DVB
-    // subs need a TS-aware muxer to produce valid streams, and VobSub
-    // needs the `.idx`+`.sub` pair written in lock-step.
-    let pgs_enc_caps = CodecCapabilities {
-        decode: false,
-        encode: true,
-        media_type: MediaType::Subtitle,
-        intra_only: true,
-        lossy: true,
-        lossless: false,
-        hardware_accelerated: false,
-        implementation: "pgs_sw".into(),
-        max_width: None,
-        max_height: None,
-        max_bitrate: None,
-        max_sample_rate: None,
-        max_channels: None,
-        priority: 100,
-        accepted_pixel_formats: vec![oxideav_core::PixelFormat::Rgba],
-    };
-    reg.register(
-        CodecInfo::new(CodecId::new(PGS_CODEC_ID))
-            .capabilities(pgs_enc_caps)
-            .encoder(pgs::make_encoder),
-    );
+    // PGS and DVB subtitle encoders. VobSub stays decode-only for now:
+    // it needs the `.idx`+`.sub` pair written in lock-step. The DVB
+    // encoder emits the display-set PES payload; riding MPEG-TS still
+    // needs a TS muxer upstream.
+    for id in [PGS_CODEC_ID, DVBSUB_CODEC_ID] {
+        let enc_caps = CodecCapabilities {
+            decode: false,
+            encode: true,
+            media_type: MediaType::Subtitle,
+            intra_only: true,
+            lossy: true,
+            lossless: false,
+            hardware_accelerated: false,
+            implementation: format!("{id}_sw"),
+            max_width: None,
+            max_height: None,
+            max_bitrate: None,
+            max_sample_rate: None,
+            max_channels: None,
+            priority: 100,
+            accepted_pixel_formats: vec![oxideav_core::PixelFormat::Rgba],
+        };
+        let factory = match id {
+            PGS_CODEC_ID => pgs::make_encoder,
+            DVBSUB_CODEC_ID => dvbsub::make_encoder,
+            _ => unreachable!(),
+        };
+        reg.register(
+            CodecInfo::new(CodecId::new(id))
+                .capabilities(enc_caps)
+                .encoder(factory),
+        );
+    }
 }
 
 /// Register the PGS (`.sup`) and VobSub (`.idx`+`.sub`) containers.
@@ -158,6 +167,15 @@ mod register_tests {
         assert!(
             ctx.codecs.has_encoder(&id),
             "PGS encoder factory not installed via RuntimeContext"
+        );
+        let dvb_id = CodecId::new(DVBSUB_CODEC_ID);
+        assert!(
+            ctx.codecs.has_decoder(&dvb_id),
+            "DVB sub decoder factory not installed via RuntimeContext"
+        );
+        assert!(
+            ctx.codecs.has_encoder(&dvb_id),
+            "DVB sub encoder factory not installed via RuntimeContext"
         );
         assert_eq!(
             ctx.containers.container_for_extension("sup"),

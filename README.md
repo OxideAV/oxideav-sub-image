@@ -4,8 +4,30 @@ Pure-Rust bitmap-subtitle codecs and containers:
 
 - **PGS** (HDMV / Blu-ray `.sup`) — decode + encode, standalone `.sup`
   container.
-- **DVB subtitles** (ETSI EN 300 743) — decode only, no standalone
-  container (DVB subs ride inside MPEG-TS). The region composition
+- **DVB subtitles** (ETSI EN 300 743) — decode + encode, no standalone
+  container (DVB subs ride inside MPEG-TS; the encoder emits the
+  display-set PES payload, so getting on air still needs a TS muxer
+  upstream). The write direction covers every segment the decoder
+  reads: `write_segment` framing plus display-definition,
+  page-composition, region-composition (fill flag, per-depth fill
+  pixel codes, object placements), CLUT-definition (4-byte full-range
+  and packed 2-byte entry forms, with `rgba_to_clut_ycbcrt` as the
+  integer inverse of the decode-side BT.601 transform — greys are
+  bit-exact, colours within ±2 LSBs, alpha exact), and object-data
+  writers, the last with true run-length 2/4/8-bit pixel-code-string
+  encoders (all counted-run forms, single-pixel-of-colour-0 codes,
+  end-of-line and end-of-string markers, byte alignment) and optional
+  2-byte map-table prefixes. `make_encoder` quantises RGBA frames into
+  a CLUT (≤ 4 entries → 2-bit, ≤ 16 → 4-bit, else 8-bit; > 255
+  distinct colours fall back to 3-3-2-2 channel reduction), crops to
+  the tight bounding box of non-transparent pixels, and emits one
+  complete display set per frame; a fully-transparent frame becomes an
+  erase page referencing no regions. Every writer is pinned by
+  encode→decode roundtrips through the existing decode path,
+  including max-run / chunked-over-max / boundary-length edge cases
+  for each run-length form.
+
+  On the decode side, the region composition
   segment's `region_fill_flag` is honoured: when set, the region
   rectangle is pre-painted with the depth-appropriate
   `region_n-bit_pixel_code` (8/4/2-bit, translated through the

@@ -20,9 +20,19 @@
 //!
 //! ## Scope / limitations
 //!
-//! * **Decode only.** Pixel-coded objects are supported; *character*-
-//!   coded objects (2‐byte UTF-style segments used for teletext-style
+//! * **Decode:** pixel-coded objects are supported; *character*-coded
+//!   objects (2‐byte UTF-style segments used for teletext-style
 //!   streams) currently return `Error::Unsupported`.
+//! * **Encode:** [`make_encoder`] turns RGBA video frames into complete
+//!   display-set PES payloads (DDS + page composition + region
+//!   composition + CLUT definition + object data + end-of-display-set),
+//!   and the individual segment writers (`write_segment`,
+//!   `write_display_definition`, `write_page_composition`,
+//!   `write_region_composition`, `write_clut_definition`,
+//!   `write_object_data`) plus the 2/4/8-bit pixel-code-string encoders
+//!   are exposed for callers that assemble their own display sets. The
+//!   emitted payload is the PES-level byte stream (with the `0x20 0x00`
+//!   prefix); riding MPEG-TS still needs a TS muxer upstream.
 //! * Multi-region displays are composited in page-composition list
 //!   order: each referenced region paints onto the canvas in the order
 //!   it appears in the page-composition segment, blending over whatever
@@ -40,10 +50,11 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use oxideav_core::Decoder;
 use oxideav_core::{
-    CodecId, CodecParameters, Error, Frame, Packet, Result, VideoFrame, VideoPlane,
+    CodecId, CodecParameters, Error, Frame, MediaType, Packet, PixelFormat, Result, TimeBase,
+    VideoFrame, VideoPlane,
 };
+use oxideav_core::{Decoder, Encoder};
 
 use crate::DVBSUB_CODEC_ID;
 
@@ -644,6 +655,882 @@ impl<'a> BitReader<'a> {
     fn consumed_bytes(&self) -> usize {
         self.bit_pos.div_ceil(8)
     }
+}
+
+// --- bit writer ---------------------------------------------------------
+
+/// MSB-first bit accumulator — the write-direction mirror of
+/// [`BitReader`]. `into_bytes` pads the final partial byte with zero
+/// bits, matching the byte-alignment the pixel-code-string decoders
+/// perform after the end-of-string code.
+struct BitWriter {
+    out: Vec<u8>,
+    cur: u8,
+    used: u8,
+}
+
+impl BitWriter {
+    fn new() -> Self {
+        Self {
+            out: Vec::new(),
+            cur: 0,
+            used: 0,
+        }
+    }
+
+    fn put(&mut self, n: u8, val: u32) {
+        for k in (0..n).rev() {
+            let bit = ((val >> k) & 1) as u8;
+            self.cur = (self.cur << 1) | bit;
+            self.used += 1;
+            if self.used == 8 {
+                self.out.push(self.cur);
+                self.cur = 0;
+                self.used = 0;
+            }
+        }
+    }
+
+    fn into_bytes(mut self) -> Vec<u8> {
+        if self.used > 0 {
+            self.out.push(self.cur << (8 - self.used));
+        }
+        self.out
+    }
+}
+
+// --- pixel-code-string encoders -----------------------------------------
+
+/// Pixel-data sub-block introducer: 2-bit pixel-code string.
+pub const DATA_TYPE_2BIT: u8 = 0x10;
+/// Pixel-data sub-block introducer: 4-bit pixel-code string.
+pub const DATA_TYPE_4BIT: u8 = 0x11;
+/// Pixel-data sub-block introducer: 8-bit pixel-code string.
+pub const DATA_TYPE_8BIT: u8 = 0x12;
+/// Pixel-data sub-block introducer: 2-to-4-bit map table (2-byte body).
+pub const DATA_TYPE_MAP_2_TO_4: u8 = 0x20;
+/// Pixel-data sub-block introducer: 2-to-8-bit map table (2-byte body).
+pub const DATA_TYPE_MAP_2_TO_8: u8 = 0x21;
+/// Pixel-data sub-block introducer: 4-to-8-bit map table (2-byte body).
+pub const DATA_TYPE_MAP_4_TO_8: u8 = 0x22;
+/// Pixel-data sub-block introducer: end of object line.
+pub const DATA_TYPE_END_OF_LINE: u8 = 0xF0;
+
+/// Encode one row of 2-bit pixels (values `0..=3`) as a 2-bit
+/// pixel-code string, terminated by the end-of-string code and padded
+/// to a byte boundary — the inverse of the 2-bit decode path.
+///
+/// Run-length forms emitted, longest-match first:
+/// * `00 00 11` + 8-bit count + colour — runs of 29..=284 (any colour);
+/// * `00 0 1` + 4-bit count — runs of 12..=27 of colour 0;
+/// * `00 1` + 3-bit count + colour — runs of 3..=10 (any colour);
+/// * `00 00 01` — a single pixel of colour 0;
+/// * a bare 2-bit code — a single pixel of colour 1..=3.
+pub fn encode_2bit_pixel_string(pixels: &[u8]) -> Result<Vec<u8>> {
+    if let Some(&bad) = pixels.iter().find(|&&p| p > 3) {
+        return Err(Error::invalid(format!(
+            "DVB 2-bit encode: pixel value {bad} out of 0..=3 range"
+        )));
+    }
+    let mut bw = BitWriter::new();
+    for_each_run(pixels, |col, n| emit_2bit_run(&mut bw, col, n));
+    // end-of-string: 00 + 0 + 0 + 00, then byte-align.
+    bw.put(2, 0);
+    bw.put(1, 0);
+    bw.put(1, 0);
+    bw.put(2, 0);
+    Ok(bw.into_bytes())
+}
+
+fn emit_2bit_run(bw: &mut BitWriter, col: u8, mut n: usize) {
+    while n > 0 {
+        if n >= 29 {
+            let chunk = n.min(284);
+            bw.put(2, 0);
+            bw.put(1, 0);
+            bw.put(1, 0);
+            bw.put(2, 0b11);
+            bw.put(8, (chunk - 29) as u32);
+            bw.put(2, col as u32);
+            n -= chunk;
+        } else if col == 0 && n >= 12 {
+            let chunk = n.min(27);
+            bw.put(2, 0);
+            bw.put(1, 0);
+            bw.put(1, 1);
+            bw.put(4, (chunk - 12) as u32);
+            n -= chunk;
+        } else if n >= 3 {
+            // The 3-bit-count colour-run form carries the colour
+            // explicitly, so it covers colour 0 as well.
+            let chunk = n.min(10);
+            bw.put(2, 0);
+            bw.put(1, 1);
+            bw.put(3, (chunk - 3) as u32);
+            bw.put(2, col as u32);
+            n -= chunk;
+        } else if col == 0 {
+            // Single pixel of colour 0 (a bare `00` code is the escape).
+            bw.put(2, 0);
+            bw.put(1, 0);
+            bw.put(1, 0);
+            bw.put(2, 0b01);
+            n -= 1;
+        } else {
+            bw.put(2, col as u32);
+            n -= 1;
+        }
+    }
+}
+
+/// Encode one row of 4-bit pixels (values `0..=15`) as a 4-bit
+/// pixel-code string, terminated by the end-of-string code and padded
+/// to a byte boundary — the inverse of the 4-bit decode path.
+///
+/// Run-length forms emitted, longest-match first:
+/// * `0000 1 1 11` + 8-bit count + colour — runs of 25..=280;
+/// * `0000 1 1 10` + 4-bit count + colour — runs of 9..=24;
+/// * `0000 0` + 3-bit count — runs of 3..=9 of colour 0;
+/// * `0000 1 1 01` — two pixels of colour 0;
+/// * `0000 1 1 00` — one pixel of colour 0;
+/// * `0000 1 0` + 2-bit count + colour — runs of 4..=7 (non-zero colour);
+/// * a bare 4-bit code — a single pixel of colour 1..=15.
+pub fn encode_4bit_pixel_string(pixels: &[u8]) -> Result<Vec<u8>> {
+    if let Some(&bad) = pixels.iter().find(|&&p| p > 15) {
+        return Err(Error::invalid(format!(
+            "DVB 4-bit encode: pixel value {bad} out of 0..=15 range"
+        )));
+    }
+    let mut bw = BitWriter::new();
+    for_each_run(pixels, |col, n| emit_4bit_run(&mut bw, col, n));
+    // end-of-string: 0000 + 0 + 000, then byte-align.
+    bw.put(4, 0);
+    bw.put(1, 0);
+    bw.put(3, 0);
+    Ok(bw.into_bytes())
+}
+
+fn emit_4bit_run(bw: &mut BitWriter, col: u8, mut n: usize) {
+    while n > 0 {
+        if n >= 25 {
+            let chunk = n.min(280);
+            bw.put(4, 0);
+            bw.put(1, 1);
+            bw.put(1, 1);
+            bw.put(2, 0b11);
+            bw.put(8, (chunk - 25) as u32);
+            bw.put(4, col as u32);
+            n -= chunk;
+        } else if n >= 9 {
+            let chunk = n.min(24);
+            bw.put(4, 0);
+            bw.put(1, 1);
+            bw.put(1, 1);
+            bw.put(2, 0b10);
+            bw.put(4, (chunk - 9) as u32);
+            bw.put(4, col as u32);
+            n -= chunk;
+        } else if col == 0 {
+            if n >= 3 {
+                let chunk = n.min(9);
+                bw.put(4, 0);
+                bw.put(1, 0);
+                bw.put(3, (chunk - 2) as u32);
+                n -= chunk;
+            } else if n == 2 {
+                bw.put(4, 0);
+                bw.put(1, 1);
+                bw.put(1, 1);
+                bw.put(2, 0b01);
+                n -= 2;
+            } else {
+                bw.put(4, 0);
+                bw.put(1, 1);
+                bw.put(1, 1);
+                bw.put(2, 0b00);
+                n -= 1;
+            }
+        } else if n >= 4 {
+            let chunk = n.min(7);
+            bw.put(4, 0);
+            bw.put(1, 1);
+            bw.put(1, 0);
+            bw.put(2, (chunk - 4) as u32);
+            bw.put(4, col as u32);
+            n -= chunk;
+        } else {
+            bw.put(4, col as u32);
+            n -= 1;
+        }
+    }
+}
+
+/// Encode one row of 8-bit pixels as an 8-bit pixel-code string
+/// terminated by the `0x00 0x00` end-of-string marker — the inverse of
+/// the 8-bit decode path. The encoding is byte-aligned throughout:
+/// non-zero bytes are literal colours, `0x00` + count (high bit clear)
+/// is a run of colour 0, and `0x00` + (`0x80` | count) + colour is a
+/// run of any colour. Counts max out at 127 per escape; longer runs
+/// are chunked.
+pub fn encode_8bit_pixel_string(pixels: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(pixels.len() / 4 + 8);
+    for_each_run(pixels, |col, mut n| {
+        if col == 0 {
+            while n > 0 {
+                let chunk = n.min(127);
+                out.push(0x00);
+                out.push(chunk as u8);
+                n -= chunk;
+            }
+        } else {
+            while n > 0 {
+                if n >= 3 {
+                    let chunk = n.min(127);
+                    out.push(0x00);
+                    out.push(0x80 | chunk as u8);
+                    out.push(col);
+                    n -= chunk;
+                } else {
+                    out.push(col);
+                    n -= 1;
+                }
+            }
+        }
+    });
+    out.push(0x00);
+    out.push(0x00);
+    out
+}
+
+/// Invoke `f(colour, run_length)` for each maximal run of equal pixel
+/// values in `pixels`, left to right.
+fn for_each_run<F: FnMut(u8, usize)>(pixels: &[u8], mut f: F) {
+    let mut i = 0;
+    while i < pixels.len() {
+        let col = pixels[i];
+        let mut n = 1usize;
+        while i + n < pixels.len() && pixels[i + n] == col {
+            n += 1;
+        }
+        f(col, n);
+        i += n;
+    }
+}
+
+// --- segment writers ----------------------------------------------------
+
+/// Frame one DVB segment (`0x0F` sync + type + page_id + length + body)
+/// onto `out` — the inverse of [`read_segment`]. Fails when `body` is
+/// longer than the 16-bit `segment_length` field can carry.
+pub fn write_segment(out: &mut Vec<u8>, seg_type: u8, page_id: u16, body: &[u8]) -> Result<()> {
+    if body.len() > u16::MAX as usize {
+        return Err(Error::invalid(format!(
+            "DVB segment: body of {} bytes exceeds the 16-bit segment_length field",
+            body.len()
+        )));
+    }
+    out.push(0x0F);
+    out.push(seg_type);
+    out.extend_from_slice(&page_id.to_be_bytes());
+    out.extend_from_slice(&(body.len() as u16).to_be_bytes());
+    out.extend_from_slice(body);
+    Ok(())
+}
+
+/// Build a display-definition segment body declaring a `width` ×
+/// `height` canvas. The on-wire fields carry `width - 1` /
+/// `height - 1`, so a zero-sized canvas is unrepresentable and
+/// rejected.
+pub fn write_display_definition(width: u16, height: u16) -> Result<Vec<u8>> {
+    if width == 0 || height == 0 {
+        return Err(Error::invalid("DVB DDS: zero canvas"));
+    }
+    let mut body = Vec::with_capacity(5);
+    body.push(0); // dds_version_number + display_window_flag
+    body.extend_from_slice(&(width - 1).to_be_bytes());
+    body.extend_from_slice(&(height - 1).to_be_bytes());
+    Ok(body)
+}
+
+/// Build a page-composition segment body: `page_time_out` (seconds),
+/// the version/state byte, then one 6-byte `(region_id, x, y)` entry
+/// per referenced region. Region positions are full 16-bit canvas
+/// coordinates. Reserved bits are written high.
+pub fn write_page_composition(
+    timeout_s: u8,
+    version: u8,
+    state: u8,
+    regions: &[(u8, u16, u16)],
+) -> Vec<u8> {
+    let mut body = Vec::with_capacity(2 + regions.len() * 6);
+    body.push(timeout_s);
+    body.push(((version & 0x0F) << 4) | ((state & 0x03) << 2) | 0x03);
+    for &(region_id, x, y) in regions {
+        body.push(region_id);
+        body.push(0xFF); // reserved
+        body.extend_from_slice(&x.to_be_bytes());
+        body.extend_from_slice(&y.to_be_bytes());
+    }
+    body
+}
+
+/// Declarative form of a region-composition segment — the write-side
+/// mirror of the decoder's region state.
+#[derive(Clone, Debug)]
+pub struct RegionCompositionDef {
+    pub region_id: u8,
+    /// `region_version_number` (4 bits used).
+    pub version: u8,
+    /// `region_fill_flag` — pre-paint the rectangle with the
+    /// depth-appropriate pixel code before objects composite.
+    pub fill: bool,
+    pub width: u16,
+    pub height: u16,
+    /// Region colour depth: 2, 4, or 8 bits.
+    pub depth_bits: u8,
+    pub clut_id: u8,
+    /// `region_8-bit_pixel_code` — fill index at 8-bit depth.
+    pub fill_code_8: u8,
+    /// `region_4-bit_pixel_code` — fill index at 4-bit depth (low nibble).
+    pub fill_code_4: u8,
+    /// `region_2-bit_pixel_code` — fill index at 2-bit depth (low 2 bits).
+    pub fill_code_2: u8,
+    /// `(object_id, x, y)` placements relative to the region origin.
+    /// `x` is a 12-bit field on the wire (stored in 6+8 bits, capped at
+    /// `0x3FFF` by the header layout) and `y` a 12-bit field capped at
+    /// `0x0FFF`.
+    pub objects: Vec<(u16, u16, u16)>,
+}
+
+/// Build a region-composition segment body from `def` — the inverse of
+/// the region-composition parse. Objects are written as pixel-coded
+/// (`object_type` 0), so no foreground/background colour bytes follow
+/// the 6-byte placement entries.
+pub fn write_region_composition(def: &RegionCompositionDef) -> Result<Vec<u8>> {
+    let depth_code: u8 = match def.depth_bits {
+        2 => 1,
+        4 => 2,
+        8 => 3,
+        other => {
+            return Err(Error::invalid(format!(
+                "DVB region_composition: depth {other} bits is not 2/4/8"
+            )))
+        }
+    };
+    let mut body = Vec::with_capacity(10 + def.objects.len() * 6);
+    body.push(def.region_id);
+    body.push(((def.version & 0x0F) << 4) | ((def.fill as u8) << 3) | 0x07);
+    body.extend_from_slice(&def.width.to_be_bytes());
+    body.extend_from_slice(&def.height.to_be_bytes());
+    // region_level_of_compatibility (top 3 bits) mirrors the declared
+    // depth — the minimum CLUT depth the region needs.
+    body.push((depth_code << 5) | (depth_code << 2) | 0x03);
+    body.push(def.clut_id);
+    body.push(def.fill_code_8);
+    body.push(((def.fill_code_4 & 0x0F) << 4) | ((def.fill_code_2 & 0x03) << 2) | 0x03);
+    for &(object_id, x, y) in &def.objects {
+        if x > 0x3FFF {
+            return Err(Error::invalid(format!(
+                "DVB region_composition: object x {x} exceeds the 14-bit position field"
+            )));
+        }
+        if y > 0x0FFF {
+            return Err(Error::invalid(format!(
+                "DVB region_composition: object y {y} exceeds the 12-bit position field"
+            )));
+        }
+        body.extend_from_slice(&object_id.to_be_bytes());
+        // object_type = 0 (pixel-coded bitmap) in the top 2 bits, then
+        // the high bits of x.
+        body.push(((x >> 8) as u8) & 0x3F);
+        body.push((x & 0xFF) as u8);
+        body.push(0xF0 | (((y >> 8) as u8) & 0x0F));
+        body.push((y & 0xFF) as u8);
+    }
+    Ok(body)
+}
+
+/// One CLUT entry for [`write_clut_definition`]. Colour is carried as
+/// full-range Y/Cr/Cb plus T (transparency, `0` = opaque, `255` =
+/// fully transparent — the decode side maps alpha to `255 - T`).
+#[derive(Clone, Copy, Debug)]
+pub struct ClutEntryDef {
+    pub entry_id: u8,
+    pub y: u8,
+    pub cr: u8,
+    pub cb: u8,
+    pub t: u8,
+    /// `true` → 4-byte full-range Y/Cr/Cb/T form. `false` → packed
+    /// 2-byte form (Y reduced to 6 bits, Cr/Cb to 4, T to 2 — lossy).
+    pub full_range: bool,
+}
+
+/// Build a CLUT-definition segment body — the inverse of the CLUT
+/// parse. Each entry is written in the 4-byte full-range form or the
+/// packed 2-byte reduced form depending on its `full_range` flag (the
+/// flag byte's bit 0 selects the form on the wire; the remaining flag
+/// bits are written high).
+pub fn write_clut_definition(clut_id: u8, version: u8, entries: &[ClutEntryDef]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(2 + entries.len() * 6);
+    body.push(clut_id);
+    body.push(((version & 0x0F) << 4) | 0x0F);
+    for e in entries {
+        body.push(e.entry_id);
+        if e.full_range {
+            body.push(0xFF);
+            body.extend_from_slice(&[e.y, e.cr, e.cb, e.t]);
+        } else {
+            body.push(0xFE);
+            // Packed form: 6-bit Y, 4-bit Cr, 4-bit Cb, 2-bit T — the
+            // exact inverse of the decode-side unpacking.
+            let y6 = e.y >> 2;
+            let cr4 = e.cr >> 4;
+            let cb4 = e.cb >> 4;
+            let t2 = e.t >> 6;
+            body.push((y6 << 2) | (cr4 >> 2));
+            body.push(((cr4 & 0x03) << 6) | (cb4 << 2) | t2);
+        }
+    }
+    body
+}
+
+/// Convert a straight-alpha RGBA pixel to the CLUT's `[Y, Cr, Cb, T]`
+/// quad — the integer inverse of the decode-side BT.601 transform, so
+/// a full-range CLUT entry built from this value decodes back to
+/// within ±2 per channel. Greys (`R == G == B`) are bit-exact because
+/// `Cb = Cr = 128` makes the chroma terms vanish.
+pub fn rgba_to_clut_ycbcrt(rgba: [u8; 4]) -> [u8; 4] {
+    let r = rgba[0] as i64;
+    let g = rgba[1] as i64;
+    let b = rgba[2] as i64;
+    // BT.601 luma weights 0.299 / 0.587 / 0.114 scaled by 1 << 16; the
+    // three integer weights sum to exactly 65536.
+    let y = (19595 * r + 38470 * g + 7471 * b + 32768) >> 16;
+    // The decode side reconstructs R = Y + (91881·Cr′) >> 16 and
+    // B = Y + (116130·Cb′) >> 16 with Cr′/Cb′ centred on 128, so the
+    // inverse divides by the same constants (rounded to nearest).
+    let cr = div_round((r - y) << 16, 91881) + 128;
+    let cb = div_round((b - y) << 16, 116130) + 128;
+    [
+        y.clamp(0, 255) as u8,
+        cr.clamp(0, 255) as u8,
+        cb.clamp(0, 255) as u8,
+        255 - rgba[3],
+    ]
+}
+
+/// Signed division rounded to nearest (ties away from zero).
+fn div_round(num: i64, den: i64) -> i64 {
+    let half = den / 2;
+    if num >= 0 {
+        (num + half) / den
+    } else {
+        (num - half) / den
+    }
+}
+
+/// Build an object-data segment body for a pixel-coded object — the
+/// inverse of the object-data parse.
+///
+/// `rows` is the full-height bitmap; even rows go to the top-field
+/// block and odd rows to the bottom-field block, undoing the decode
+/// side's top/bottom interleave. `depth_bits` (2, 4, or 8) selects the
+/// pixel-code-string flavour used for every row. `map_tables` entries
+/// (`(data_type, payload)` with a map-table data_type `0x20..=0x22`
+/// and a 2-byte payload) are emitted ahead of the first pixel-code
+/// string of each field block.
+///
+/// A single-row object still gets a non-empty bottom-field block — a
+/// bare end-of-line marker producing one empty bottom row — because a
+/// zero-length bottom field makes the decode side reuse the top field
+/// for both fields, doubling every row.
+pub fn write_object_data(
+    object_id: u16,
+    version: u8,
+    depth_bits: u8,
+    rows: &[Vec<u8>],
+    map_tables: &[(u8, [u8; 2])],
+) -> Result<Vec<u8>> {
+    if rows.is_empty() {
+        return Err(Error::invalid("DVB object_data: no rows to encode"));
+    }
+    let data_type = match depth_bits {
+        2 => DATA_TYPE_2BIT,
+        4 => DATA_TYPE_4BIT,
+        8 => DATA_TYPE_8BIT,
+        other => {
+            return Err(Error::invalid(format!(
+                "DVB object_data: depth {other} bits is not 2/4/8"
+            )))
+        }
+    };
+    for &(t, _) in map_tables {
+        if !(DATA_TYPE_MAP_2_TO_4..=DATA_TYPE_MAP_4_TO_8).contains(&t) {
+            return Err(Error::invalid(format!(
+                "DVB object_data: 0x{t:02X} is not a map-table data_type"
+            )));
+        }
+    }
+    let encode_field = |field_rows: &[&Vec<u8>]| -> Result<Vec<u8>> {
+        let mut block = Vec::new();
+        for &(t, payload) in map_tables {
+            block.push(t);
+            block.extend_from_slice(&payload);
+        }
+        for row in field_rows {
+            block.push(data_type);
+            match depth_bits {
+                2 => block.extend_from_slice(&encode_2bit_pixel_string(row)?),
+                4 => block.extend_from_slice(&encode_4bit_pixel_string(row)?),
+                _ => block.extend_from_slice(&encode_8bit_pixel_string(row)),
+            }
+            block.push(DATA_TYPE_END_OF_LINE);
+        }
+        Ok(block)
+    };
+    let top_rows: Vec<&Vec<u8>> = rows.iter().step_by(2).collect();
+    let bot_rows: Vec<&Vec<u8>> = rows.iter().skip(1).step_by(2).collect();
+    let top = encode_field(&top_rows)?;
+    let bot = if bot_rows.is_empty() {
+        vec![DATA_TYPE_END_OF_LINE]
+    } else {
+        encode_field(&bot_rows)?
+    };
+    if top.len() > u16::MAX as usize || bot.len() > u16::MAX as usize {
+        return Err(Error::invalid(
+            "DVB object_data: field block exceeds the 16-bit length field",
+        ));
+    }
+    let mut body = Vec::with_capacity(7 + top.len() + bot.len());
+    body.extend_from_slice(&object_id.to_be_bytes());
+    // version (4) + coding_method 0 = pixel-coded (2) +
+    // non_modifying_colour_flag 0 (1) + reserved.
+    body.push((version & 0x0F) << 4);
+    body.extend_from_slice(&(top.len() as u16).to_be_bytes());
+    body.extend_from_slice(&(bot.len() as u16).to_be_bytes());
+    body.extend_from_slice(&top);
+    body.extend_from_slice(&bot);
+    Ok(body)
+}
+
+// --- encoder ------------------------------------------------------------
+
+/// Page id used by display sets the [`make_encoder`] encoder emits.
+pub const ENCODER_PAGE_ID: u16 = 1;
+
+/// Build a DVB subtitle encoder. The encoder accepts [`Frame::Video`]
+/// frames with [`PixelFormat::Rgba`] and emits one [`Packet`] per frame
+/// carrying a complete display-set PES payload (`0x20 0x00` prefix +
+/// DDS + page composition + region composition + CLUT definition +
+/// object data + end-of-display-set) — the byte shape the decoder in
+/// this module consumes directly. Riding MPEG-TS needs a TS muxer
+/// upstream.
+///
+/// Non-transparent pixels are quantised into a CLUT (index 0 is
+/// reserved for the fully-transparent background) and the object is
+/// cropped to the tight bounding box of non-transparent pixels, placed
+/// on the canvas through the page-composition region position. The
+/// pixel-code-string depth is the smallest that fits the palette:
+/// ≤ 4 entries → 2-bit, ≤ 16 → 4-bit, otherwise 8-bit. When the input
+/// has more than 255 distinct RGBA colours each channel is reduced to
+/// 3-3-2-2 R-G-B-A bits first (lossy), with nearest-entry snapping if
+/// even that overflows the 256-entry CLUT. A fully-transparent frame
+/// emits an erase display set: a page composition referencing no
+/// regions.
+pub fn make_encoder(_params: &CodecParameters) -> Result<Box<dyn Encoder>> {
+    let mut out_params = CodecParameters::video(CodecId::new(DVBSUB_CODEC_ID));
+    out_params.media_type = MediaType::Subtitle;
+    out_params.pixel_format = Some(PixelFormat::Rgba);
+    Ok(Box::new(DvbSubEncoder {
+        codec_id: CodecId::new(DVBSUB_CODEC_ID),
+        params: out_params,
+        pending: VecDeque::new(),
+        version: 0,
+    }))
+}
+
+struct DvbSubEncoder {
+    codec_id: CodecId,
+    params: CodecParameters,
+    pending: VecDeque<Packet>,
+    /// 4-bit page/region/CLUT/object version counter, bumped per frame.
+    version: u8,
+}
+
+impl Encoder for DvbSubEncoder {
+    fn codec_id(&self) -> &CodecId {
+        &self.codec_id
+    }
+
+    fn output_params(&self) -> &CodecParameters {
+        &self.params
+    }
+
+    fn send_frame(&mut self, frame: &Frame) -> Result<()> {
+        let Frame::Video(v) = frame else {
+            return Err(Error::unsupported(
+                "DVB sub encoder only accepts Frame::Video input",
+            ));
+        };
+        if v.planes.is_empty() {
+            return Err(Error::invalid("DVB sub encoder: frame has no plane"));
+        }
+        let plane = &v.planes[0];
+        if plane.stride == 0 || plane.stride % 4 != 0 {
+            return Err(Error::invalid(
+                "DVB sub encoder: RGBA plane stride must be a positive multiple of 4",
+            ));
+        }
+        let width = plane.stride / 4;
+        let height = plane.data.len() / plane.stride;
+        if width == 0 || height == 0 {
+            return Err(Error::invalid("DVB sub encoder: zero-sized frame"));
+        }
+        if width > u16::MAX as usize || height > u16::MAX as usize {
+            return Err(Error::invalid(
+                "DVB sub encoder: frame exceeds the 16-bit DDS dimension fields",
+            ));
+        }
+        if self.params.width.is_none() {
+            self.params.width = Some(width as u32);
+            self.params.height = Some(height as u32);
+        }
+        let version = self.version & 0x0F;
+        self.version = (self.version + 1) & 0x0F;
+
+        let mut payload = vec![0x20, 0x00]; // data_identifier + subtitle_stream_id
+        write_segment(
+            &mut payload,
+            SEG_DISPLAY_DEFINITION,
+            ENCODER_PAGE_ID,
+            &write_display_definition(width as u16, height as u16)?,
+        )?;
+        match encode_bbox(plane, width, height) {
+            None => {
+                // Fully transparent: an erase display set — a page
+                // composition that references no regions decodes to a
+                // fully-transparent canvas.
+                write_segment(
+                    &mut payload,
+                    SEG_PAGE_COMPOSITION,
+                    ENCODER_PAGE_ID,
+                    &write_page_composition(0, version, 0, &[]),
+                )?;
+            }
+            Some((bx, by, bw, bh)) => {
+                let (indices, palette) = quantise_rgba_region(plane, width, bx, by, bw, bh);
+                let depth_bits: u8 = if palette.len() <= 4 {
+                    2
+                } else if palette.len() <= 16 {
+                    4
+                } else {
+                    8
+                };
+                write_segment(
+                    &mut payload,
+                    SEG_PAGE_COMPOSITION,
+                    ENCODER_PAGE_ID,
+                    &write_page_composition(0, version, 0, &[(0, bx as u16, by as u16)]),
+                )?;
+                write_segment(
+                    &mut payload,
+                    SEG_REGION_COMPOSITION,
+                    ENCODER_PAGE_ID,
+                    &write_region_composition(&RegionCompositionDef {
+                        region_id: 0,
+                        version,
+                        fill: false,
+                        width: bw as u16,
+                        height: bh as u16,
+                        depth_bits,
+                        clut_id: 0,
+                        fill_code_8: 0,
+                        fill_code_4: 0,
+                        fill_code_2: 0,
+                        objects: vec![(0, 0, 0)],
+                    })?,
+                )?;
+                let entries: Vec<ClutEntryDef> = palette
+                    .iter()
+                    .enumerate()
+                    .skip(1) // entry 0 stays the default transparent
+                    .map(|(i, rgba)| {
+                        let [y, cr, cb, t] = rgba_to_clut_ycbcrt(*rgba);
+                        ClutEntryDef {
+                            entry_id: i as u8,
+                            y,
+                            cr,
+                            cb,
+                            t,
+                            full_range: true,
+                        }
+                    })
+                    .collect();
+                write_segment(
+                    &mut payload,
+                    SEG_CLUT_DEFINITION,
+                    ENCODER_PAGE_ID,
+                    &write_clut_definition(0, version, &entries),
+                )?;
+                let rows: Vec<Vec<u8>> = indices.chunks(bw).map(<[u8]>::to_vec).collect();
+                write_segment(
+                    &mut payload,
+                    SEG_OBJECT_DATA,
+                    ENCODER_PAGE_ID,
+                    &write_object_data(0, version, depth_bits, &rows, &[])?,
+                )?;
+            }
+        }
+        write_segment(&mut payload, SEG_END_OF_DISPLAY_SET, ENCODER_PAGE_ID, &[])?;
+
+        let pts_90k = encoder_pts_90k(v).unwrap_or(0);
+        let mut packet = Packet::new(0, TimeBase::new(1, 90_000), payload);
+        packet.pts = Some(pts_90k as i64);
+        packet.dts = Some(pts_90k as i64);
+        packet.flags.keyframe = true;
+        self.pending.push_back(packet);
+        Ok(())
+    }
+
+    fn receive_packet(&mut self) -> Result<Packet> {
+        self.pending.pop_front().ok_or(Error::NeedMore)
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Frame pts is treated as microseconds (the canonical subtitle pts
+/// unit) and rescaled to the 90 kHz transport clock the packet carries.
+fn encoder_pts_90k(v: &VideoFrame) -> Option<u32> {
+    let pts = v.pts?;
+    let scaled = TimeBase::new(1, 1_000_000).rescale(pts, TimeBase::new(1, 90_000));
+    if scaled < 0 {
+        Some(0)
+    } else {
+        Some(scaled as u32)
+    }
+}
+
+/// Tight bounding box of pixels with non-zero alpha, or `None` when the
+/// frame is fully transparent. Returns `(x, y, width, height)`.
+fn encode_bbox(
+    plane: &VideoPlane,
+    width: usize,
+    height: usize,
+) -> Option<(usize, usize, usize, usize)> {
+    let mut min_x = width;
+    let mut max_x = 0usize;
+    let mut min_y = height;
+    let mut max_y = 0usize;
+    let mut any = false;
+    for row in 0..height {
+        let line = &plane.data[row * plane.stride..row * plane.stride + width * 4];
+        for (col, px) in line.chunks_exact(4).enumerate() {
+            if px[3] != 0 {
+                any = true;
+                min_x = min_x.min(col);
+                max_x = max_x.max(col);
+                min_y = min_y.min(row);
+                max_y = max_y.max(row);
+            }
+        }
+    }
+    if !any {
+        return None;
+    }
+    Some((min_x, min_y, max_x - min_x + 1, max_y - min_y + 1))
+}
+
+/// Quantise the RGBA pixels of a frame sub-rectangle into an indexed
+/// bitmap plus RGBA palette. Index 0 is reserved for fully-transparent
+/// pixels. An input with more than 255 distinct opaque colours is
+/// re-quantised with 3-3-2-2 R-G-B-A channel reduction; if even that
+/// overflows the 256-entry CLUT, further novel colours snap to the
+/// nearest existing entry.
+fn quantise_rgba_region(
+    plane: &VideoPlane,
+    frame_width: usize,
+    bx: usize,
+    by: usize,
+    bw: usize,
+    bh: usize,
+) -> (Vec<u8>, Vec<[u8; 4]>) {
+    // Exact pass first.
+    if let Some(exact) = quantise_pass(plane, frame_width, bx, by, bw, bh, false) {
+        return exact;
+    }
+    // 3-3-2-2 reduction (with nearest-entry snapping) always succeeds.
+    quantise_pass(plane, frame_width, bx, by, bw, bh, true)
+        .expect("reduced quantisation pass cannot overflow")
+}
+
+fn quantise_pass(
+    plane: &VideoPlane,
+    frame_width: usize,
+    bx: usize,
+    by: usize,
+    bw: usize,
+    bh: usize,
+    reduce: bool,
+) -> Option<(Vec<u8>, Vec<[u8; 4]>)> {
+    let mut palette: Vec<[u8; 4]> = vec![[0, 0, 0, 0]];
+    let mut map: HashMap<[u8; 4], u8> = HashMap::new();
+    map.insert([0, 0, 0, 0], 0);
+    let mut indices = vec![0u8; bw * bh];
+    for row in 0..bh {
+        let src = (by + row) * plane.stride;
+        let line = &plane.data[src..src + frame_width * 4];
+        for col in 0..bw {
+            let px = &line[(bx + col) * 4..(bx + col) * 4 + 4];
+            if px[3] == 0 {
+                continue; // index 0
+            }
+            let key = if reduce {
+                key_3322(px)
+            } else {
+                [px[0], px[1], px[2], px[3]]
+            };
+            let idx = if let Some(&idx) = map.get(&key) {
+                idx
+            } else if palette.len() < 256 {
+                let idx = palette.len() as u8;
+                palette.push(key);
+                map.insert(key, idx);
+                idx
+            } else if reduce {
+                nearest_clut_entry(&palette, key)
+            } else {
+                return None; // exact pass overflowed — caller reduces
+            };
+            indices[row * bw + col] = idx;
+        }
+    }
+    Some((indices, palette))
+}
+
+/// Reduce an opaque-ish RGBA pixel to 3-3-2-2 R-G-B-A bits, mapping each
+/// bucket to its top value so fully-saturated channels stay at 255.
+fn key_3322(px: &[u8]) -> [u8; 4] {
+    [px[0] | 0x1F, px[1] | 0x1F, px[2] | 0x3F, px[3] | 0x3F]
+}
+
+fn nearest_clut_entry(palette: &[[u8; 4]], key: [u8; 4]) -> u8 {
+    let mut best = 0u8;
+    let mut best_d = i32::MAX;
+    for (i, entry) in palette.iter().enumerate() {
+        let dr = entry[0] as i32 - key[0] as i32;
+        let dg = entry[1] as i32 - key[1] as i32;
+        let db = entry[2] as i32 - key[2] as i32;
+        let da = entry[3] as i32 - key[3] as i32;
+        let d = dr * dr + dg * dg + db * db + da * da;
+        if d < best_d {
+            best_d = d;
+            best = i as u8;
+        }
+    }
+    best
 }
 
 // --- decoder -----------------------------------------------------------
@@ -1859,6 +2746,563 @@ mod tests {
         };
         for chunk in v.planes[0].data.chunks(4) {
             assert_eq!(chunk, &[0, 0, 0, 0]);
+        }
+    }
+
+    // --- pixel-code-string encoder roundtrips ------------------------
+
+    fn assert_2bit_roundtrip(row: &[u8]) {
+        let enc = encode_2bit_pixel_string(row).unwrap();
+        let (consumed, decoded) = decode_2bit_string(&enc).unwrap();
+        assert_eq!(decoded, row, "2-bit roundtrip mismatch for {row:?}");
+        assert_eq!(consumed, enc.len(), "2-bit consumed != encoded length");
+    }
+
+    fn assert_4bit_roundtrip(row: &[u8]) {
+        let enc = encode_4bit_pixel_string(row).unwrap();
+        let (consumed, decoded) = decode_4bit_string(&enc).unwrap();
+        assert_eq!(decoded, row, "4-bit roundtrip mismatch for {row:?}");
+        assert_eq!(consumed, enc.len(), "4-bit consumed != encoded length");
+    }
+
+    fn assert_8bit_roundtrip(row: &[u8]) {
+        let enc = encode_8bit_pixel_string(row);
+        let (consumed, decoded) = decode_8bit_string(&enc).unwrap();
+        assert_eq!(decoded, row, "8-bit roundtrip mismatch (len {})", row.len());
+        assert_eq!(consumed, enc.len(), "8-bit consumed != encoded length");
+    }
+
+    /// Pure runs of every colour at every run-length-form boundary the
+    /// 2-bit encoder switches on (literals / 3..=10 colour runs /
+    /// 12..=27 zero runs / 29..=284 long runs, plus the chunked
+    /// over-284 shapes).
+    #[test]
+    fn encode_2bit_run_boundaries_roundtrip() {
+        for col in 0u8..=3 {
+            for len in [
+                1usize, 2, 3, 4, 10, 11, 12, 13, 26, 27, 28, 29, 30, 283, 284, 285, 300, 600,
+            ] {
+                assert_2bit_roundtrip(&vec![col; len]);
+            }
+        }
+    }
+
+    /// Mixed rows exercising run/literal transitions and the
+    /// zero-vs-colour split paths.
+    #[test]
+    fn encode_2bit_mixed_rows_roundtrip() {
+        let mut long = vec![1u8; 284];
+        long.extend(std::iter::repeat_n(0u8, 27));
+        long.push(2);
+        long.push(0);
+        long.extend(std::iter::repeat_n(3u8, 10));
+        long.extend(std::iter::repeat_n(0u8, 12));
+        long.extend([1, 2, 3, 2, 1]);
+        assert_2bit_roundtrip(&long);
+        assert_2bit_roundtrip(&[]);
+        assert_2bit_roundtrip(&[0]);
+        assert_2bit_roundtrip(&[0, 1, 0, 2, 0, 3, 0]);
+    }
+
+    #[test]
+    fn encode_2bit_rejects_out_of_range_pixel() {
+        let err = encode_2bit_pixel_string(&[1, 4]).unwrap_err();
+        match err {
+            Error::InvalidData(_) => {}
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encode_2bit_random_rows_roundtrip() {
+        let mut state: u64 = 0x2B17_2B17_2B17_2B17;
+        for _ in 0..300 {
+            let len = (lcg(&mut state) % 200) as usize;
+            let row: Vec<u8> = (0..len).map(|_| (lcg(&mut state) % 4) as u8).collect();
+            assert_2bit_roundtrip(&row);
+        }
+    }
+
+    /// Pure runs at every 4-bit form boundary: literals, 4..=7 colour
+    /// runs, 3..=9 zero runs, one/two-zero codes, 9..=24 and 25..=280
+    /// counted runs, plus chunked over-280 shapes.
+    #[test]
+    fn encode_4bit_run_boundaries_roundtrip() {
+        for col in [0u8, 1, 7, 15] {
+            for len in [
+                1usize, 2, 3, 4, 5, 7, 8, 9, 10, 23, 24, 25, 26, 279, 280, 281, 300, 600,
+            ] {
+                assert_4bit_roundtrip(&vec![col; len]);
+            }
+        }
+    }
+
+    #[test]
+    fn encode_4bit_mixed_rows_roundtrip() {
+        let mut long = vec![5u8; 280];
+        long.extend(std::iter::repeat_n(0u8, 9));
+        long.extend([15, 0, 0, 14]);
+        long.extend(std::iter::repeat_n(1u8, 24));
+        long.extend(std::iter::repeat_n(0u8, 2));
+        long.extend([1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_4bit_roundtrip(&long);
+        assert_4bit_roundtrip(&[]);
+        assert_4bit_roundtrip(&[0]);
+        assert_4bit_roundtrip(&[0, 9, 0, 10, 0]);
+    }
+
+    #[test]
+    fn encode_4bit_rejects_out_of_range_pixel() {
+        let err = encode_4bit_pixel_string(&[16]).unwrap_err();
+        match err {
+            Error::InvalidData(_) => {}
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encode_4bit_random_rows_roundtrip() {
+        let mut state: u64 = 0x4B17_4B17_4B17_4B17;
+        for _ in 0..300 {
+            let len = (lcg(&mut state) % 200) as usize;
+            let row: Vec<u8> = (0..len).map(|_| (lcg(&mut state) % 16) as u8).collect();
+            assert_4bit_roundtrip(&row);
+        }
+    }
+
+    /// Pure runs at the 8-bit escape boundaries: literal-vs-run cutover
+    /// (3 pixels), the 127-count cap, and chunked longer runs.
+    #[test]
+    fn encode_8bit_run_boundaries_roundtrip() {
+        for col in [0u8, 1, 128, 255] {
+            for len in [1usize, 2, 3, 4, 5, 126, 127, 128, 129, 253, 254, 255, 400] {
+                assert_8bit_roundtrip(&vec![col; len]);
+            }
+        }
+    }
+
+    #[test]
+    fn encode_8bit_mixed_rows_roundtrip() {
+        let mut long = vec![200u8; 127];
+        long.extend(std::iter::repeat_n(0u8, 127));
+        long.extend([1, 2, 3, 0, 255, 0, 0, 9]);
+        long.extend(std::iter::repeat_n(42u8, 128));
+        assert_8bit_roundtrip(&long);
+        assert_8bit_roundtrip(&[]);
+        assert_8bit_roundtrip(&[0]);
+    }
+
+    #[test]
+    fn encode_8bit_random_rows_roundtrip() {
+        let mut state: u64 = 0x8B17_8B17_8B17_8B17;
+        for _ in 0..300 {
+            let len = (lcg(&mut state) % 200) as usize;
+            // Bias toward a tiny alphabet so runs actually form.
+            let row: Vec<u8> = (0..len)
+                .map(|_| {
+                    let v = lcg(&mut state);
+                    if v % 3 == 0 {
+                        (v >> 8) as u8
+                    } else {
+                        (v % 4) as u8
+                    }
+                })
+                .collect();
+            assert_8bit_roundtrip(&row);
+        }
+    }
+
+    // --- segment writer roundtrips ------------------------------------
+
+    #[test]
+    fn write_read_segment_roundtrip() {
+        let mut buf = Vec::new();
+        let body_a: Vec<u8> = (0..37u8).collect();
+        write_segment(&mut buf, SEG_OBJECT_DATA, 0xABCD, &body_a).unwrap();
+        write_segment(&mut buf, SEG_END_OF_DISPLAY_SET, 0x0001, &[]).unwrap();
+        let (seg, next) = read_segment(&buf, 0).unwrap();
+        assert_eq!(seg.seg_type, SEG_OBJECT_DATA);
+        assert_eq!(seg.page_id, 0xABCD);
+        assert_eq!(seg.body, body_a);
+        let (seg2, end) = read_segment(&buf, next).unwrap();
+        assert_eq!(seg2.seg_type, SEG_END_OF_DISPLAY_SET);
+        assert_eq!(seg2.page_id, 1);
+        assert!(seg2.body.is_empty());
+        assert_eq!(end, buf.len());
+    }
+
+    #[test]
+    fn write_segment_rejects_oversized_body() {
+        let mut buf = Vec::new();
+        let body = vec![0u8; u16::MAX as usize + 1];
+        let err = write_segment(&mut buf, SEG_OBJECT_DATA, 1, &body).unwrap_err();
+        match err {
+            Error::InvalidData(_) => {}
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn display_definition_roundtrip() {
+        for (w, h) in [(1u16, 1u16), (720, 576), (1920, 1080), (65535, 65535)] {
+            let body = write_display_definition(w, h).unwrap();
+            let dds = parse_display_definition(&body).unwrap();
+            assert_eq!((dds.width, dds.height), (w, h));
+        }
+        assert!(write_display_definition(0, 576).is_err());
+        assert!(write_display_definition(720, 0).is_err());
+    }
+
+    #[test]
+    fn page_composition_roundtrip() {
+        let regions = [(0u8, 0u16, 0u16), (7, 100, 200), (255, 65535, 12345)];
+        let body = write_page_composition(30, 5, 2, &regions);
+        let parsed = parse_page_composition(&body).unwrap();
+        assert_eq!(parsed.len(), regions.len());
+        for (got, want) in parsed.iter().zip(regions.iter()) {
+            assert_eq!((got.region_id, got.x, got.y), *want);
+        }
+        // Region-free page (the erase shape) parses to an empty list.
+        let empty = write_page_composition(0, 0, 0, &[]);
+        assert!(parse_page_composition(&empty).unwrap().is_empty());
+    }
+
+    #[test]
+    fn region_composition_roundtrip_all_depths() {
+        for depth_bits in [2u8, 4, 8] {
+            let def = RegionCompositionDef {
+                region_id: 9,
+                version: 3,
+                fill: true,
+                width: 640,
+                height: 80,
+                depth_bits,
+                clut_id: 5,
+                fill_code_8: 0xAB,
+                fill_code_4: 0x0C,
+                fill_code_2: 0x02,
+                objects: vec![(0x1234, 0x3FF, 0x0FF), (1, 0, 0)],
+            };
+            let body = write_region_composition(&def).unwrap();
+            let (id, region) = parse_region_composition(&body).unwrap();
+            assert_eq!(id, 9);
+            assert!(region.fill);
+            assert_eq!(region.width, 640);
+            assert_eq!(region.height, 80);
+            assert_eq!(region.depth_bits, depth_bits);
+            assert_eq!(region.clut_id, 5);
+            assert_eq!(region.fill_code_8, 0xAB);
+            assert_eq!(region.fill_code_4, 0x0C);
+            assert_eq!(region.fill_code_2, 0x02);
+            assert_eq!(region.objects.len(), 2);
+            assert_eq!(region.objects[0].object_id, 0x1234);
+            assert_eq!(region.objects[0].x, 0x3FF);
+            assert_eq!(region.objects[0].y, 0x0FF);
+            assert_eq!(region.objects[1].object_id, 1);
+        }
+    }
+
+    #[test]
+    fn region_composition_fill_flag_cleared_roundtrip() {
+        let def = RegionCompositionDef {
+            region_id: 0,
+            version: 0,
+            fill: false,
+            width: 2,
+            height: 2,
+            depth_bits: 8,
+            clut_id: 0,
+            fill_code_8: 5,
+            fill_code_4: 0,
+            fill_code_2: 0,
+            objects: Vec::new(),
+        };
+        let body = write_region_composition(&def).unwrap();
+        let (_, region) = parse_region_composition(&body).unwrap();
+        assert!(!region.fill);
+        assert_eq!(region.fill_code_8, 5);
+        assert!(region.objects.is_empty());
+    }
+
+    #[test]
+    fn region_composition_rejects_bad_inputs() {
+        let mut def = RegionCompositionDef {
+            region_id: 0,
+            version: 0,
+            fill: false,
+            width: 2,
+            height: 2,
+            depth_bits: 3, // not 2/4/8
+            clut_id: 0,
+            fill_code_8: 0,
+            fill_code_4: 0,
+            fill_code_2: 0,
+            objects: Vec::new(),
+        };
+        assert!(write_region_composition(&def).is_err());
+        def.depth_bits = 8;
+        def.objects = vec![(0, 0x4000, 0)];
+        assert!(write_region_composition(&def).is_err());
+        def.objects = vec![(0, 0, 0x1000)];
+        assert!(write_region_composition(&def).is_err());
+    }
+
+    /// Full-range CLUT entries built from grey RGBA values are bit-exact
+    /// through the YCbCr roundtrip (Cb = Cr = 128 makes the chroma terms
+    /// vanish on both sides).
+    #[test]
+    fn clut_full_range_grey_roundtrip_is_exact() {
+        let mut entries = Vec::new();
+        for (i, v) in (0u16..=255).step_by(17).enumerate() {
+            let [y, cr, cb, t] = rgba_to_clut_ycbcrt([v as u8, v as u8, v as u8, 255]);
+            entries.push(ClutEntryDef {
+                entry_id: (i + 1) as u8,
+                y,
+                cr,
+                cb,
+                t,
+                full_range: true,
+            });
+        }
+        let body = write_clut_definition(3, 1, &entries);
+        let mut cluts = HashMap::new();
+        parse_clut_into(&body, &mut cluts).unwrap();
+        let clut = &cluts[&3];
+        for (i, v) in (0u16..=255).step_by(17).enumerate() {
+            let v = v as u8;
+            assert_eq!(
+                clut.entries[i + 1],
+                [v, v, v, 255],
+                "grey {v} did not roundtrip exactly"
+            );
+        }
+    }
+
+    /// Arbitrary colours roundtrip within a couple of LSBs per colour
+    /// channel; alpha is exact (T = 255 − A on both sides).
+    #[test]
+    fn clut_full_range_colour_roundtrip_is_close() {
+        let samples = [
+            [255u8, 0, 0, 255],
+            [0, 255, 0, 200],
+            [0, 0, 255, 128],
+            [200, 50, 25, 255],
+            [10, 200, 100, 64],
+            [255, 255, 0, 255],
+            [128, 0, 128, 255],
+        ];
+        let entries: Vec<ClutEntryDef> = samples
+            .iter()
+            .enumerate()
+            .map(|(i, rgba)| {
+                let [y, cr, cb, t] = rgba_to_clut_ycbcrt(*rgba);
+                ClutEntryDef {
+                    entry_id: (i + 1) as u8,
+                    y,
+                    cr,
+                    cb,
+                    t,
+                    full_range: true,
+                }
+            })
+            .collect();
+        let body = write_clut_definition(0, 0, &entries);
+        let mut cluts = HashMap::new();
+        parse_clut_into(&body, &mut cluts).unwrap();
+        let clut = &cluts[&0];
+        for (i, want) in samples.iter().enumerate() {
+            let got = clut.entries[i + 1];
+            for c in 0..3 {
+                assert!(
+                    (got[c] as i32 - want[c] as i32).abs() <= 2,
+                    "colour {want:?} channel {c} drifted to {got:?}"
+                );
+            }
+            assert_eq!(got[3], want[3], "alpha must be exact for {want:?}");
+        }
+    }
+
+    /// The packed 2-byte CLUT form quantises Y/Cr/Cb/T to 6/4/4/2 bits;
+    /// values already on those grids decode identically to the full
+    /// 4-byte form carrying the same quad.
+    #[test]
+    fn clut_short_form_matches_full_form_on_grid_values() {
+        let quads: [[u8; 4]; 3] = [
+            [252, 128, 128, 0], // near-white grey, opaque
+            [80, 240, 96, 64],
+            [160, 16, 224, 192],
+        ];
+        let mut entries = Vec::new();
+        for (i, q) in quads.iter().enumerate() {
+            entries.push(ClutEntryDef {
+                entry_id: (i * 2) as u8,
+                y: q[0],
+                cr: q[1],
+                cb: q[2],
+                t: q[3],
+                full_range: true,
+            });
+            entries.push(ClutEntryDef {
+                entry_id: (i * 2 + 1) as u8,
+                y: q[0],
+                cr: q[1],
+                cb: q[2],
+                t: q[3],
+                full_range: false,
+            });
+        }
+        let body = write_clut_definition(0, 0, &entries);
+        let mut cluts = HashMap::new();
+        parse_clut_into(&body, &mut cluts).unwrap();
+        let clut = &cluts[&0];
+        for (i, quad) in quads.iter().enumerate() {
+            assert_eq!(
+                clut.entries[i * 2],
+                clut.entries[i * 2 + 1],
+                "short form diverged from full form for quad {quad:?}"
+            );
+        }
+    }
+
+    // --- object-data writer roundtrips --------------------------------
+
+    /// Expected decode-side row list for a bitmap written through
+    /// `write_object_data`: the rows themselves, except a single-row
+    /// object gains one empty bottom-field row.
+    fn expected_rows(rows: &[Vec<u8>]) -> Vec<Vec<u8>> {
+        let mut out = rows.to_vec();
+        if rows.len() == 1 {
+            out.push(Vec::new());
+        }
+        out
+    }
+
+    #[test]
+    fn object_data_roundtrip_even_odd_and_single_heights() {
+        let bitmaps: [Vec<Vec<u8>>; 3] = [
+            // Even height — both fields populated.
+            vec![
+                vec![1, 2, 3, 0],
+                vec![0, 3, 2, 1],
+                vec![1, 1, 1, 1],
+                vec![2; 4],
+            ],
+            // Odd height — top field one row longer.
+            vec![vec![3, 0, 3], vec![0, 0, 0], vec![1, 2, 1]],
+            // Single row — bottom field is one empty row on decode.
+            vec![vec![1, 0, 2, 0, 3]],
+        ];
+        for depth_bits in [2u8, 4, 8] {
+            for rows in &bitmaps {
+                let body = write_object_data(0x0102, 4, depth_bits, rows, &[]).unwrap();
+                let (id, obj) = parse_object_data(&body).unwrap();
+                assert_eq!(id, 0x0102);
+                assert_eq!(
+                    obj.rows,
+                    expected_rows(rows),
+                    "depth {depth_bits} bitmap {rows:?} did not roundtrip"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn object_data_map_table_prefixes_are_transparent_to_decode() {
+        let rows = vec![vec![1u8, 0, 2, 3], vec![3, 3, 0, 1]];
+        let plain = write_object_data(7, 0, 2, &rows, &[]).unwrap();
+        let mapped = write_object_data(
+            7,
+            0,
+            2,
+            &rows,
+            &[
+                (DATA_TYPE_MAP_2_TO_4, [0x01, 0x23]),
+                (DATA_TYPE_MAP_2_TO_8, [0x45, 0x67]),
+                (DATA_TYPE_MAP_4_TO_8, [0x89, 0xAB]),
+            ],
+        )
+        .unwrap();
+        assert!(mapped.len() > plain.len(), "map tables must add bytes");
+        let (_, obj_plain) = parse_object_data(&plain).unwrap();
+        let (_, obj_mapped) = parse_object_data(&mapped).unwrap();
+        assert_eq!(
+            obj_plain.rows, obj_mapped.rows,
+            "map-table prefixes changed the decoded pixels"
+        );
+    }
+
+    #[test]
+    fn object_data_rejects_bad_inputs() {
+        // No rows.
+        assert!(write_object_data(0, 0, 8, &[], &[]).is_err());
+        // Unsupported depth.
+        assert!(write_object_data(0, 0, 5, &[vec![1]], &[]).is_err());
+        // Pixel out of range for the declared depth.
+        assert!(write_object_data(0, 0, 2, &[vec![4]], &[]).is_err());
+        assert!(write_object_data(0, 0, 4, &[vec![16]], &[]).is_err());
+        // Non-map-table data_type in the map-table slot.
+        assert!(write_object_data(0, 0, 2, &[vec![1]], &[(0x12, [0, 0])]).is_err());
+        // Field block longer than the 16-bit length field: 70k pixels of
+        // alternating colours encode as one literal byte each.
+        let huge: Vec<u8> = (0..70_000usize).map(|i| 1 + (i % 2) as u8).collect();
+        assert!(write_object_data(0, 0, 8, &[huge], &[]).is_err());
+    }
+
+    /// Random bitmaps through the writer/parser pair at every depth.
+    #[test]
+    fn object_data_random_bitmaps_roundtrip() {
+        let mut state: u64 = 0x0B7E_C7DA_7A00_0001;
+        for _ in 0..100 {
+            let depth_bits = [2u8, 4, 8][(lcg(&mut state) % 3) as usize];
+            let mask = match depth_bits {
+                2 => 3u32,
+                4 => 15,
+                _ => 255,
+            };
+            let w = 1 + (lcg(&mut state) % 40) as usize;
+            let h = 1 + (lcg(&mut state) % 12) as usize;
+            let rows: Vec<Vec<u8>> = (0..h)
+                .map(|_| (0..w).map(|_| (lcg(&mut state) & mask) as u8).collect())
+                .collect();
+            let body = write_object_data(1, 0, depth_bits, &rows, &[]).unwrap();
+            let (_, obj) = parse_object_data(&body).unwrap();
+            assert_eq!(obj.rows, expected_rows(&rows), "depth {depth_bits} {w}x{h}");
+        }
+    }
+
+    // --- colour conversion ---------------------------------------------
+
+    #[test]
+    fn rgba_ycbcr_roundtrip_is_close_and_re_encode_bounded() {
+        // decode(encode(x)) may move a colour channel by up to 2 LSBs
+        // (alpha is exact). Repeated re-encoding of decoded subtitles
+        // accumulates only slowly: five passes stay within 5 LSBs of
+        // the original over a 200k-sample deterministic sweep, so the
+        // transform cannot drift unboundedly.
+        let mut state: u64 = 0xC010_12D2_1F7C_0001;
+        for _ in 0..200_000 {
+            let v = lcg(&mut state);
+            let rgba = [v as u8, (v >> 8) as u8, (v >> 16) as u8, 255];
+            let [y, cr, cb, t] = rgba_to_clut_ycbcrt(rgba);
+            let once = ycbcr_to_rgba(y, cr, cb, t);
+            assert_eq!(once[3], 255, "alpha must be exact for {rgba:?}");
+            for c in 0..3 {
+                assert!(
+                    (once[c] as i32 - rgba[c] as i32).abs() <= 2,
+                    "first roundtrip drifted >2 LSBs for {rgba:?}: {once:?}"
+                );
+            }
+            let mut cur = once;
+            for _ in 0..4 {
+                let [y2, cr2, cb2, t2] = rgba_to_clut_ycbcrt(cur);
+                cur = ycbcr_to_rgba(y2, cr2, cb2, t2);
+            }
+            for c in 0..3 {
+                assert!(
+                    (cur[c] as i32 - rgba[c] as i32).abs() <= 5,
+                    "five-pass re-encode drifted >5 LSBs for {rgba:?}: {cur:?}"
+                );
+            }
         }
     }
 
