@@ -41,6 +41,18 @@ Pure-Rust bitmap-subtitle codecs and containers:
   over whatever an earlier region already wrote (Porter–Duff
   source-over), so a later region's partially-transparent CLUT entries
   show the region beneath through rather than discarding it.
+
+  The Display Definition Segment's `display_window_flag` (§7.2.1) is
+  parsed: when set, the four inclusive `display_window_*_position_
+  minimum/maximum` fields are read into a typed `DisplayWindow` and the
+  composited canvas is confined to that rectangle — region addresses
+  stay absolute display coordinates, so anything rendered outside the
+  window is cleared to the transparent background, matching the spec's
+  "intended to be rendered in a window within the display size." A
+  window-flagged body truncated below 13 bytes, or one whose maximum
+  falls below its minimum, is rejected. `dds_version_number` is decoded
+  for callers that track per-segment versioning. The write side mirrors
+  this through `write_display_definition_windowed`.
 - **VobSub** / DVD SPU (`.idx`+`.sub`) — decode only, container reads
   the `.idx` text index + matched `.sub` payload (MPEG-PS pack + PES
   private_stream_1 or raw SPU-length-prefixed form). The SPU's

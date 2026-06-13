@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- DVB subtitles: Display Definition Segment rendering window (ETSI
+  EN 300 743 §7.2.1). `parse_display_definition` now decodes
+  `dds_version_number` and `display_window_flag`; when the flag is set
+  it reads the four inclusive `display_window_*_position_minimum/
+  maximum` fields into a new public `DisplayWindow`, rejecting a
+  window-flagged body that is truncated below 13 bytes or whose
+  maximum falls below its minimum. The decoder confines the composited
+  canvas to the declared window — pixels rendered outside the inclusive
+  window rectangle are cleared to the transparent background, since the
+  display set "is intended to be rendered in a window within the
+  display size." New `write_display_definition_windowed(width, height,
+  version, Option<DisplayWindow>)` is the writer inverse (the existing
+  `write_display_definition` delegates to it with no window). Covered
+  by write/parse roundtrips (no-window, full window, single-pixel
+  inclusive window), truncation and inverted-extent rejection, and an
+  end-to-end decode test asserting an out-of-window region is clipped
+  while an in-window region survives.
+
 - DVB subtitles: full WRITE direction (ETSI EN 300 743). New public
   segment writers in `dvbsub` — `write_segment` framing,
   `write_display_definition`, `write_page_composition`,

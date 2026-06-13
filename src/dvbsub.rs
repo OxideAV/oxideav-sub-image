@@ -108,10 +108,32 @@ pub fn read_segment(buf: &[u8], pos: usize) -> Result<(RawSegment, usize)> {
 
 // --- parse helpers -----------------------------------------------------
 
+/// The optional rendering sub-window carried by a Display Definition
+/// Segment when its `display_window_flag` is set (ETSI EN 300 743
+/// §7.2.1). Coordinates are absolute pixel/line addresses with respect
+/// to the top-left of the display raster (the `..._maximum` fields name
+/// the last in-window pixel/line, so the window is inclusive on both
+/// ends). When the flag is clear the display set is rendered directly
+/// across the whole `display_width × display_height` raster and this is
+/// `None`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DisplayWindow {
+    /// `display_window_horizontal_position_minimum` — left-most in-window pixel.
+    pub h_min: u16,
+    /// `display_window_horizontal_position_maximum` — right-most in-window pixel.
+    pub h_max: u16,
+    /// `display_window_vertical_position_minimum` — top-most in-window line.
+    pub v_min: u16,
+    /// `display_window_vertical_position_maximum` — bottom in-window line.
+    pub v_max: u16,
+}
+
 #[derive(Clone, Debug)]
 struct DisplayDefinition {
     width: u16,
     height: u16,
+    version: u8,
+    window: Option<DisplayWindow>,
 }
 
 impl Default for DisplayDefinition {
@@ -120,6 +142,8 @@ impl Default for DisplayDefinition {
         Self {
             width: 720,
             height: 576,
+            version: 0,
+            window: None,
         }
     }
 }
@@ -128,10 +152,43 @@ fn parse_display_definition(body: &[u8]) -> Result<DisplayDefinition> {
     if body.len() < 5 {
         return Err(Error::invalid("DVB DDS: body too short"));
     }
-    // body[0] = version + flags
+    // body[0]: dds_version_number (4) | display_window_flag (1) | reserved (3).
+    let version = body[0] >> 4;
+    let window_flag = (body[0] & 0x08) != 0;
     let width = u16::from_be_bytes([body[1], body[2]]).wrapping_add(1);
     let height = u16::from_be_bytes([body[3], body[4]]).wrapping_add(1);
-    Ok(DisplayDefinition { width, height })
+    let window = if window_flag {
+        // Four 16-bit window positions follow (§7.2.1). The `_maximum`
+        // values name the last in-window pixel/line, so the window is
+        // inclusive at both edges; a maximum below its matching minimum
+        // is malformed (a zero-extent window can't bound a display set).
+        if body.len() < 13 {
+            return Err(Error::invalid(
+                "DVB DDS: window flag set but body too short",
+            ));
+        }
+        let h_min = u16::from_be_bytes([body[5], body[6]]);
+        let h_max = u16::from_be_bytes([body[7], body[8]]);
+        let v_min = u16::from_be_bytes([body[9], body[10]]);
+        let v_max = u16::from_be_bytes([body[11], body[12]]);
+        if h_max < h_min || v_max < v_min {
+            return Err(Error::invalid("DVB DDS: window maximum below minimum"));
+        }
+        Some(DisplayWindow {
+            h_min,
+            h_max,
+            v_min,
+            v_max,
+        })
+    } else {
+        None
+    };
+    Ok(DisplayDefinition {
+        width,
+        height,
+        version,
+        window,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -942,13 +999,40 @@ pub fn write_segment(out: &mut Vec<u8>, seg_type: u8, page_id: u16, body: &[u8])
 /// `height - 1`, so a zero-sized canvas is unrepresentable and
 /// rejected.
 pub fn write_display_definition(width: u16, height: u16) -> Result<Vec<u8>> {
+    write_display_definition_windowed(width, height, 0, None)
+}
+
+/// Display-definition body with an explicit `dds_version_number` and an
+/// optional rendering window (ETSI EN 300 743 §7.2.1). `width`/`height`
+/// are the full display raster (encoded minus-1). When `window` is
+/// `Some`, `display_window_flag` is set and the four inclusive
+/// `display_window_*_position_minimum/maximum` fields are appended; the
+/// maxima must not fall below their matching minima. This is the inverse
+/// of `parse_display_definition`.
+pub fn write_display_definition_windowed(
+    width: u16,
+    height: u16,
+    version: u8,
+    window: Option<DisplayWindow>,
+) -> Result<Vec<u8>> {
     if width == 0 || height == 0 {
         return Err(Error::invalid("DVB DDS: zero canvas"));
     }
-    let mut body = Vec::with_capacity(5);
-    body.push(0); // dds_version_number + display_window_flag
+    let mut body = Vec::with_capacity(if window.is_some() { 13 } else { 5 });
+    // dds_version_number (4) | display_window_flag (1) | reserved (3, high).
+    let flag = if window.is_some() { 0x08 } else { 0x00 };
+    body.push(((version & 0x0F) << 4) | flag | 0x07);
     body.extend_from_slice(&(width - 1).to_be_bytes());
     body.extend_from_slice(&(height - 1).to_be_bytes());
+    if let Some(w) = window {
+        if w.h_max < w.h_min || w.v_max < w.v_min {
+            return Err(Error::invalid("DVB DDS: window maximum below minimum"));
+        }
+        body.extend_from_slice(&w.h_min.to_be_bytes());
+        body.extend_from_slice(&w.h_max.to_be_bytes());
+        body.extend_from_slice(&w.v_min.to_be_bytes());
+        body.extend_from_slice(&w.v_max.to_be_bytes());
+    }
     Ok(body)
 }
 
@@ -1672,6 +1756,33 @@ impl Decoder for DvbSubDecoder {
             }
         }
 
+        // ETSI EN 300 743 §7.2.1: a DDS whose `display_window_flag` is set
+        // confines this display set to a window within the display raster
+        // — it "is intended to be rendered in a window within the display
+        // size defined by display_width and display_height". Region
+        // addresses stay absolute display coordinates (§7.2.2), so any
+        // pixel that composited outside the inclusive window rectangle is
+        // not part of the intended display set; clear it back to the
+        // transparent background. `dds.version` is parsed for callers that
+        // track per-segment versioning but does not alter rendering.
+        let _ = dds.version;
+        if let Some(w) = dds.window {
+            let wx0 = (w.h_min as usize).min(width);
+            let wx1 = ((w.h_max as usize) + 1).min(width);
+            let wy0 = (w.v_min as usize).min(height);
+            let wy1 = ((w.v_max as usize) + 1).min(height);
+            for y in 0..height {
+                let in_v = y >= wy0 && y < wy1;
+                for x in 0..width {
+                    if in_v && x >= wx0 && x < wx1 {
+                        continue;
+                    }
+                    let off = (y * width + x) * 4;
+                    canvas[off..off + 4].copy_from_slice(&[0, 0, 0, 0]);
+                }
+            }
+        }
+
         let frame = VideoFrame {
             pts: packet.pts,
             planes: vec![VideoPlane {
@@ -2006,6 +2117,76 @@ mod tests {
         );
         // Final pixel is opaque (the underlying region was opaque white).
         assert_eq!(px[3], 255, "expected opaque result, got {px:?}");
+    }
+
+    #[test]
+    fn display_window_clips_pixels_outside_it() {
+        // ETSI EN 300 743 §7.2.1: a DDS with display_window_flag set
+        // confines the display set to a window inside the raster. We lay a
+        // 4×1 canvas with two opaque single-pixel regions — one at x=0
+        // (inside a window covering pixels 0..=1) and one at x=3 (outside
+        // it). After rendering, the in-window pixel survives and the
+        // out-of-window pixel is cleared to transparent.
+        let mut out = vec![0x20, 0x00]; // data_identifier + stream_id
+
+        // DDS: 4×1 raster, window flag set, window = horizontal 0..=1, vertical 0..=0.
+        let win = DisplayWindow {
+            h_min: 0,
+            h_max: 1,
+            v_min: 0,
+            v_max: 0,
+        };
+        let dds = write_display_definition_windowed(4, 1, 0, Some(win)).unwrap();
+        dvb_segment(&mut out, SEG_DISPLAY_DEFINITION, &dds);
+
+        // Region 0 at page x=0 (inside), region 1 at page x=3 (outside).
+        let mut page = vec![0u8, 0u8];
+        page.push(0); // region_id 0
+        page.push(0xFF);
+        page.extend_from_slice(&0u16.to_be_bytes()); // x = 0
+        page.extend_from_slice(&0u16.to_be_bytes()); // y
+        page.push(1); // region_id 1
+        page.push(0xFF);
+        page.extend_from_slice(&3u16.to_be_bytes()); // x = 3 (outside window)
+        page.extend_from_slice(&0u16.to_be_bytes()); // y
+        dvb_segment(&mut out, SEG_PAGE_COMPOSITION, &page);
+
+        dvb_segment(
+            &mut out,
+            SEG_REGION_COMPOSITION,
+            &dvb_region_8bit(0, 0, 1, 1, 100),
+        );
+        dvb_segment(
+            &mut out,
+            SEG_REGION_COMPOSITION,
+            &dvb_region_8bit(1, 0, 1, 1, 101),
+        );
+        // CLUT 0 entry 1 → opaque white.
+        dvb_segment(
+            &mut out,
+            SEG_CLUT_DEFINITION,
+            &dvb_clut_entry1(0, 255, 128, 128, 0),
+        );
+        dvb_segment(&mut out, SEG_OBJECT_DATA, &dvb_object_8bit(100, &[1]));
+        dvb_segment(&mut out, SEG_OBJECT_DATA, &dvb_object_8bit(101, &[1]));
+        dvb_segment(&mut out, SEG_END_OF_DISPLAY_SET, &[]);
+
+        let params = CodecParameters::video(CodecId::new(DVBSUB_CODEC_ID));
+        let mut dec = make_decoder(&params).unwrap();
+        let pkt = Packet::new(0, TimeBase::new(1, 90_000), out).with_pts(0);
+        dec.send_packet(&pkt).unwrap();
+        let Frame::Video(v) = dec.receive_frame().unwrap() else {
+            panic!("expected video frame");
+        };
+        let data = &v.planes[0].data;
+        // Pixel 0 (inside window) painted opaque.
+        assert_eq!(data[3], 255, "in-window pixel should be opaque");
+        // Pixel 3 (outside window) cleared to transparent despite its region.
+        assert_eq!(
+            &data[12..16],
+            &[0, 0, 0, 0],
+            "out-of-window pixel must be cleared"
+        );
     }
 
     #[test]
@@ -2951,6 +3132,88 @@ mod tests {
         }
         assert!(write_display_definition(0, 576).is_err());
         assert!(write_display_definition(720, 0).is_err());
+    }
+
+    #[test]
+    fn display_definition_no_window_has_none() {
+        // The default 5-byte form carries no window; the flag is clear.
+        let body = write_display_definition(1920, 1080).unwrap();
+        assert_eq!(body.len(), 5);
+        let dds = parse_display_definition(&body).unwrap();
+        assert_eq!(dds.window, None);
+    }
+
+    #[test]
+    fn display_definition_window_roundtrip() {
+        // ETSI EN 300 743 §7.2.1: when display_window_flag is set, the
+        // four inclusive window positions follow and survive a write/
+        // parse roundtrip. Version is carried in the top nibble.
+        let win = DisplayWindow {
+            h_min: 100,
+            h_max: 1819,
+            v_min: 60,
+            v_max: 1019,
+        };
+        let body = write_display_definition_windowed(1920, 1080, 9, Some(win)).unwrap();
+        assert_eq!(body.len(), 13);
+        assert_eq!(body[0] & 0x08, 0x08, "display_window_flag must be set");
+        let dds = parse_display_definition(&body).unwrap();
+        assert_eq!((dds.width, dds.height), (1920, 1080));
+        assert_eq!(dds.version, 9);
+        assert_eq!(dds.window, Some(win));
+    }
+
+    #[test]
+    fn display_definition_window_flag_truncated_rejected() {
+        // Flag set but only the 5-byte no-window body present.
+        let mut body = write_display_definition(720, 576).unwrap();
+        body[0] |= 0x08; // raise display_window_flag without the 8 trailing bytes
+        assert!(parse_display_definition(&body).is_err());
+    }
+
+    #[test]
+    fn display_definition_window_inverted_extent_rejected() {
+        // A maximum below its minimum is a zero/negative-extent window.
+        let bad = DisplayWindow {
+            h_min: 500,
+            h_max: 400,
+            v_min: 10,
+            v_max: 20,
+        };
+        assert!(write_display_definition_windowed(1920, 1080, 0, Some(bad)).is_err());
+        // And the decode side rejects such a body even if hand-built.
+        let mut body = write_display_definition_windowed(
+            1920,
+            1080,
+            0,
+            Some(DisplayWindow {
+                h_min: 0,
+                h_max: 1,
+                v_min: 0,
+                v_max: 1,
+            }),
+        )
+        .unwrap();
+        // Corrupt v_max (bytes 11..13) to fall below v_min.
+        body[9] = 0x00;
+        body[10] = 0x05; // v_min = 5
+        body[11] = 0x00;
+        body[12] = 0x02; // v_max = 2 < 5
+        assert!(parse_display_definition(&body).is_err());
+    }
+
+    #[test]
+    fn display_definition_window_single_pixel_edge() {
+        // Inclusive maxima permit an equal min==max (one-pixel/one-line) window.
+        let win = DisplayWindow {
+            h_min: 7,
+            h_max: 7,
+            v_min: 3,
+            v_max: 3,
+        };
+        let body = write_display_definition_windowed(720, 576, 0, Some(win)).unwrap();
+        let dds = parse_display_definition(&body).unwrap();
+        assert_eq!(dds.window, Some(win));
     }
 
     #[test]
