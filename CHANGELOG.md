@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- DVB subtitles: Disparity Signalling Segment (DSS, segment type
+  `0x15`, ETSI EN 300 743 §7.2.7) parsing for plano-stereoscopic (3D)
+  placement metadata. New public `SEG_DISPARITY_SIGNALLING` constant
+  and `parse_disparity_signalling` returning a typed
+  `DisparitySignalling` (`dss_version_number`, signed `tcimsbf`
+  `page_default_disparity_shift`, optional page-level
+  `DisparityShiftUpdateSequence`, and the region loop). Each
+  `DisparityRegion` carries 1..=4 `DisparitySubregion`s; positional
+  `subregion_horizontal_position`/`subregion_width` are present only
+  when a region declares more than one subregion (a single implicit
+  subregion reports them as `None` and spans the whole region). The
+  unsigned 4-bit `subregion_disparity_shift_fractional_part` is exposed
+  as 1/16-pixel units added to the signed integer part per the spec's
+  worked examples. `DisparityShiftUpdateSequence` decodes the 24-bit
+  `interval_duration` plus each `division_period`'s `interval_count`
+  and signed `disparity_shift_update_integer_part`, for both the
+  page-level (`disparity_shift_update_sequence_page_flag`) and
+  per-region (`disparity_shift_update_sequence_region_flag`) forms. The
+  decoder routes the DSS through its segment loop and validates it; the
+  painted RGBA canvas remains the spec's disparity-zero (2D) baseline
+  view, so the parsed values are surfaced for stereoscopic callers
+  without shifting the emitted picture. Truncated update-sequence
+  bodies and subregion fields are rejected, not silently clamped.
+  Covered by eight unit tests (page-default-only, single/multi
+  subregion, page + region update sequences, in-display-set decode,
+  two truncation rejections).
+
 - DVB subtitles: Display Definition Segment rendering window (ETSI
   EN 300 743 §7.2.1). `parse_display_definition` now decodes
   `dds_version_number` and `display_window_flag`; when the flag is set

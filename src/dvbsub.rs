@@ -65,6 +65,10 @@ pub const SEG_REGION_COMPOSITION: u8 = 0x11;
 pub const SEG_CLUT_DEFINITION: u8 = 0x12;
 pub const SEG_OBJECT_DATA: u8 = 0x13;
 pub const SEG_DISPLAY_DEFINITION: u8 = 0x14;
+/// Disparity Signalling Segment (ETSI EN 300 743 §7.2.7) — carries the
+/// plano-stereoscopic (3D) per-page / per-region / per-subregion disparity
+/// shift values.
+pub const SEG_DISPARITY_SIGNALLING: u8 = 0x15;
 pub const SEG_END_OF_DISPLAY_SET: u8 = 0x80;
 
 // --- raw segments ------------------------------------------------------
@@ -188,6 +192,212 @@ fn parse_display_definition(body: &[u8]) -> Result<DisplayDefinition> {
         height,
         version,
         window,
+    })
+}
+
+// --- Disparity Signalling Segment (§7.2.7) -----------------------------
+
+/// One step of a `disparity_shift_update_sequence` (ETSI EN 300 743
+/// §7.2.7): a single near-future disparity value plus the interval
+/// multiplier that places it on the presentation timeline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DisparityDivisionPeriod {
+    /// `interval_count` — multiplier (≥ 1) applied to the sequence's
+    /// `interval_duration` to compute this update's PTS offset from the
+    /// previous value.
+    pub interval_count: u8,
+    /// `disparity_shift_update_integer_part` — signed integer disparity
+    /// (−128..=+127 pixels) applied at this step.
+    pub disparity_shift_integer: i8,
+}
+
+/// A `disparity_shift_update_sequence()` (ETSI EN 300 743 §7.2.7) — a
+/// run of near-future disparity values transmitted together so the
+/// decoder can schedule (and interpolate between) them off a single PTS.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct DisparityShiftUpdateSequence {
+    /// `interval_duration` — 24-bit unit (90 kHz STC ticks) between
+    /// division periods.
+    pub interval_duration: u32,
+    /// One entry per `division_period_count` value (≥ 1).
+    pub division_periods: Vec<DisparityDivisionPeriod>,
+}
+
+/// One subregion's disparity within a DSS region loop (ETSI EN 300 743
+/// §7.2.7). When a region declares a single subregion the positional
+/// fields are absent on the wire and inherit the whole region's extent;
+/// they are reported here as `None` so callers can distinguish the
+/// "whole region" case from an explicit sub-rectangle.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DisparitySubregion {
+    /// `subregion_horizontal_position` — left-most pixel, page-relative.
+    /// `None` when the region carries a single implicit subregion.
+    pub horizontal_position: Option<u16>,
+    /// `subregion_width` — width in pixels. `None` with a single
+    /// implicit subregion (it spans the whole region).
+    pub width: Option<u16>,
+    /// `subregion_disparity_shift_integer_part` — signed integer pixels
+    /// (−128..=+127).
+    pub disparity_shift_integer: i8,
+    /// `subregion_disparity_shift_fractional_part` — unsigned 1/16-pixel
+    /// units (0..=15) **added** to the integer part per the spec's
+    /// worked examples (−0.75 ⇒ [−1, 4/16]).
+    pub disparity_shift_fractional: u8,
+    /// Per-region `disparity_shift_update_sequence`, present only when
+    /// `disparity_shift_update_sequence_region_flag` was set. It applies
+    /// to every subregion of the region.
+    pub update_sequence: Option<DisparityShiftUpdateSequence>,
+}
+
+/// One region entry in the DSS region loop (ETSI EN 300 743 §7.2.7).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DisparityRegion {
+    /// `region_id` the subregions below belong to.
+    pub region_id: u8,
+    /// The subregions (1..=4) declared for this region.
+    pub subregions: Vec<DisparitySubregion>,
+}
+
+/// A parsed Disparity Signalling Segment (ETSI EN 300 743 §7.2.7).
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct DisparitySignalling {
+    /// `dss_version_number` (modulo-16).
+    pub version: u8,
+    /// `page_default_disparity_shift` — signed integer default applied
+    /// to every region when the decoder cannot place individual values.
+    pub page_default_disparity_shift: i8,
+    /// Page-level `disparity_shift_update_sequence`, present only when
+    /// `disparity_shift_update_sequence_page_flag` was set.
+    pub page_update_sequence: Option<DisparityShiftUpdateSequence>,
+    /// The DSS region loop. Regions absent here inherit
+    /// `page_default_disparity_shift`.
+    pub regions: Vec<DisparityRegion>,
+}
+
+/// Parse a `disparity_shift_update_sequence()` starting at `buf[*cur]`.
+/// Advances `*cur` past the consumed bytes.
+fn parse_disparity_update_sequence(
+    buf: &[u8],
+    cur: &mut usize,
+) -> Result<DisparityShiftUpdateSequence> {
+    // disparity_shift_update_sequence_length (8) precedes a body of that
+    // many bytes: interval_duration (24) + division_period_count (8) +
+    // division_period_count × { interval_count (8) + integer_part (8) }.
+    if *cur + 1 > buf.len() {
+        return Err(Error::invalid("DVB DSS: update-sequence length missing"));
+    }
+    let seq_len = buf[*cur] as usize;
+    let body_start = *cur + 1;
+    let body_end = body_start + seq_len;
+    if body_end > buf.len() {
+        return Err(Error::invalid("DVB DSS: update-sequence body truncated"));
+    }
+    if seq_len < 4 {
+        return Err(Error::invalid(
+            "DVB DSS: update-sequence too short for interval_duration + count",
+        ));
+    }
+    let interval_duration =
+        u32::from_be_bytes([0, buf[body_start], buf[body_start + 1], buf[body_start + 2]]);
+    let division_period_count = buf[body_start + 3] as usize;
+    let mut periods = Vec::with_capacity(division_period_count);
+    let mut p = body_start + 4;
+    for _ in 0..division_period_count {
+        if p + 2 > body_end {
+            return Err(Error::invalid(
+                "DVB DSS: update-sequence division period truncated",
+            ));
+        }
+        periods.push(DisparityDivisionPeriod {
+            interval_count: buf[p],
+            disparity_shift_integer: buf[p + 1] as i8,
+        });
+        p += 2;
+    }
+    *cur = body_end;
+    Ok(DisparityShiftUpdateSequence {
+        interval_duration,
+        division_periods: periods,
+    })
+}
+
+fn parse_disparity_signalling(body: &[u8]) -> Result<DisparitySignalling> {
+    // dss_version_number (4) | page_flag (1) | reserved (3) +
+    // page_default_disparity_shift (8) minimum.
+    if body.len() < 2 {
+        return Err(Error::invalid("DVB DSS: body too short"));
+    }
+    let version = body[0] >> 4;
+    let page_flag = (body[0] & 0x08) != 0;
+    let page_default_disparity_shift = body[1] as i8;
+    let mut cur = 2;
+    let page_update_sequence = if page_flag {
+        Some(parse_disparity_update_sequence(body, &mut cur)?)
+    } else {
+        None
+    };
+    // region loop runs while processed_length < segment_length, i.e. to
+    // the end of the body.
+    let mut regions = Vec::new();
+    while cur < body.len() {
+        if cur + 2 > body.len() {
+            return Err(Error::invalid("DVB DSS: region entry header truncated"));
+        }
+        let region_id = body[cur];
+        let flags = body[cur + 1];
+        let region_update_flag = (flags & 0x80) != 0;
+        // reserved (5) sit between the flag and the 2-bit count.
+        let number_of_subregions = (flags & 0x03) as usize + 1;
+        cur += 2;
+        let mut subregions = Vec::with_capacity(number_of_subregions);
+        for _ in 0..number_of_subregions {
+            // Positional fields are present only when there is more than
+            // one subregion (number_of_subregions_minus_1 > 0).
+            let (horizontal_position, width) = if number_of_subregions > 1 {
+                if cur + 4 > body.len() {
+                    return Err(Error::invalid(
+                        "DVB DSS: subregion position fields truncated",
+                    ));
+                }
+                let h = u16::from_be_bytes([body[cur], body[cur + 1]]);
+                let w = u16::from_be_bytes([body[cur + 2], body[cur + 3]]);
+                cur += 4;
+                (Some(h), Some(w))
+            } else {
+                (None, None)
+            };
+            if cur + 2 > body.len() {
+                return Err(Error::invalid(
+                    "DVB DSS: subregion disparity fields truncated",
+                ));
+            }
+            let disparity_shift_integer = body[cur] as i8;
+            // fractional_part (4) | reserved (4).
+            let disparity_shift_fractional = (body[cur + 1] >> 4) & 0x0F;
+            cur += 2;
+            let update_sequence = if region_update_flag {
+                Some(parse_disparity_update_sequence(body, &mut cur)?)
+            } else {
+                None
+            };
+            subregions.push(DisparitySubregion {
+                horizontal_position,
+                width,
+                disparity_shift_integer,
+                disparity_shift_fractional,
+                update_sequence,
+            });
+        }
+        regions.push(DisparityRegion {
+            region_id,
+            subregions,
+        });
+    }
+    Ok(DisparitySignalling {
+        version,
+        page_default_disparity_shift,
+        page_update_sequence,
+        regions,
     })
 }
 
@@ -1671,6 +1881,16 @@ impl Decoder for DvbSubDecoder {
                 SEG_OBJECT_DATA => {
                     let (id, obj) = parse_object_data(&seg.body)?;
                     objects.insert(id, obj);
+                }
+                SEG_DISPARITY_SIGNALLING => {
+                    // 3D plano-stereoscopic disparity metadata (§7.2.7).
+                    // Parsed and validated for structural correctness; the
+                    // 2D RGBA canvas this decoder paints is the
+                    // disparity-zero view (the spec's "implicit disparity
+                    // of zero" baseline), so the parsed values do not shift
+                    // the emitted picture — they are surfaced for callers
+                    // doing stereoscopic placement.
+                    let _dss = parse_disparity_signalling(&seg.body)?;
                 }
                 SEG_END_OF_DISPLAY_SET => {
                     break;
@@ -3637,5 +3857,198 @@ mod tests {
         // (0, 1) and (2, 1) are left of the region — still transparent.
         assert_eq!(px(0, 1), &[0, 0, 0, 0]);
         assert_eq!(px(2, 1), &[0, 0, 0, 0]);
+    }
+
+    // --- Disparity Signalling Segment (§7.2.7) ---------------------
+
+    /// Minimal DSS: a version + page default disparity, no page update
+    /// sequence and no region loop. Negative defaults are signed
+    /// (tcimsbf), so the byte round-trips through `i8`.
+    #[test]
+    fn dss_parses_page_default_only() {
+        // version=5, page_flag=0, page_default = -7 (0xF9 as i8).
+        let body = vec![(5 << 4), 0xF9u8];
+        let dss = parse_disparity_signalling(&body).unwrap();
+        assert_eq!(dss.version, 5);
+        assert_eq!(dss.page_default_disparity_shift, -7);
+        assert!(dss.page_update_sequence.is_none());
+        assert!(dss.regions.is_empty());
+    }
+
+    /// A region with a single implicit subregion: positional fields are
+    /// absent on the wire (number_of_subregions_minus_1 == 0), so both
+    /// `horizontal_position` and `width` are reported as `None` and the
+    /// disparity applies to the whole region. The fractional part is the
+    /// high nibble of its byte and is unsigned.
+    #[test]
+    fn dss_single_subregion_omits_position_fields() {
+        let mut body = vec![(2 << 4), 0x00]; // version 2, no page flag, default 0
+        body.push(0x09); // region_id = 9
+                         // region flags: update_flag=0, reserved=0, subregions_minus_1=0
+        body.push(0x00);
+        body.push(0x03); // disparity integer = +3
+        body.push(0x40); // fractional = 4 (0x4 in high nibble), reserved low
+        let dss = parse_disparity_signalling(&body).unwrap();
+        assert_eq!(dss.regions.len(), 1);
+        let region = &dss.regions[0];
+        assert_eq!(region.region_id, 9);
+        assert_eq!(region.subregions.len(), 1);
+        let sub = &region.subregions[0];
+        assert_eq!(sub.horizontal_position, None);
+        assert_eq!(sub.width, None);
+        assert_eq!(sub.disparity_shift_integer, 3);
+        assert_eq!(sub.disparity_shift_fractional, 4);
+        assert!(sub.update_sequence.is_none());
+    }
+
+    /// Two subregions per region carry explicit horizontal_position +
+    /// width (16-bit each), per the spec's `number_of_subregions_minus_1
+    /// > 0` branch. Negative disparity integers stay signed.
+    #[test]
+    fn dss_multi_subregion_carries_positions() {
+        let mut body = vec![(0 << 4), 0x00];
+        body.push(0x01); // region_id = 1
+        body.push(0x01); // flags: subregions_minus_1 = 1 (two subregions)
+                         // subregion 0: h=10, w=40, disparity=+5, frac=0
+        body.extend_from_slice(&10u16.to_be_bytes());
+        body.extend_from_slice(&40u16.to_be_bytes());
+        body.push(0x05);
+        body.push(0x00);
+        // subregion 1: h=100, w=60, disparity=-2 (0xFE), frac=8
+        body.extend_from_slice(&100u16.to_be_bytes());
+        body.extend_from_slice(&60u16.to_be_bytes());
+        body.push(0xFE);
+        body.push(0x80);
+        let dss = parse_disparity_signalling(&body).unwrap();
+        let subs = &dss.regions[0].subregions;
+        assert_eq!(subs.len(), 2);
+        assert_eq!(subs[0].horizontal_position, Some(10));
+        assert_eq!(subs[0].width, Some(40));
+        assert_eq!(subs[0].disparity_shift_integer, 5);
+        assert_eq!(subs[1].horizontal_position, Some(100));
+        assert_eq!(subs[1].width, Some(60));
+        assert_eq!(subs[1].disparity_shift_integer, -2);
+        assert_eq!(subs[1].disparity_shift_fractional, 8);
+    }
+
+    /// A page-level `disparity_shift_update_sequence` (page_flag=1) is
+    /// parsed into its `interval_duration` + per-division-period
+    /// (interval_count, integer_part) entries.
+    #[test]
+    fn dss_page_update_sequence_round_trips() {
+        let mut body = vec![(1 << 4) | 0x08, 0x02]; // version 1, page_flag, default +2
+                                                    // update sequence: length, interval_duration(3), count(1), 2×(2)
+        let mut seq = Vec::new();
+        seq.extend_from_slice(&[0x00, 0x0B, 0xB8]); // interval_duration = 3000
+        seq.push(0x02); // division_period_count = 2
+        seq.push(0x01); // interval_count
+        seq.push(0x04); // integer_part = +4
+        seq.push(0x03); // interval_count
+        seq.push(0xFB); // integer_part = -5
+        body.push(seq.len() as u8);
+        body.extend_from_slice(&seq);
+        let dss = parse_disparity_signalling(&body).unwrap();
+        let s = dss.page_update_sequence.expect("page sequence present");
+        assert_eq!(s.interval_duration, 3000);
+        assert_eq!(s.division_periods.len(), 2);
+        assert_eq!(s.division_periods[0].interval_count, 1);
+        assert_eq!(s.division_periods[0].disparity_shift_integer, 4);
+        assert_eq!(s.division_periods[1].disparity_shift_integer, -5);
+    }
+
+    /// region_flag=1 attaches one update sequence per region (shared by
+    /// all its subregions). With a single subregion the positional
+    /// fields stay absent and the sequence follows immediately.
+    #[test]
+    fn dss_region_update_sequence_applies_per_region() {
+        let mut body = vec![0x00, 0x00];
+        body.push(0x07); // region_id = 7
+        body.push(0x80); // flags: region_update_flag = 1, subregions = 1
+        body.push(0x01); // disparity integer = +1
+        body.push(0x00); // fractional = 0
+        let mut seq = Vec::new();
+        seq.extend_from_slice(&[0x00, 0x00, 0x64]); // interval_duration = 100
+        seq.push(0x01); // count
+        seq.push(0x05); // interval_count
+        seq.push(0x09); // integer = +9
+        body.push(seq.len() as u8);
+        body.extend_from_slice(&seq);
+        let dss = parse_disparity_signalling(&body).unwrap();
+        let sub = &dss.regions[0].subregions[0];
+        let s = sub.update_sequence.as_ref().expect("region sequence");
+        assert_eq!(s.interval_duration, 100);
+        assert_eq!(s.division_periods[0].interval_count, 5);
+        assert_eq!(s.division_periods[0].disparity_shift_integer, 9);
+    }
+
+    /// A DSS segment flowing through the decoder's segment loop is parsed
+    /// and validated without disturbing the painted 2D (disparity-zero)
+    /// canvas — the spec's baseline view. The frame still decodes.
+    #[test]
+    fn dss_segment_in_display_set_decodes_without_panic() {
+        let mut out = vec![0x20, 0x00]; // data_identifier + stream_id
+        let mut dds = Vec::new();
+        dds.push(0);
+        dds.extend_from_slice(&0u16.to_be_bytes()); // width-1 → 1
+        dds.extend_from_slice(&0u16.to_be_bytes()); // height-1 → 1
+        dvb_segment(&mut out, SEG_DISPLAY_DEFINITION, &dds);
+
+        let mut page = vec![0x00, 0x00];
+        page.push(0); // region_id 0
+        page.push(0); // reserved
+        page.extend_from_slice(&0u16.to_be_bytes()); // x
+        page.extend_from_slice(&0u16.to_be_bytes()); // y
+        dvb_segment(&mut out, SEG_PAGE_COMPOSITION, &page);
+
+        dvb_segment(
+            &mut out,
+            SEG_REGION_COMPOSITION,
+            &dvb_region_8bit(0, 0, 1, 1, 50),
+        );
+        dvb_segment(
+            &mut out,
+            SEG_CLUT_DEFINITION,
+            &dvb_clut_entry1(0, 200, 128, 128, 0),
+        );
+        dvb_segment(&mut out, SEG_OBJECT_DATA, &dvb_object_8bit(50, &[1]));
+
+        // DSS: page default + one region with a single subregion.
+        let dss = vec![(3 << 4), 0x02, 0x00, 0x00, 0x06, 0x00];
+        dvb_segment(&mut out, SEG_DISPARITY_SIGNALLING, &dss);
+
+        dvb_segment(&mut out, SEG_END_OF_DISPLAY_SET, &[]);
+
+        let params = CodecParameters::video(CodecId::new(DVBSUB_CODEC_ID));
+        let mut dec = make_decoder(&params).unwrap();
+        let pkt = Packet::new(0, TimeBase::new(1, 90_000), out).with_pts(0);
+        dec.send_packet(&pkt).unwrap();
+        // Standalone confirmation the DSS body parses the same bytes.
+        assert_eq!(parse_disparity_signalling(&dss).unwrap().version, 3);
+    }
+
+    /// A truncated update-sequence body (advertised length overruns the
+    /// segment) is rejected, not silently clamped.
+    #[test]
+    fn dss_rejects_truncated_update_sequence() {
+        // page_flag set, then a sequence length of 10 with only 2 bytes.
+        let body = vec![0x08, 0x00, 0x0A, 0x00, 0x00];
+        let err = parse_disparity_signalling(&body).unwrap_err();
+        match err {
+            Error::InvalidData(_) => {}
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    /// A region entry whose subregion disparity fields run off the end
+    /// of the body is rejected.
+    #[test]
+    fn dss_rejects_truncated_subregion() {
+        // region_id + flags then nothing for the disparity bytes.
+        let body = vec![0x00, 0x00, 0x01, 0x00];
+        let err = parse_disparity_signalling(&body).unwrap_err();
+        match err {
+            Error::InvalidData(_) => {}
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
     }
 }

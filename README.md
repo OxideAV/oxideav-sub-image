@@ -53,6 +53,28 @@ Pure-Rust bitmap-subtitle codecs and containers:
   falls below its minimum, is rejected. `dds_version_number` is decoded
   for callers that track per-segment versioning. The write side mirrors
   this through `write_display_definition_windowed`.
+
+  The Disparity Signalling Segment (DSS, segment type `0x15`, §7.2.7)
+  is parsed for plano-stereoscopic (3D) placement. `parse_disparity_signalling`
+  returns a typed `DisparitySignalling`: the modulo-16
+  `dss_version_number`, the signed `page_default_disparity_shift`
+  applied when a decoder can only carry one disparity per page, an
+  optional page-level `DisparityShiftUpdateSequence`, and the region
+  loop. Each `DisparityRegion` carries one to four `DisparitySubregion`s
+  whose positional `subregion_horizontal_position`/`subregion_width`
+  are present only when a region declares more than one subregion — a
+  single implicit subregion reports them as `None` and spans the whole
+  region. The unsigned 4-bit fractional disparity is exposed as
+  1/16-pixel units to be *added* to the signed integer part (the spec's
+  `-0.75 ⇒ [-1, 4/16]` convention). `DisparityShiftUpdateSequence`
+  decodes the 24-bit `interval_duration` and each division period's
+  `interval_count` + signed integer update, for both the page-flag and
+  region-flag forms. The decoder routes the DSS through its segment
+  loop and validates it, but the painted RGBA canvas stays the
+  disparity-zero (2D) baseline view the spec mandates as the implicit
+  default, so the parsed values are surfaced for stereoscopic callers
+  rather than shifting the emitted picture. Truncated update-sequence
+  or subregion bodies are rejected.
 - **VobSub** / DVD SPU (`.idx`+`.sub`) — decode only, container reads
   the `.idx` text index + matched `.sub` payload (MPEG-PS pack + PES
   private_stream_1 or raw SPU-length-prefixed form). The SPU's
