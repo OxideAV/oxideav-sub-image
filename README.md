@@ -42,6 +42,14 @@ Pure-Rust bitmap-subtitle codecs and containers:
   source-over), so a later region's partially-transparent CLUT entries
   show the region beneath through rather than discarding it.
 
+  An object's `non_modifying_colour_flag` (§7.2.5) is honoured: when set,
+  CLUT index 1 is the *non-modifying colour*, so any pixel carrying that
+  index leaves the underlying region background / lower-z-order object
+  untouched instead of painting CLUT entry 1 — the spec's mechanism for
+  punching "transparent holes" through an object. Cleared, index 1 paints
+  normally. The flag is decoded from the object-data version/coding byte
+  and the write side can emit it via `write_object_data_flags`.
+
   The Display Definition Segment's `display_window_flag` (§7.2.1) is
   parsed: when set, the four inclusive `display_window_*_position_
   minimum/maximum` fields are read into a typed `DisplayWindow` and the

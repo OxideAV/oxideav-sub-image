@@ -20,9 +20,12 @@
 //!
 //! ## Scope / limitations
 //!
-//! * **Decode:** pixel-coded objects are supported; *character*-coded
-//!   objects (2‐byte UTF-style segments used for teletext-style
-//!   streams) currently return `Error::Unsupported`.
+//! * **Decode:** pixel-coded objects are supported, including the
+//!   `non_modifying_colour_flag` (§7.2.5): when set, CLUT index 1 is the
+//!   non-modifying colour and pixels carrying it leave the underlying
+//!   region/object content untouched ("transparent holes"). *Character*-
+//!   coded objects (2‐byte segments used for teletext-style streams)
+//!   currently return `Error::Unsupported`.
 //! * **Encode:** [`make_encoder`] turns RGBA video frames into complete
 //!   display-set PES payloads (DDS + page composition + region
 //!   composition + CLUT definition + object data + end-of-display-set),
@@ -612,6 +615,11 @@ struct Object {
     /// character-coded objects at render time.
     #[allow(dead_code)]
     coding_method: u8,
+    /// ETSI EN 300 743 §7.2.5 `non_modifying_colour_flag`: when set, CLUT
+    /// entry value `1` is the *non-modifying colour*. Pixels assigned that
+    /// index leave the underlying region background / object pixel
+    /// unchanged ("transparent holes"), rather than painting CLUT entry 1.
+    non_modifying_colour: bool,
 }
 
 fn parse_object_data(body: &[u8]) -> Result<(u16, Object)> {
@@ -621,6 +629,7 @@ fn parse_object_data(body: &[u8]) -> Result<(u16, Object)> {
     let object_id = u16::from_be_bytes([body[0], body[1]]);
     // body[2] = version (4 bits) + coding_method (2 bits) + non_modifying_colour_flag (1) + reserved
     let coding_method = (body[2] >> 2) & 0x03;
+    let non_modifying_colour = (body[2] >> 1) & 0x01 != 0;
     if coding_method != 0 {
         return Err(Error::unsupported(format!(
             "DVB sub: coding_method {} (character/text objects)",
@@ -665,6 +674,7 @@ fn parse_object_data(body: &[u8]) -> Result<(u16, Object)> {
         Object {
             rows,
             coding_method,
+            non_modifying_colour,
         },
     ))
 }
@@ -1445,6 +1455,24 @@ pub fn write_object_data(
     rows: &[Vec<u8>],
     map_tables: &[(u8, [u8; 2])],
 ) -> Result<Vec<u8>> {
+    write_object_data_flags(object_id, version, depth_bits, rows, map_tables, false)
+}
+
+/// Build an object-data segment body for a pixel-coded object, choosing
+/// whether the `non_modifying_colour_flag` (ETSI EN 300 743 §7.2.5) is
+/// set. When `non_modifying_colour` is `true`, CLUT index `1` becomes the
+/// non-modifying colour: the decode side leaves the underlying canvas
+/// untouched wherever the object carries index 1, creating "transparent
+/// holes". Everything else matches [`write_object_data`], of which this is
+/// the general form ([`write_object_data`] passes `false`).
+pub fn write_object_data_flags(
+    object_id: u16,
+    version: u8,
+    depth_bits: u8,
+    rows: &[Vec<u8>],
+    map_tables: &[(u8, [u8; 2])],
+    non_modifying_colour: bool,
+) -> Result<Vec<u8>> {
     if rows.is_empty() {
         return Err(Error::invalid("DVB object_data: no rows to encode"));
     }
@@ -1498,8 +1526,9 @@ pub fn write_object_data(
     let mut body = Vec::with_capacity(7 + top.len() + bot.len());
     body.extend_from_slice(&object_id.to_be_bytes());
     // version (4) + coding_method 0 = pixel-coded (2) +
-    // non_modifying_colour_flag 0 (1) + reserved.
-    body.push((version & 0x0F) << 4);
+    // non_modifying_colour_flag (1) + reserved (1).
+    let flag_bit = if non_modifying_colour { 0x02 } else { 0x00 };
+    body.push(((version & 0x0F) << 4) | flag_bit);
     body.extend_from_slice(&(top.len() as u16).to_be_bytes());
     body.extend_from_slice(&(bot.len() as u16).to_be_bytes());
     body.extend_from_slice(&top);
@@ -1958,6 +1987,7 @@ impl Decoder for DvbSubDecoder {
                 };
                 let base_x = pr.x as usize + ro.x as usize;
                 let base_y = pr.y as usize + ro.y as usize;
+                let non_modifying = obj.non_modifying_colour;
                 crate::composite::blit_indexed(
                     &mut canvas,
                     width,
@@ -1966,7 +1996,15 @@ impl Decoder for DvbSubDecoder {
                     base_x,
                     base_y,
                     |px| {
-                        if px == 0 {
+                        // ETSI EN 300 743 §7.2.5: index 0 is the region's
+                        // transparent background. When the object's
+                        // `non_modifying_colour_flag` is set, index 1 is the
+                        // non-modifying colour — it leaves whatever is
+                        // already on the canvas (region background or a
+                        // lower-z-order object) untouched, punching a
+                        // "transparent hole" through this object. Returning
+                        // alpha 0 makes the compositor skip the write.
+                        if px == 0 || (non_modifying && px == 1) {
                             [0, 0, 0, 0]
                         } else {
                             clut.entries[px as usize]
@@ -2423,6 +2461,160 @@ mod tests {
             Error::Unsupported(_) => {}
             other => panic!("expected Unsupported, got {other:?}"),
         }
+    }
+
+    /// ETSI EN 300 743 §7.2.5: `non_modifying_colour_flag` (bit 1 of the
+    /// version/coding byte) is decoded into the parsed object.
+    #[test]
+    fn parse_object_decodes_non_modifying_colour_flag() {
+        // Flag clear.
+        let plain = write_object_data_flags(0, 0, 8, &[vec![1, 2]], &[], false).unwrap();
+        let (_, obj) = parse_object_data(&plain).unwrap();
+        assert!(!obj.non_modifying_colour);
+
+        // Flag set — must survive the write→parse round-trip.
+        let holed = write_object_data_flags(0, 0, 8, &[vec![1, 2]], &[], true).unwrap();
+        let (_, obj) = parse_object_data(&holed).unwrap();
+        assert!(obj.non_modifying_colour);
+        // Same pixel rows either way; only the flag byte changes.
+        assert_eq!(obj.rows, parse_object_data(&plain).unwrap().1.rows);
+    }
+
+    /// CLUT body with two full-precision entries (ids 1 and 2).
+    fn dvb_clut_entries(clut_id: u8, e1: (u8, u8, u8, u8), e2: (u8, u8, u8, u8)) -> Vec<u8> {
+        let mut body = vec![clut_id, 0];
+        for (id, (y, cr, cb, t)) in [(1u8, e1), (2u8, e2)] {
+            body.push(id);
+            body.push(0x01); // full-precision flag
+            body.extend_from_slice(&[y, cr, cb, t]);
+        }
+        body
+    }
+
+    /// One 8-bit-coded object body with a chosen `non_modifying_colour`
+    /// flag, carrying a single top-field row.
+    fn dvb_object_8bit_flagged(object_id: u16, row: &[u8], non_modifying: bool) -> Vec<u8> {
+        let mut obj = Vec::new();
+        obj.extend_from_slice(&object_id.to_be_bytes());
+        obj.push(if non_modifying { 0x02 } else { 0x00 });
+        let mut top = vec![0x12];
+        top.extend_from_slice(&encode_8bit_literal(row));
+        top.push(0xF0);
+        obj.extend_from_slice(&(top.len() as u16).to_be_bytes());
+        obj.extend_from_slice(&0u16.to_be_bytes());
+        obj.extend_from_slice(&top);
+        obj
+    }
+
+    /// ETSI EN 300 743 §7.2.5: when an object's `non_modifying_colour_flag`
+    /// is set, CLUT index 1 is the non-modifying colour — pixels carrying
+    /// it leave the underlying region/object content untouched, punching a
+    /// transparent hole. Index 2 still paints normally.
+    #[test]
+    fn non_modifying_colour_punches_transparent_hole() {
+        // Two regions at (0,0) over a 3×1 canvas. Region 0 is the opaque
+        // white background object; region 1 sits on top with the flag set,
+        // painting [1, 2, 1] — index 1 = hole (white shows through),
+        // index 2 = opaque red (overpaints).
+        let build = |non_modifying: bool| -> Vec<u8> {
+            let mut out = vec![0x20, 0x00];
+
+            // DDS: 3×1 raster (width/height encoded as max-index).
+            let mut dds = Vec::new();
+            dds.push(0); // dds_version + flags (window flag clear)
+            dds.extend_from_slice(&2u16.to_be_bytes()); // width-1 = 2
+            dds.extend_from_slice(&0u16.to_be_bytes()); // height-1 = 0
+            dvb_segment(&mut out, SEG_DISPLAY_DEFINITION, &dds);
+
+            // Page: region 0 then region 1, both at (0,0).
+            let mut page = vec![0u8, 0u8];
+            for region_id in [0u8, 1] {
+                page.push(region_id);
+                page.push(0xFF);
+                page.extend_from_slice(&0u16.to_be_bytes());
+                page.extend_from_slice(&0u16.to_be_bytes());
+            }
+            dvb_segment(&mut out, SEG_PAGE_COMPOSITION, &page);
+
+            // Region 0: 3×1, clut 0, object 100. Region 1: 3×1, clut 1, object 101.
+            dvb_segment(
+                &mut out,
+                SEG_REGION_COMPOSITION,
+                &dvb_region_8bit(0, 0, 3, 1, 100),
+            );
+            dvb_segment(
+                &mut out,
+                SEG_REGION_COMPOSITION,
+                &dvb_region_8bit(1, 1, 3, 1, 101),
+            );
+
+            // CLUT 0: entry 1 = opaque white. CLUT 1: entry 1 = opaque
+            // green (would overpaint if NOT treated as a hole), entry 2 =
+            // opaque red.
+            dvb_segment(
+                &mut out,
+                SEG_CLUT_DEFINITION,
+                &dvb_clut_entry1(0, 235, 128, 128, 0),
+            );
+            dvb_segment(
+                &mut out,
+                SEG_CLUT_DEFINITION,
+                &dvb_clut_entries(1, (145, 54, 34, 0), (81, 240, 90, 0)),
+            );
+
+            // Object 100: opaque white across all three pixels.
+            dvb_segment(&mut out, SEG_OBJECT_DATA, &dvb_object_8bit(100, &[1, 1, 1]));
+            // Object 101 (top): [1, 2, 1] with the chosen flag.
+            dvb_segment(
+                &mut out,
+                SEG_OBJECT_DATA,
+                &dvb_object_8bit_flagged(101, &[1, 2, 1], non_modifying),
+            );
+            dvb_segment(&mut out, SEG_END_OF_DISPLAY_SET, &[]);
+            out
+        };
+
+        let decode = |bytes: Vec<u8>| -> Vec<u8> {
+            let params = CodecParameters::video(CodecId::new(DVBSUB_CODEC_ID));
+            let mut dec = make_decoder(&params).unwrap();
+            let pkt = Packet::new(0, TimeBase::new(1, 90_000), bytes).with_pts(0);
+            dec.send_packet(&pkt).unwrap();
+            let Frame::Video(v) = dec.receive_frame().unwrap() else {
+                panic!("expected video frame");
+            };
+            v.planes[0].data.clone()
+        };
+
+        // Flag clear: index 1 of the top object paints CLUT-1 green over
+        // the white background at pixels 0 and 2.
+        let plain = decode(build(false));
+        let green = &plain[0..4];
+        assert!(
+            green[1] > green[0] && green[1] > green[2],
+            "flag clear: pixel 0 should be green (top object overpaints), got {green:?}"
+        );
+
+        // Flag set: index 1 is the non-modifying colour — pixels 0 and 2
+        // leave the white background untouched; pixel 1 (index 2) overpaints red.
+        let holed = decode(build(true));
+        let p0 = &holed[0..4];
+        let p1 = &holed[4..8];
+        let p2 = &holed[8..12];
+        // Pixel 0 and 2 stayed white (R≈G≈B, all high) — the hole let the
+        // underlying object show through unchanged.
+        assert!(
+            p0[0] > 200 && p0[1] > 200 && p0[2] > 200,
+            "hole pixel 0 should keep the white background, got {p0:?}"
+        );
+        assert!(
+            p2[0] > 200 && p2[1] > 200 && p2[2] > 200,
+            "hole pixel 2 should keep the white background, got {p2:?}"
+        );
+        // Pixel 1 (index 2) overpainted red.
+        assert!(
+            p1[0] > p1[1] && p1[0] > p1[2],
+            "pixel 1 (index 2) should overpaint red, got {p1:?}"
+        );
     }
 
     // --- pixel-line decoder coverage --------------------------------

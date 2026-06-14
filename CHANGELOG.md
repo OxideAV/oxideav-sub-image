@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- DVB subtitles: object `non_modifying_colour_flag` (ETSI EN 300 743
+  §7.2.5) is decoded and applied. When set, CLUT index 1 is the
+  non-modifying colour: pixels carrying that index leave the underlying
+  region background / lower-z-order object untouched instead of painting
+  CLUT entry 1, the spec's mechanism for "transparent holes" through an
+  object. The flag is parsed from the object-data version/coding byte and
+  routed through the render compositor; cleared, index 1 paints normally.
+  New public `write_object_data_flags` lets the write side emit the flag
+  (existing `write_object_data` is now a thin wrapper passing `false`).
+
 - DVB subtitles: Disparity Signalling Segment (DSS, segment type
   `0x15`, ETSI EN 300 743 §7.2.7) parsing for plano-stereoscopic (3D)
   placement metadata. New public `SEG_DISPARITY_SIGNALLING` constant
