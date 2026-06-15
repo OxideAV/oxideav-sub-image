@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- DVB subtitles: pixel-data sub-block map-tables (ETSI EN 300 743
+  §7.2.5.1) are now applied instead of skipped. A 2-bit or 4-bit
+  pixel-code string carried inside a deeper region is remapped onto the
+  region CLUT entry numbers through the active map-table: the
+  `0x20`/`0x21`/`0x22` map-table sub-blocks redefine the table in place,
+  which otherwise defaults to the §10.4–10.6 contents (2→4
+  `{0,7,8,15}`, 2→8 `{0x00,0x77,0x88,0xFF}`, 4→8 nibble-replicated). The
+  2-bit-source default (2→4 vs 2→8) and whether a remap applies at all
+  are selected by the referencing region's colour depth (Figure 8). A
+  2-bit region uses 2-bit codes directly, a region of depth ≤ 4 uses
+  4-bit codes directly, and 8-bit codes always index the CLUT directly.
+  Objects are now decoded lazily per referencing region so the right
+  depth drives the remap. `write_object_data` / `write_object_data_flags`
+  take `map_tables: &[(u8, &[u8])]` (variable-length payloads) and
+  validate the payload length against the data_type (2/4/16 bytes for
+  `0x20`/`0x21`/`0x22`).
+
+### Changed
+
+- DVB subtitles: `write_object_data` and `write_object_data_flags` change
+  the `map_tables` parameter from `&[(u8, [u8; 2])]` to `&[(u8, &[u8])]`
+  so map-tables of the correct on-wire size (2/4/16 bytes) can be emitted.
+
+### Added (prior)
+
 - DVB subtitles: object `non_modifying_colour_flag` (ETSI EN 300 743
   §7.2.5) is decoded and applied. When set, CLUT index 1 is the
   non-modifying colour: pixels carrying that index leave the underlying

@@ -27,7 +27,22 @@ Pure-Rust bitmap-subtitle codecs and containers:
   including max-run / chunked-over-max / boundary-length edge cases
   for each run-length form.
 
-  On the decode side, the region composition
+  On the decode side, pixel-data sub-block **map-tables** (§7.2.5.1) are
+  applied rather than skipped: a 2-bit or 4-bit pixel-code string carried
+  inside a deeper region is remapped onto the region CLUT entry numbers
+  through the active map-table. The `0x20`/`0x21`/`0x22` sub-blocks
+  redefine the table in place; absent an explicit redefinition the table
+  holds its §10.4–10.6 default contents (2→4 `{0,7,8,15}`, 2→8
+  `{0x00,0x77,0x88,0xFF}`, 4→8 nibble-replicated). Whether a 2-bit string
+  uses the 2→4 or 2→8 default, and whether a remap happens at all, is
+  driven by the referencing region's colour depth (Figure 8): a 2-bit
+  region uses 2-bit codes directly, a depth-≤4 region uses 4-bit codes
+  directly, and 8-bit codes always index the CLUT directly. Objects are
+  decoded lazily per referencing region so the correct depth drives the
+  remap, and the write side emits map-tables of the correct on-wire size
+  (2/4/16 bytes for `0x20`/`0x21`/`0x22`).
+
+  The region composition
   segment's `region_fill_flag` is honoured: when set, the region
   rectangle is pre-painted with the depth-appropriate
   `region_n-bit_pixel_code` (8/4/2-bit, translated through the

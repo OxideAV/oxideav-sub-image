@@ -23,9 +23,13 @@
 //! * **Decode:** pixel-coded objects are supported, including the
 //!   `non_modifying_colour_flag` (§7.2.5): when set, CLUT index 1 is the
 //!   non-modifying colour and pixels carrying it leave the underlying
-//!   region/object content untouched ("transparent holes"). *Character*-
-//!   coded objects (2‐byte segments used for teletext-style streams)
-//!   currently return `Error::Unsupported`.
+//!   region/object content untouched ("transparent holes"). A 2-bit or
+//!   4-bit pixel string carried inside a deeper region is remapped onto
+//!   the region CLUT through the active map-table (§7.2.5.1): the
+//!   `0x20`/`0x21`/`0x22` map-table sub-blocks redefine the table, which
+//!   otherwise defaults to the §10.4–10.6 contents. *Character*-coded
+//!   objects (2‐byte segments used for teletext-style streams) currently
+//!   return `Error::Unsupported`.
 //! * **Encode:** [`make_encoder`] turns RGBA video frames into complete
 //!   display-set PES payloads (DDS + page composition + region
 //!   composition + CLUT definition + object data + end-of-display-set),
@@ -622,7 +626,74 @@ struct Object {
     non_modifying_colour: bool,
 }
 
-fn parse_object_data(body: &[u8]) -> Result<(u16, Object)> {
+/// Active per-field map-table state used while decoding a pixel-data
+/// sub-block (ETSI EN 300 743 §7.2.5.1). A lower-depth pixel-code string
+/// (2-bit or 4-bit) carried inside a deeper region is remapped onto the
+/// region's CLUT entry numbers through these tables; the table contents
+/// default to §10.4–10.6 and are redefined by a `0x20`/`0x21`/`0x22`
+/// map-table pixel-data sub-block appearing before the code string.
+///
+/// `region_depth` selects which 2-bit-source default applies: 2→4 when
+/// the region is 4-bit, 2→8 when 8-bit (Figure 8's level-of-compatibility
+/// paths). A 2-bit region needs no remap — 2-bit codes index its 4-entry
+/// CLUT directly.
+#[derive(Clone)]
+struct MapTables {
+    /// Maps a 2-bit source code (0..=3) to a region CLUT entry number.
+    map_2bit: [u8; 4],
+    /// Maps a 4-bit source code (0..=15) to a region CLUT entry number.
+    map_4bit: [u8; 16],
+    /// Region colour depth (2/4/8) — picks the default 2-bit-source table
+    /// and decides whether a 2-bit string is remapped at all.
+    region_depth: u8,
+}
+
+/// §10.4 — default 2_to_4-bit map-table contents (Table 12).
+const DEFAULT_MAP_2_TO_4: [u8; 4] = [0b0000, 0b0111, 0b1000, 0b1111];
+/// §10.5 — default 2_to_8-bit map-table contents (Table 13).
+const DEFAULT_MAP_2_TO_8: [u8; 4] = [0b0000_0000, 0b0111_0111, 0b1000_1000, 0b1111_1111];
+
+impl MapTables {
+    fn new(region_depth: u8) -> Self {
+        // §10.6 — default 4_to_8-bit map-table replicates each nibble.
+        let mut map_4bit = [0u8; 16];
+        for (i, m) in map_4bit.iter_mut().enumerate() {
+            *m = (i as u8) * 0x11;
+        }
+        let map_2bit = if region_depth >= 8 {
+            DEFAULT_MAP_2_TO_8
+        } else {
+            DEFAULT_MAP_2_TO_4
+        };
+        Self {
+            map_2bit,
+            map_4bit,
+            region_depth,
+        }
+    }
+
+    /// Remap a 2-bit code into a CLUT entry number. A 2-bit region uses
+    /// the code directly (its CLUT has four entries).
+    fn remap_2bit(&self, code: u8) -> u8 {
+        if self.region_depth <= 2 {
+            code
+        } else {
+            self.map_2bit[(code & 0x03) as usize]
+        }
+    }
+
+    /// Remap a 4-bit code into a CLUT entry number. A region of depth ≤ 4
+    /// uses the code directly (its CLUT addresses ≤ 16 entries).
+    fn remap_4bit(&self, code: u8) -> u8 {
+        if self.region_depth <= 4 {
+            code
+        } else {
+            self.map_4bit[(code & 0x0F) as usize]
+        }
+    }
+}
+
+fn parse_object_data(body: &[u8], region_depth: u8) -> Result<(u16, Object)> {
     if body.len() < 3 {
         return Err(Error::invalid("DVB object_data: body too short"));
     }
@@ -651,9 +722,9 @@ fn parse_object_data(body: &[u8]) -> Result<(u16, Object)> {
             "DVB object_data: pixel-coded line blocks truncated",
         ));
     }
-    let top_rows = parse_pixel_lines(&body[top_start..top_end])?;
+    let top_rows = parse_pixel_lines(&body[top_start..top_end], region_depth)?;
     let bot_rows = if bot_len > 0 {
-        parse_pixel_lines(&body[top_end..bot_end])?
+        parse_pixel_lines(&body[top_end..bot_end], region_depth)?
     } else {
         top_rows.clone()
     };
@@ -679,36 +750,68 @@ fn parse_object_data(body: &[u8]) -> Result<(u16, Object)> {
     ))
 }
 
-fn parse_pixel_lines(buf: &[u8]) -> Result<Vec<Vec<u8>>> {
+fn parse_pixel_lines(buf: &[u8], region_depth: u8) -> Result<Vec<Vec<u8>>> {
     let mut rows: Vec<Vec<u8>> = Vec::new();
     let mut row: Vec<u8> = Vec::new();
+    // ETSI EN 300 743 §7.2.5.1 / §10: map-tables start at their spec
+    // defaults and are redefined in place by a 0x20/0x21/0x22 map-table
+    // sub-block. The redefinition persists for the rest of this field's
+    // pixel data (each field block is parsed independently).
+    let mut maps = MapTables::new(region_depth);
     let mut i = 0;
     while i < buf.len() {
         let code = buf[i];
         i += 1;
         match code {
             0x10 => {
-                // 2-bit pixel-code string — subset supported.
+                // 2-bit pixel-code string — codes remapped onto the
+                // region CLUT through the active 2-bit-source map-table.
                 let (consumed, pixels) = decode_2bit_string(&buf[i..])?;
                 i += consumed;
-                row.extend_from_slice(&pixels);
+                row.extend(pixels.iter().map(|&c| maps.remap_2bit(c)));
             }
             0x11 => {
                 let (consumed, pixels) = decode_4bit_string(&buf[i..])?;
                 i += consumed;
-                row.extend_from_slice(&pixels);
+                row.extend(pixels.iter().map(|&c| maps.remap_4bit(c)));
             }
             0x12 => {
+                // 8-bit codes already address the region CLUT directly.
                 let (consumed, pixels) = decode_8bit_string(&buf[i..])?;
                 i += consumed;
                 row.extend_from_slice(&pixels);
             }
-            0x20..=0x22 => {
-                // 2-to-4 / 2-to-8 / 4-to-8 map tables — skip the next two bytes.
+            0x20 => {
+                // 2_to_4-bit_map-table: 4 entry numbers of 4 bits each,
+                // entry 0 first (§7.2.5.1). Packed into two bytes.
                 if i + 2 > buf.len() {
-                    return Err(Error::invalid("DVB: map table truncated"));
+                    return Err(Error::invalid("DVB: 2-to-4 map table truncated"));
                 }
+                maps.map_2bit = [
+                    (buf[i] >> 4) & 0x0F,
+                    buf[i] & 0x0F,
+                    (buf[i + 1] >> 4) & 0x0F,
+                    buf[i + 1] & 0x0F,
+                ];
                 i += 2;
+            }
+            0x21 => {
+                // 2_to_8-bit_map-table: 4 entry numbers of 8 bits each
+                // (§7.2.5.1), four bytes.
+                if i + 4 > buf.len() {
+                    return Err(Error::invalid("DVB: 2-to-8 map table truncated"));
+                }
+                maps.map_2bit = [buf[i], buf[i + 1], buf[i + 2], buf[i + 3]];
+                i += 4;
+            }
+            0x22 => {
+                // 4_to_8-bit_map-table: 16 entry numbers of 8 bits each
+                // (§7.2.5.1), sixteen bytes.
+                if i + 16 > buf.len() {
+                    return Err(Error::invalid("DVB: 4-to-8 map table truncated"));
+                }
+                maps.map_4bit.copy_from_slice(&buf[i..i + 16]);
+                i += 16;
             }
             0xF0 => {
                 // End-of-object-line.
@@ -1440,9 +1543,12 @@ fn div_round(num: i64, den: i64) -> i64 {
 /// block and odd rows to the bottom-field block, undoing the decode
 /// side's top/bottom interleave. `depth_bits` (2, 4, or 8) selects the
 /// pixel-code-string flavour used for every row. `map_tables` entries
-/// (`(data_type, payload)` with a map-table data_type `0x20..=0x22`
-/// and a 2-byte payload) are emitted ahead of the first pixel-code
-/// string of each field block.
+/// (`(data_type, payload)` with a map-table data_type `0x20..=0x22`)
+/// are emitted ahead of the first pixel-code string of each field block.
+/// The payload length must match the data_type per ETSI EN 300 743
+/// §7.2.5.1: 2 bytes for `0x20` (2→4, four 4-bit entries), 4 bytes for
+/// `0x21` (2→8, four 8-bit entries), 16 bytes for `0x22` (4→8, sixteen
+/// 8-bit entries).
 ///
 /// A single-row object still gets a non-empty bottom-field block — a
 /// bare end-of-line marker producing one empty bottom row — because a
@@ -1453,9 +1559,21 @@ pub fn write_object_data(
     version: u8,
     depth_bits: u8,
     rows: &[Vec<u8>],
-    map_tables: &[(u8, [u8; 2])],
+    map_tables: &[(u8, &[u8])],
 ) -> Result<Vec<u8>> {
     write_object_data_flags(object_id, version, depth_bits, rows, map_tables, false)
+}
+
+/// On-wire byte length of a map-table pixel-data sub-block payload for a
+/// given map-table data_type (ETSI EN 300 743 §7.2.5.1). Returns `None`
+/// for a non-map-table data_type.
+fn map_table_payload_len(data_type: u8) -> Option<usize> {
+    match data_type {
+        DATA_TYPE_MAP_2_TO_4 => Some(2),
+        DATA_TYPE_MAP_2_TO_8 => Some(4),
+        DATA_TYPE_MAP_4_TO_8 => Some(16),
+        _ => None,
+    }
 }
 
 /// Build an object-data segment body for a pixel-coded object, choosing
@@ -1470,7 +1588,7 @@ pub fn write_object_data_flags(
     version: u8,
     depth_bits: u8,
     rows: &[Vec<u8>],
-    map_tables: &[(u8, [u8; 2])],
+    map_tables: &[(u8, &[u8])],
     non_modifying_colour: bool,
 ) -> Result<Vec<u8>> {
     if rows.is_empty() {
@@ -1486,10 +1604,16 @@ pub fn write_object_data_flags(
             )))
         }
     };
-    for &(t, _) in map_tables {
-        if !(DATA_TYPE_MAP_2_TO_4..=DATA_TYPE_MAP_4_TO_8).contains(&t) {
+    for &(t, payload) in map_tables {
+        let Some(want) = map_table_payload_len(t) else {
             return Err(Error::invalid(format!(
                 "DVB object_data: 0x{t:02X} is not a map-table data_type"
+            )));
+        };
+        if payload.len() != want {
+            return Err(Error::invalid(format!(
+                "DVB object_data: 0x{t:02X} map-table needs {want} payload bytes, got {}",
+                payload.len()
             )));
         }
     }
@@ -1497,7 +1621,7 @@ pub fn write_object_data_flags(
         let mut block = Vec::new();
         for &(t, payload) in map_tables {
             block.push(t);
-            block.extend_from_slice(&payload);
+            block.extend_from_slice(payload);
         }
         for row in field_rows {
             block.push(data_type);
@@ -1883,7 +2007,11 @@ impl Decoder for DvbSubDecoder {
         let payload = strip_pes_prefix(&packet.data);
         let mut dds = DisplayDefinition::default();
         let mut regions: HashMap<u8, Region> = HashMap::new();
-        let mut objects: HashMap<u16, Object> = HashMap::new();
+        // Object-data segment bodies, decoded lazily per referencing
+        // region: the map-table remap of a low-depth pixel string depends
+        // on the region's colour depth (§7.2.5.1 / Figure 8), which is not
+        // known until a region references the object.
+        let mut object_bodies: HashMap<u16, Vec<u8>> = HashMap::new();
         let mut cluts: HashMap<u8, Clut> = HashMap::new();
         let mut page: Vec<PageRegion> = Vec::new();
         let mut cur = 0;
@@ -1908,8 +2036,15 @@ impl Decoder for DvbSubDecoder {
                     parse_clut_into(&seg.body, &mut cluts)?;
                 }
                 SEG_OBJECT_DATA => {
-                    let (id, obj) = parse_object_data(&seg.body)?;
-                    objects.insert(id, obj);
+                    // Validate framing now (header + coding method) but defer
+                    // the pixel decode until a region's depth is known. A
+                    // 2-bit region is the cheapest valid depth and exercises
+                    // the structural checks without remapping.
+                    parse_object_data(&seg.body, 2)?;
+                    if seg.body.len() >= 2 {
+                        let id = u16::from_be_bytes([seg.body[0], seg.body[1]]);
+                        object_bodies.insert(id, seg.body.clone());
+                    }
                 }
                 SEG_DISPARITY_SIGNALLING => {
                     // 3D plano-stereoscopic disparity metadata (§7.2.7).
@@ -1934,6 +2069,11 @@ impl Decoder for DvbSubDecoder {
             return Err(Error::invalid("DVB sub: zero canvas"));
         }
         let mut canvas = vec![0u8; width * height * 4];
+        // Objects are decoded lazily and cached by (object_id, region
+        // depth): the same object reused by regions of different depths
+        // produces different remapped pixel codes (§7.2.5.1), and a region
+        // referencing several objects shares the same depth.
+        let mut decoded_objects: HashMap<(u16, u8), Object> = HashMap::new();
         // DVB page composition stacks regions and, within a region, the
         // referenced objects. When two of those overlap and the topmost
         // CLUT entry is only partially transparent, the correct result is
@@ -1982,9 +2122,15 @@ impl Decoder for DvbSubDecoder {
                 }
             }
             for ro in &region.objects {
-                let Some(obj) = objects.get(&ro.object_id) else {
-                    continue;
-                };
+                let key = (ro.object_id, region.depth_bits);
+                if let std::collections::hash_map::Entry::Vacant(e) = decoded_objects.entry(key) {
+                    let Some(body) = object_bodies.get(&ro.object_id) else {
+                        continue;
+                    };
+                    let (_, obj) = parse_object_data(body, region.depth_bits)?;
+                    e.insert(obj);
+                }
+                let obj = &decoded_objects[&key];
                 let base_x = pr.x as usize + ro.x as usize;
                 let base_y = pr.y as usize + ro.y as usize;
                 let non_modifying = obj.non_modifying_colour;
@@ -2456,7 +2602,7 @@ mod tests {
         body.extend_from_slice(&0u16.to_be_bytes());
         body.extend_from_slice(&0u16.to_be_bytes());
 
-        let err = parse_object_data(&body).unwrap_err();
+        let err = parse_object_data(&body, 8).unwrap_err();
         match err {
             Error::Unsupported(_) => {}
             other => panic!("expected Unsupported, got {other:?}"),
@@ -2469,15 +2615,15 @@ mod tests {
     fn parse_object_decodes_non_modifying_colour_flag() {
         // Flag clear.
         let plain = write_object_data_flags(0, 0, 8, &[vec![1, 2]], &[], false).unwrap();
-        let (_, obj) = parse_object_data(&plain).unwrap();
+        let (_, obj) = parse_object_data(&plain, 8).unwrap();
         assert!(!obj.non_modifying_colour);
 
         // Flag set — must survive the write→parse round-trip.
         let holed = write_object_data_flags(0, 0, 8, &[vec![1, 2]], &[], true).unwrap();
-        let (_, obj) = parse_object_data(&holed).unwrap();
+        let (_, obj) = parse_object_data(&holed, 8).unwrap();
         assert!(obj.non_modifying_colour);
         // Same pixel rows either way; only the flag byte changes.
-        assert_eq!(obj.rows, parse_object_data(&plain).unwrap().1.rows);
+        assert_eq!(obj.rows, parse_object_data(&plain, 8).unwrap().1.rows);
     }
 
     /// CLUT body with two full-precision entries (ids 1 and 2).
@@ -2886,15 +3032,15 @@ mod tests {
         buf.push(0x12);
         buf.extend_from_slice(&encode_8bit_literal(&[4, 5]));
         buf.push(0xF0);
-        let rows = parse_pixel_lines(&buf).unwrap();
+        let rows = parse_pixel_lines(&buf, 8).unwrap();
         assert_eq!(rows, vec![vec![1u8, 2, 3], vec![4, 5]]);
     }
 
     #[test]
-    fn parse_pixel_lines_skips_map_tables() {
-        // 0x20 / 0x21 / 0x22 each carry a 2-byte body. Sandwich one
-        // between two 8-bit pixel-coded strings and confirm the data
-        // bytes are consumed without being treated as pixels.
+    fn parse_pixel_lines_consumes_map_table_without_remapping_8bit() {
+        // A 2-to-4 map-table (0x20, 2-byte body) between two 8-bit
+        // pixel-coded strings is consumed but does not touch 8-bit codes,
+        // which already index the region CLUT directly (§7.2.5.1).
         let mut buf = Vec::new();
         buf.push(0x12);
         buf.extend_from_slice(&encode_8bit_literal(&[7]));
@@ -2904,7 +3050,7 @@ mod tests {
         buf.push(0x12);
         buf.extend_from_slice(&encode_8bit_literal(&[9]));
         buf.push(0xF0);
-        let rows = parse_pixel_lines(&buf).unwrap();
+        let rows = parse_pixel_lines(&buf, 8).unwrap();
         assert_eq!(rows, vec![vec![7u8, 9]]);
     }
 
@@ -2912,17 +3058,20 @@ mod tests {
     fn parse_pixel_lines_rejects_truncated_map_table() {
         // 0x20 introducer with only one trailing byte instead of two.
         let buf = vec![0x20, 0xAA];
-        let err = parse_pixel_lines(&buf).unwrap_err();
+        let err = parse_pixel_lines(&buf, 8).unwrap_err();
         match err {
             Error::InvalidData(_) => {}
             other => panic!("expected InvalidData, got {other:?}"),
         }
+        // 0x21 needs 4 bytes; 0x22 needs 16.
+        assert!(parse_pixel_lines(&[0x21, 1, 2, 3], 8).is_err());
+        assert!(parse_pixel_lines(&[0x22, 0, 0, 0], 8).is_err());
     }
 
     #[test]
     fn parse_pixel_lines_rejects_unknown_data_type() {
         // 0x80 / 0xF1 / etc. are not handled — must error, not panic.
-        let err = parse_pixel_lines(&[0x80]).unwrap_err();
+        let err = parse_pixel_lines(&[0x80], 8).unwrap_err();
         match err {
             Error::InvalidData(_) => {}
             other => panic!("expected InvalidData, got {other:?}"),
@@ -2938,8 +3087,11 @@ mod tests {
             for b in &mut buf {
                 *b = lcg(&mut state) as u8;
             }
-            // Decoder must terminate (Ok or Err) without panicking.
-            let _ = parse_pixel_lines(&buf);
+            // Decoder must terminate (Ok or Err) without panicking at any
+            // region depth.
+            for depth in [2u8, 4, 8] {
+                let _ = parse_pixel_lines(&buf, depth);
+            }
         }
     }
 
@@ -2977,13 +3129,21 @@ mod tests {
         page.extend_from_slice(&0u16.to_be_bytes());
         segment(&mut out, SEG_PAGE_COMPOSITION, &page);
 
-        // RCS — region 0, depth = 3 (8-bit), CLUT 0.
+        // RCS — region 0, CLUT 0. The region depth matches the object's
+        // pixel-code width so the codes index the region CLUT directly
+        // (no map-table remap): 0x10→2-bit (region_depth 1), 0x11→4-bit
+        // (2), 0x12→8-bit (3), per ETSI EN 300 743 §7.2.5.1 / Figure 8.
+        let region_depth_code: u8 = match encoder_byte {
+            0x10 => 1,
+            0x11 => 2,
+            _ => 3,
+        };
         let mut region = Vec::new();
         region.push(0);
         region.push(0);
         region.extend_from_slice(&(rows[0].len() as u16).to_be_bytes());
         region.extend_from_slice(&(rows.len() as u16).to_be_bytes());
-        region.push(3 << 2);
+        region.push(region_depth_code << 2);
         region.push(0);
         region.push(0);
         region.push(0);
@@ -3058,6 +3218,68 @@ mod tests {
         let col1 = &v.planes[0].data[4..8];
         assert!(col0[0] > 200 && col0[1] > 200 && col0[2] > 200);
         assert!(col1[0] > col1[1] && col1[0] > col1[2]);
+    }
+
+    /// End-to-end: a 2-bit pixel string in an 8-bit region is remapped
+    /// through an explicit 2_to_8 map-table onto high CLUT indices, and the
+    /// painted RGBA picks up the colours stored at the *mapped* entries —
+    /// ETSI EN 300 743 §7.2.5.1. Without the remap the codes 1/2 would
+    /// index the (transparent) default CLUT and paint nothing.
+    #[test]
+    fn decodes_2bit_string_in_8bit_region_through_map_table() {
+        fn segment(out: &mut Vec<u8>, seg_type: u8, body: &[u8]) {
+            out.push(0x0F);
+            out.push(seg_type);
+            out.extend_from_slice(&1u16.to_be_bytes());
+            out.extend_from_slice(&(body.len() as u16).to_be_bytes());
+            out.extend_from_slice(body);
+        }
+        let mut out = vec![0x20, 0x00];
+        // DDS — 4×1 canvas.
+        segment(&mut out, SEG_DISPLAY_DEFINITION, &[0, 0, 3, 0, 0]);
+        // PCS — region 0 at (0,0).
+        segment(&mut out, SEG_PAGE_COMPOSITION, &[0, 0, 0, 0xFF, 0, 0, 0, 0]);
+        // RCS — region 0, depth = 3 (8-bit), CLUT 0, 4×1.
+        segment(
+            &mut out,
+            SEG_REGION_COMPOSITION,
+            &[0, 0, 0, 4, 0, 1, 3 << 2, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        );
+        // CLUT — populate the *mapped* entries: 0x30 white, 0x60 red.
+        let mut clut = vec![0, 0];
+        clut.extend_from_slice(&[0x30, 0xFF, 255, 128, 128, 0]);
+        clut.extend_from_slice(&[0x60, 0xFF, 81, 240, 90, 0]);
+        segment(&mut out, SEG_CLUT_DEFINITION, &clut);
+        // Object 0: a 2-to-8 map-table (codes 1→0x30, 2→0x60) ahead of a
+        // 2-bit pixel string {1,2,2,1}.
+        let mut field = vec![DATA_TYPE_MAP_2_TO_8, 0x00, 0x30, 0x60, 0x00];
+        field.push(0x10);
+        field.extend_from_slice(&encode_2bit_literal(&[1, 2, 2, 1]));
+        field.push(0xF0);
+        let mut obj = vec![0, 0, 0];
+        obj.extend_from_slice(&(field.len() as u16).to_be_bytes());
+        obj.extend_from_slice(&0u16.to_be_bytes());
+        obj.extend_from_slice(&field);
+        segment(&mut out, SEG_OBJECT_DATA, &obj);
+        segment(&mut out, SEG_END_OF_DISPLAY_SET, &[]);
+
+        let params = CodecParameters::video(CodecId::new(DVBSUB_CODEC_ID));
+        let mut dec = make_decoder(&params).unwrap();
+        let pkt = Packet::new(0, TimeBase::new(1, 90_000), out).with_pts(0);
+        dec.send_packet(&pkt).unwrap();
+        let Frame::Video(v) = dec.receive_frame().unwrap() else {
+            panic!("expected video frame");
+        };
+        let col0 = &v.planes[0].data[0..4]; // code 1 → entry 0x30 → white
+        let col1 = &v.planes[0].data[4..8]; // code 2 → entry 0x60 → red
+        assert!(
+            col0[0] > 200 && col0[1] > 200 && col0[2] > 200 && col0[3] == 255,
+            "col0 not white: {col0:?}"
+        );
+        assert!(
+            col1[0] > col1[1] && col1[0] > col1[2] && col1[3] == 255,
+            "col1 not red: {col1:?}"
+        );
     }
 
     #[test]
@@ -3870,7 +4092,7 @@ mod tests {
         for depth_bits in [2u8, 4, 8] {
             for rows in &bitmaps {
                 let body = write_object_data(0x0102, 4, depth_bits, rows, &[]).unwrap();
-                let (id, obj) = parse_object_data(&body).unwrap();
+                let (id, obj) = parse_object_data(&body, depth_bits).unwrap();
                 assert_eq!(id, 0x0102);
                 assert_eq!(
                     obj.rows,
@@ -3881,29 +4103,60 @@ mod tests {
         }
     }
 
+    /// In a 2-bit region a 2-bit code addresses the four-entry CLUT
+    /// directly, so a 2-to-4 map-table prefix with an identity layout
+    /// (entries 0,1,2,3) leaves the decoded pixels unchanged (§7.2.5.1).
     #[test]
-    fn object_data_map_table_prefixes_are_transparent_to_decode() {
+    fn object_data_identity_map_in_2bit_region_is_transparent() {
         let rows = vec![vec![1u8, 0, 2, 3], vec![3, 3, 0, 1]];
         let plain = write_object_data(7, 0, 2, &rows, &[]).unwrap();
-        let mapped = write_object_data(
-            7,
-            0,
-            2,
-            &rows,
-            &[
-                (DATA_TYPE_MAP_2_TO_4, [0x01, 0x23]),
-                (DATA_TYPE_MAP_2_TO_8, [0x45, 0x67]),
-                (DATA_TYPE_MAP_4_TO_8, [0x89, 0xAB]),
-            ],
-        )
-        .unwrap();
-        assert!(mapped.len() > plain.len(), "map tables must add bytes");
-        let (_, obj_plain) = parse_object_data(&plain).unwrap();
-        let (_, obj_mapped) = parse_object_data(&mapped).unwrap();
-        assert_eq!(
-            obj_plain.rows, obj_mapped.rows,
-            "map-table prefixes changed the decoded pixels"
-        );
+        // 2-to-4 identity: input 0→0, 1→1, 2→2, 3→3, packed two nibbles
+        // per byte. A 2-bit region uses the codes directly regardless, so
+        // this only checks the prefix is parsed and consumed correctly.
+        let mapped =
+            write_object_data(7, 0, 2, &rows, &[(DATA_TYPE_MAP_2_TO_4, &[0x01, 0x23])]).unwrap();
+        assert!(mapped.len() > plain.len(), "map table must add bytes");
+        let (_, obj_plain) = parse_object_data(&plain, 2).unwrap();
+        let (_, obj_mapped) = parse_object_data(&mapped, 2).unwrap();
+        assert_eq!(obj_plain.rows, obj_mapped.rows);
+    }
+
+    /// ETSI EN 300 743 §7.2.5.1: a 2-bit pixel string carried in an 8-bit
+    /// region is remapped onto the region CLUT through the active
+    /// 2_to_8-bit map-table. The explicit table wins over the §10.5
+    /// default; the decoded rows carry the mapped 8-bit entry numbers.
+    #[test]
+    fn object_data_2bit_string_remapped_through_2to8_table() {
+        let rows = vec![vec![0u8, 1, 2, 3]];
+        // Codes 0..=3 → CLUT entries 0x10, 0x20, 0x30, 0x40.
+        let table: [u8; 4] = [0x10, 0x20, 0x30, 0x40];
+        let body = write_object_data(1, 0, 2, &rows, &[(DATA_TYPE_MAP_2_TO_8, &table)]).unwrap();
+        // Region depth 8 → 2-to-8 remap applies.
+        let (_, obj8) = parse_object_data(&body, 8).unwrap();
+        assert_eq!(obj8.rows, expected_rows(&[vec![0x10, 0x20, 0x30, 0x40]]));
+        // Region depth 2 → codes used directly, table ignored.
+        let (_, obj2) = parse_object_data(&body, 2).unwrap();
+        assert_eq!(obj2.rows, expected_rows(&[vec![0, 1, 2, 3]]));
+    }
+
+    /// With no explicit map-table, a 2-bit string in an 8-bit region uses
+    /// the §10.5 default 2_to_8 contents {0x00, 0x77, 0x88, 0xFF}.
+    #[test]
+    fn object_data_2bit_string_uses_default_2to8_in_8bit_region() {
+        let rows = vec![vec![0u8, 1, 2, 3]];
+        let body = write_object_data(1, 0, 2, &rows, &[]).unwrap();
+        let (_, obj) = parse_object_data(&body, 8).unwrap();
+        assert_eq!(obj.rows, expected_rows(&[vec![0x00, 0x77, 0x88, 0xFF]]));
+    }
+
+    /// A 4-bit string in an 8-bit region without an explicit table uses
+    /// the §10.6 default 4_to_8 contents (each nibble replicated, n→n*0x11).
+    #[test]
+    fn object_data_4bit_string_uses_default_4to8_in_8bit_region() {
+        let rows = vec![vec![0u8, 1, 5, 15]];
+        let body = write_object_data(1, 0, 4, &rows, &[]).unwrap();
+        let (_, obj) = parse_object_data(&body, 8).unwrap();
+        assert_eq!(obj.rows, expected_rows(&[vec![0x00, 0x11, 0x55, 0xFF]]));
     }
 
     #[test]
@@ -3916,7 +4169,15 @@ mod tests {
         assert!(write_object_data(0, 0, 2, &[vec![4]], &[]).is_err());
         assert!(write_object_data(0, 0, 4, &[vec![16]], &[]).is_err());
         // Non-map-table data_type in the map-table slot.
-        assert!(write_object_data(0, 0, 2, &[vec![1]], &[(0x12, [0, 0])]).is_err());
+        assert!(write_object_data(0, 0, 2, &[vec![1]], &[(0x12, &[0, 0])]).is_err());
+        // Map-table payload length mismatched to its data_type.
+        assert!(write_object_data(0, 0, 2, &[vec![1]], &[(DATA_TYPE_MAP_2_TO_4, &[0])]).is_err());
+        assert!(
+            write_object_data(0, 0, 2, &[vec![1]], &[(DATA_TYPE_MAP_2_TO_8, &[0, 0])]).is_err()
+        );
+        assert!(
+            write_object_data(0, 0, 2, &[vec![1]], &[(DATA_TYPE_MAP_4_TO_8, &[0; 4])]).is_err()
+        );
         // Field block longer than the 16-bit length field: 70k pixels of
         // alternating colours encode as one literal byte each.
         let huge: Vec<u8> = (0..70_000usize).map(|i| 1 + (i % 2) as u8).collect();
@@ -3940,7 +4201,7 @@ mod tests {
                 .map(|_| (0..w).map(|_| (lcg(&mut state) & mask) as u8).collect())
                 .collect();
             let body = write_object_data(1, 0, depth_bits, &rows, &[]).unwrap();
-            let (_, obj) = parse_object_data(&body).unwrap();
+            let (_, obj) = parse_object_data(&body, depth_bits).unwrap();
             assert_eq!(obj.rows, expected_rows(&rows), "depth {depth_bits} {w}x{h}");
         }
     }
