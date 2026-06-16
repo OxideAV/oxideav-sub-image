@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- DVB subtitles: character-coded objects (`object_coding_method == 0x01`,
+  ETSI EN 300 743 §7.2.4) are now parsed instead of returning
+  `Error::Unsupported`. The object-data body's `number_of_codes` byte is
+  followed by that many 16-bit `character_code` values (indices into the
+  character table named in the subtitle_descriptor), surfaced on the
+  decoded object. The region-composition object loop now captures each
+  object's `object_type` (Table 6) and, for character types, the
+  `foreground_pixel_code`/`background_pixel_code` 8-bit-CLUT entries —
+  advancing past them so following objects stay aligned. Per §5.4.6 the
+  stream alone carries no glyph metrics (rendering is deferred to a local
+  broadcaster/IRD font agreement), so a character object paints nothing
+  on the canvas and the codes are carried for a caller holding that
+  agreement, rather than the decoder fabricating a font. Reserved coding
+  methods (0x02/0x03), a truncated `character_code` list, and a character
+  region object missing its fg/bg bytes are rejected.
+
 - DVB subtitles: pixel-data sub-block map-tables (ETSI EN 300 743
   §7.2.5.1) are now applied instead of skipped. A 2-bit or 4-bit
   pixel-code string carried inside a deeper region is remapped onto the

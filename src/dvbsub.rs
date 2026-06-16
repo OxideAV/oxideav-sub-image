@@ -28,8 +28,13 @@
 //!   the region CLUT through the active map-table (§7.2.5.1): the
 //!   `0x20`/`0x21`/`0x22` map-table sub-blocks redefine the table, which
 //!   otherwise defaults to the §10.4–10.6 contents. *Character*-coded
-//!   objects (2‐byte segments used for teletext-style streams) currently
-//!   return `Error::Unsupported`.
+//!   objects (`object_coding_method == 0x01`, §7.2.4) are parsed into
+//!   their `number_of_codes` × 16-bit `character_code` string, alongside
+//!   the region object's `foreground_pixel_code`/`background_pixel_code`
+//!   — the codes are surfaced for a caller holding the out-of-band font
+//!   agreement §5.4.6 requires (the stream alone carries no glyph
+//!   metrics), so they decode to an empty paint rather than fabricated
+//!   pixels.
 //! * **Encode:** [`make_encoder`] turns RGBA video frames into complete
 //!   display-set PES payloads (DDS + page composition + region
 //!   composition + CLUT definition + object data + end-of-display-set),
@@ -467,6 +472,18 @@ struct RegionObject {
     object_id: u16,
     x: u16,
     y: u16,
+    /// ETSI EN 300 743 §7.2.3 Table 6 `object_type`: 0 = basic bitmap,
+    /// 1 = basic character, 2 = composite character string.
+    #[allow(dead_code)]
+    object_type: u8,
+    /// `foreground_pixel_code` / `background_pixel_code` (§7.2.3): the
+    /// 8-bit-CLUT entries the encoder selected as the character object's
+    /// foreground and background colours. Present only for character
+    /// object types (`object_type` 1 or 2); `None` for bitmap objects.
+    #[allow(dead_code)]
+    foreground_pixel_code: Option<u8>,
+    #[allow(dead_code)]
+    background_pixel_code: Option<u8>,
 }
 
 fn parse_region_composition(body: &[u8]) -> Result<(u8, Region)> {
@@ -505,13 +522,32 @@ fn parse_region_composition(body: &[u8]) -> Result<(u8, Region)> {
         // body[cur+4] has reserved (4) + y_pos hi (4 bits)
         let y = u16::from_be_bytes([body[cur + 4] & 0x0F, body[cur + 5]]);
         cur += 6;
-        if obj_type == 0x01 || obj_type == 0x02 {
-            // foreground/background colour bytes follow — skip 2.
+        let (foreground_pixel_code, background_pixel_code) = if obj_type == 0x01 || obj_type == 0x02
+        {
+            // Character object types carry an 8-bit foreground_pixel_code
+            // and background_pixel_code (§7.2.3) — capture them so a caller
+            // rendering the character codes can colour the glyphs.
             if cur + 2 <= body.len() {
+                let fg = body[cur];
+                let bg = body[cur + 1];
                 cur += 2;
+                (Some(fg), Some(bg))
+            } else {
+                return Err(Error::invalid(
+                    "DVB region_composition: character object fg/bg codes truncated",
+                ));
             }
-        }
-        objects.push(RegionObject { object_id, x, y });
+        } else {
+            (None, None)
+        };
+        objects.push(RegionObject {
+            object_id,
+            x,
+            y,
+            object_type: obj_type,
+            foreground_pixel_code,
+            background_pixel_code,
+        });
     }
     Ok((
         region_id,
@@ -612,11 +648,13 @@ fn parse_clut_into(body: &[u8], cluts: &mut HashMap<u8, Clut>) -> Result<()> {
 
 #[derive(Clone, Debug)]
 struct Object {
-    /// Row-major indexed pixels. Width/height are determined by the
-    /// region that hosts the object.
-    rows: Vec<Vec<u8>>,
-    /// Source object-data type. We track this so we can refuse
-    /// character-coded objects at render time.
+    /// The object's coded content — either run-length pixel rows
+    /// (`object_coding_method == 0x00`) or a string of character codes
+    /// (`object_coding_method == 0x01`, ETSI EN 300 743 §7.2.4 / §5.4.6).
+    content: ObjectContent,
+    /// Source object-data type (`object_coding_method`): 0 = pixels,
+    /// 1 = character string. Surfaced so callers can tell which content
+    /// variant the object carried.
     #[allow(dead_code)]
     coding_method: u8,
     /// ETSI EN 300 743 §7.2.5 `non_modifying_colour_flag`: when set, CLUT
@@ -624,6 +662,36 @@ struct Object {
     /// index leave the underlying region background / object pixel
     /// unchanged ("transparent holes"), rather than painting CLUT entry 1.
     non_modifying_colour: bool,
+}
+
+/// The decoded payload of an `object_data_segment`. DVB subtitle objects
+/// are either pixel-coded bitmaps or strings of character-table indices
+/// (ETSI EN 300 743 §7.2.4, Table 8).
+#[derive(Clone, Debug)]
+enum ObjectContent {
+    /// `object_coding_method == 0x00`: row-major indexed pixels. Width /
+    /// height are determined by the region that hosts the object.
+    Pixels(Vec<Vec<u8>>),
+    /// `object_coding_method == 0x01`: a string of 16-bit `character_code`
+    /// values, each an index into the character table identified in the
+    /// subtitle_descriptor (§7.2.4). The subtitling stream alone carries
+    /// no glyph metrics — §5.4.6 states the stream "is not sufficient to
+    /// make such a character coded system work reliably" and defers the
+    /// font model to a local broadcaster/IRD agreement — so these codes
+    /// are surfaced for a caller holding that agreement rather than
+    /// rasterised into the canvas here.
+    Characters(#[allow(dead_code)] Vec<u16>),
+}
+
+impl Object {
+    /// Pixel rows for a pixel-coded object; empty for a character-coded
+    /// one (which carries no rasterised pixels in the stream).
+    fn rows(&self) -> &[Vec<u8>] {
+        match &self.content {
+            ObjectContent::Pixels(rows) => rows,
+            ObjectContent::Characters(_) => &[],
+        }
+    }
 }
 
 /// Active per-field map-table state used while decoding a pixel-data
@@ -701,11 +769,50 @@ fn parse_object_data(body: &[u8], region_depth: u8) -> Result<(u16, Object)> {
     // body[2] = version (4 bits) + coding_method (2 bits) + non_modifying_colour_flag (1) + reserved
     let coding_method = (body[2] >> 2) & 0x03;
     let non_modifying_colour = (body[2] >> 1) & 0x01 != 0;
-    if coding_method != 0 {
-        return Err(Error::unsupported(format!(
-            "DVB sub: coding_method {} (character/text objects)",
-            coding_method
-        )));
+    match coding_method {
+        0x00 => {} // pixel-coded — fall through to the run-length path below.
+        0x01 => {
+            // Character-coded object (ETSI EN 300 743 §7.2.4, Table 8):
+            //   number_of_codes      8 uimsbf
+            //   for each code: character_code  16 bslbf
+            // The 16-bit codes index the character table named in the
+            // subtitle_descriptor; §5.4.6 leaves glyph rendering to an
+            // out-of-band local agreement, so we parse and surface them
+            // rather than fabricate a font.
+            if body.len() < 4 {
+                return Err(Error::invalid(
+                    "DVB object_data: character-coded header truncated",
+                ));
+            }
+            let number_of_codes = body[3] as usize;
+            let codes_start = 4;
+            let codes_end = codes_start + number_of_codes * 2;
+            if codes_end > body.len() {
+                return Err(Error::invalid(
+                    "DVB object_data: character_code list truncated",
+                ));
+            }
+            let mut codes = Vec::with_capacity(number_of_codes);
+            let mut p = codes_start;
+            while p < codes_end {
+                codes.push(u16::from_be_bytes([body[p], body[p + 1]]));
+                p += 2;
+            }
+            return Ok((
+                object_id,
+                Object {
+                    content: ObjectContent::Characters(codes),
+                    coding_method,
+                    non_modifying_colour,
+                },
+            ));
+        }
+        other => {
+            // 0x02 / 0x03 are reserved in Table 8.
+            return Err(Error::invalid(format!(
+                "DVB object_data: reserved object_coding_method {other}"
+            )));
+        }
     }
     if body.len() < 7 {
         return Err(Error::invalid(
@@ -743,7 +850,7 @@ fn parse_object_data(body: &[u8], region_depth: u8) -> Result<(u16, Object)> {
     Ok((
         object_id,
         Object {
-            rows,
+            content: ObjectContent::Pixels(rows),
             coding_method,
             non_modifying_colour,
         },
@@ -2134,11 +2241,17 @@ impl Decoder for DvbSubDecoder {
                 let base_x = pr.x as usize + ro.x as usize;
                 let base_y = pr.y as usize + ro.y as usize;
                 let non_modifying = obj.non_modifying_colour;
+                // A character-coded object (§7.2.4 / §5.4.6) carries no
+                // rasterised pixels in the stream — `rows()` is empty, so
+                // the blit is a no-op. Its parsed `character_code` list and
+                // the region object's foreground/background CLUT indices
+                // are surfaced for a caller holding the out-of-band font
+                // agreement the spec requires for glyph rendering.
                 crate::composite::blit_indexed(
                     &mut canvas,
                     width,
                     height,
-                    &obj.rows,
+                    obj.rows(),
                     base_x,
                     base_y,
                     |px| {
@@ -2593,20 +2706,61 @@ mod tests {
         );
     }
 
+    /// ETSI EN 300 743 §7.2.4 (Table 8): a character-coded object
+    /// (`object_coding_method == 0x01`) is parsed into its
+    /// `number_of_codes` × 16-bit `character_code` string and surfaced,
+    /// not rejected. §5.4.6 leaves glyph rasterisation to an out-of-band
+    /// font agreement, so the decoder carries the codes without inventing
+    /// pixels.
     #[test]
-    fn rejects_character_coded_objects() {
-        // Object-data body: id=0, coding_method=1 (character string).
+    fn parses_character_coded_objects() {
+        // Object-data body: id=0x0042, coding_method=1 (character string),
+        // number_of_codes=3, codes = 0x0041 ('A'), 0x0042 ('B'), 0x2764.
         let mut body = Vec::new();
-        body.extend_from_slice(&0u16.to_be_bytes()); // object id
-        body.push(0b0000_0100); // coding_method = 1 in bits 2..3
-        body.extend_from_slice(&0u16.to_be_bytes());
-        body.extend_from_slice(&0u16.to_be_bytes());
+        body.extend_from_slice(&0x0042u16.to_be_bytes()); // object id
+        body.push(0b0000_0100); // version 0 | coding_method 1 (bits 2..3) | flags 0
+        body.push(3); // number_of_codes
+        body.extend_from_slice(&0x0041u16.to_be_bytes());
+        body.extend_from_slice(&0x0042u16.to_be_bytes());
+        body.extend_from_slice(&0x2764u16.to_be_bytes());
 
-        let err = parse_object_data(&body, 8).unwrap_err();
-        match err {
-            Error::Unsupported(_) => {}
-            other => panic!("expected Unsupported, got {other:?}"),
+        let (id, obj) = parse_object_data(&body, 8).unwrap();
+        assert_eq!(id, 0x0042);
+        assert_eq!(obj.coding_method, 1);
+        match &obj.content {
+            ObjectContent::Characters(codes) => {
+                assert_eq!(codes, &[0x0041, 0x0042, 0x2764]);
+            }
+            other => panic!("expected character codes, got {other:?}"),
         }
+        // A character object has no rasterised pixels in the stream, so the
+        // blit-facing row view is empty (renders as a no-op).
+        assert!(obj.rows().is_empty());
+    }
+
+    /// A character-coded object whose declared `number_of_codes` runs past
+    /// the segment body is rejected rather than silently truncated.
+    #[test]
+    fn rejects_truncated_character_code_list() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&0u16.to_be_bytes());
+        body.push(0b0000_0100); // coding_method = 1
+        body.push(4); // claims 4 codes...
+        body.extend_from_slice(&0x0041u16.to_be_bytes()); // ...but only 1 present
+        assert!(parse_object_data(&body, 8).is_err());
+
+        // Header itself too short to hold number_of_codes.
+        let short = vec![0u8, 0, 0b0000_0100];
+        assert!(parse_object_data(&short, 8).is_err());
+    }
+
+    /// Reserved `object_coding_method` values (0x02, 0x03) are invalid.
+    #[test]
+    fn rejects_reserved_object_coding_method() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&0u16.to_be_bytes());
+        body.push(0b0000_1000); // coding_method = 2 (reserved) in bits 2..3
+        assert!(parse_object_data(&body, 8).is_err());
     }
 
     /// ETSI EN 300 743 §7.2.5: `non_modifying_colour_flag` (bit 1 of the
@@ -2623,7 +2777,7 @@ mod tests {
         let (_, obj) = parse_object_data(&holed, 8).unwrap();
         assert!(obj.non_modifying_colour);
         // Same pixel rows either way; only the flag byte changes.
-        assert_eq!(obj.rows, parse_object_data(&plain, 8).unwrap().1.rows);
+        assert_eq!(obj.rows(), parse_object_data(&plain, 8).unwrap().1.rows());
     }
 
     /// CLUT body with two full-precision entries (ids 1 and 2).
@@ -3435,6 +3589,85 @@ mod tests {
         assert_eq!(region.fill_code_8, 5);
     }
 
+    /// ETSI EN 300 743 §7.2.3 (Table 6): the region object loop reads two
+    /// extra bytes (`foreground_pixel_code`, `background_pixel_code`) when
+    /// the `object_type` is a character type (1 or 2). The parser must
+    /// surface those colours and advance past them so a following object's
+    /// entry stays aligned.
+    #[test]
+    fn region_composition_decodes_character_object_fg_bg() {
+        let mut body = vec![
+            0x00, // region_id
+            0x00, // version=0, fill=0
+            0x00,
+            0x10, // width = 16
+            0x00,
+            0x10,     // height = 16
+            (3 << 2), // depth 8-bit
+            0x01,     // clut_id
+            0x00,     // 8-bit fill code
+            0x00,     // 4/2-bit codes + reserved
+        ];
+        // Object #1: character object (type 0x01) at (x=3, y=5) with
+        // foreground=0xAA, background=0xBB.
+        body.extend_from_slice(&0x1234u16.to_be_bytes()); // object_id
+                                                          // object_type 0b01 << 6 | provider 0b00 << 4 | x_hi (top 6 bits of 3 = 0).
+        body.push(0b0100_0000);
+        body.push(0x03); // x_lo = 3
+        body.push(0x00); // reserved (4) | y_hi (4) = 0
+        body.push(0x05); // y_lo = 5
+        body.push(0xAA); // foreground_pixel_code
+        body.push(0xBB); // background_pixel_code
+                         // Object #2: a plain bitmap object (type 0x00) — no fg/bg bytes.
+        body.extend_from_slice(&0x0001u16.to_be_bytes());
+        body.push(0x00); // type 0, x_hi 0
+        body.push(0x07); // x = 7
+        body.push(0x00);
+        body.push(0x09); // y = 9
+
+        let (_, region) = parse_region_composition(&body).unwrap();
+        assert_eq!(region.objects.len(), 2);
+        let c = &region.objects[0];
+        assert_eq!(c.object_id, 0x1234);
+        assert_eq!(c.object_type, 0x01);
+        assert_eq!(c.x, 3);
+        assert_eq!(c.y, 5);
+        assert_eq!(c.foreground_pixel_code, Some(0xAA));
+        assert_eq!(c.background_pixel_code, Some(0xBB));
+        let b = &region.objects[1];
+        assert_eq!(b.object_id, 0x0001);
+        assert_eq!(b.object_type, 0x00);
+        assert_eq!(b.x, 7);
+        assert_eq!(b.y, 9);
+        assert_eq!(b.foreground_pixel_code, None);
+        assert_eq!(b.background_pixel_code, None);
+    }
+
+    /// A character object whose fg/bg colour bytes are missing from the
+    /// segment body is rejected, not silently dropped.
+    #[test]
+    fn region_composition_rejects_truncated_character_object() {
+        let mut body = vec![
+            0x00,
+            0x00,
+            0x00,
+            0x10,
+            0x00,
+            0x10,
+            (3 << 2),
+            0x01,
+            0x00,
+            0x00,
+        ];
+        body.extend_from_slice(&0x1234u16.to_be_bytes());
+        body.push(0b0100_0000); // object_type 1
+        body.push(0x00);
+        body.push(0x00);
+        body.push(0x00);
+        // fg/bg bytes omitted.
+        assert!(parse_region_composition(&body).is_err());
+    }
+
     /// End-to-end: a region with `region_fill_flag` set pre-paints the
     /// region rectangle with the CLUT entry that the depth-appropriate
     /// pixel code selects, *before* any objects composite on top. The
@@ -4095,7 +4328,7 @@ mod tests {
                 let (id, obj) = parse_object_data(&body, depth_bits).unwrap();
                 assert_eq!(id, 0x0102);
                 assert_eq!(
-                    obj.rows,
+                    obj.rows(),
                     expected_rows(rows),
                     "depth {depth_bits} bitmap {rows:?} did not roundtrip"
                 );
@@ -4118,7 +4351,7 @@ mod tests {
         assert!(mapped.len() > plain.len(), "map table must add bytes");
         let (_, obj_plain) = parse_object_data(&plain, 2).unwrap();
         let (_, obj_mapped) = parse_object_data(&mapped, 2).unwrap();
-        assert_eq!(obj_plain.rows, obj_mapped.rows);
+        assert_eq!(obj_plain.rows(), obj_mapped.rows());
     }
 
     /// ETSI EN 300 743 §7.2.5.1: a 2-bit pixel string carried in an 8-bit
@@ -4133,10 +4366,10 @@ mod tests {
         let body = write_object_data(1, 0, 2, &rows, &[(DATA_TYPE_MAP_2_TO_8, &table)]).unwrap();
         // Region depth 8 → 2-to-8 remap applies.
         let (_, obj8) = parse_object_data(&body, 8).unwrap();
-        assert_eq!(obj8.rows, expected_rows(&[vec![0x10, 0x20, 0x30, 0x40]]));
+        assert_eq!(obj8.rows(), expected_rows(&[vec![0x10, 0x20, 0x30, 0x40]]));
         // Region depth 2 → codes used directly, table ignored.
         let (_, obj2) = parse_object_data(&body, 2).unwrap();
-        assert_eq!(obj2.rows, expected_rows(&[vec![0, 1, 2, 3]]));
+        assert_eq!(obj2.rows(), expected_rows(&[vec![0, 1, 2, 3]]));
     }
 
     /// With no explicit map-table, a 2-bit string in an 8-bit region uses
@@ -4146,7 +4379,7 @@ mod tests {
         let rows = vec![vec![0u8, 1, 2, 3]];
         let body = write_object_data(1, 0, 2, &rows, &[]).unwrap();
         let (_, obj) = parse_object_data(&body, 8).unwrap();
-        assert_eq!(obj.rows, expected_rows(&[vec![0x00, 0x77, 0x88, 0xFF]]));
+        assert_eq!(obj.rows(), expected_rows(&[vec![0x00, 0x77, 0x88, 0xFF]]));
     }
 
     /// A 4-bit string in an 8-bit region without an explicit table uses
@@ -4156,7 +4389,7 @@ mod tests {
         let rows = vec![vec![0u8, 1, 5, 15]];
         let body = write_object_data(1, 0, 4, &rows, &[]).unwrap();
         let (_, obj) = parse_object_data(&body, 8).unwrap();
-        assert_eq!(obj.rows, expected_rows(&[vec![0x00, 0x11, 0x55, 0xFF]]));
+        assert_eq!(obj.rows(), expected_rows(&[vec![0x00, 0x11, 0x55, 0xFF]]));
     }
 
     #[test]
@@ -4202,7 +4435,11 @@ mod tests {
                 .collect();
             let body = write_object_data(1, 0, depth_bits, &rows, &[]).unwrap();
             let (_, obj) = parse_object_data(&body, depth_bits).unwrap();
-            assert_eq!(obj.rows, expected_rows(&rows), "depth {depth_bits} {w}x{h}");
+            assert_eq!(
+                obj.rows(),
+                expected_rows(&rows),
+                "depth {depth_bits} {w}x{h}"
+            );
         }
     }
 

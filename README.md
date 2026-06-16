@@ -42,6 +42,24 @@ Pure-Rust bitmap-subtitle codecs and containers:
   remap, and the write side emits map-tables of the correct on-wire size
   (2/4/16 bytes for `0x20`/`0x21`/`0x22`).
 
+  Character-coded objects (`object_coding_method == 0x01`, §7.2.4) are
+  parsed rather than rejected: the object-data body's `number_of_codes`
+  byte is followed by that many 16-bit `character_code` values, each an
+  index into the character table named in the subtitle_descriptor, and
+  those are surfaced on the decoded object. The pairing region-object
+  loop reads the `object_type` (Table 6: bitmap / character / composite
+  character string) and, for the two character types, the
+  `foreground_pixel_code`/`background_pixel_code` 8-bit-CLUT entries the
+  encoder selected — advancing past them so a following object stays
+  aligned. Because §5.4.6 states the stream alone "is not sufficient to
+  make such a character coded system work reliably" and defers glyph
+  size/metrics/rasterisation to a local broadcaster/IRD font agreement,
+  the codes are carried for a caller holding that agreement and the
+  object paints nothing on the canvas, rather than the decoder
+  fabricating a font. Reserved coding methods (0x02/0x03), a truncated
+  `character_code` list, and a character region object missing its
+  fg/bg bytes are all rejected.
+
   The region composition
   segment's `region_fill_flag` is honoured: when set, the region
   rectangle is pre-painted with the depth-appropriate
