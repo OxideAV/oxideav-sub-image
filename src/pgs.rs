@@ -591,6 +591,13 @@ struct DisplaySet {
     /// Last-known canvas size (carried over between display-sets when
     /// a PCS-less reset arrives).
     last_canvas: Option<(u16, u16)>,
+    /// Composition objects from the most recently rendered non-palette-update
+    /// display-set in this epoch. A palette-only update (`palette_update_flag`
+    /// set, no fresh composition objects of its own) reuses these so the prior
+    /// graphics re-render against the newly-merged palette — the spec's
+    /// "the object graphics are reused from the previous display-set"
+    /// mechanism behind BD-ROM fade / colour-change effects.
+    retained_objects: Vec<CompositionObject>,
 }
 
 impl DisplaySet {
@@ -600,7 +607,35 @@ impl DisplaySet {
             SEG_PCS => {
                 let pcs = parse_pcs(&seg.body)?;
                 self.last_canvas = Some((pcs.width, pcs.height));
-                self.pcs = Some(pcs);
+                // An Epoch Start discards the prior epoch's object buffer,
+                // window geometry and palettes — everything needed is carried
+                // afresh in this display-set (spec: "new display"). Without
+                // this reset, stale objects/windows from a previous epoch
+                // would leak into the new one when the new set happens to omit
+                // a segment type.
+                if pcs.composition_state == COMP_STATE_EPOCH_START {
+                    self.objects.clear();
+                    self.object_fragments.clear();
+                    self.windows.clear();
+                    self.palettes.clear();
+                    self.retained_objects.clear();
+                }
+                // A palette-only update reuses the previous display-set's
+                // composition objects when it declares none of its own; the
+                // PDS carried alongside merges palette deltas, and the render
+                // re-runs the retained composition against the updated colours.
+                // A non-palette-update PCS (or one that brings its own
+                // composition objects) replaces the retained set.
+                if pcs.palette_update_flag && pcs.objects.is_empty() {
+                    let reused = self.retained_objects.clone();
+                    self.pcs = Some(PresentationComposition {
+                        objects: reused,
+                        ..pcs
+                    });
+                } else {
+                    self.retained_objects = pcs.objects.clone();
+                    self.pcs = Some(pcs);
+                }
             }
             SEG_WDS => {
                 // Parse the declared windows into a typed table keyed by
@@ -894,6 +929,7 @@ pub fn make_decoder(_params: &CodecParameters) -> Result<Box<dyn Decoder>> {
         codec_id: CodecId::new(PGS_CODEC_ID),
         pending: VecDeque::new(),
         eof: false,
+        epoch: DisplaySet::default(),
     }))
 }
 
@@ -901,6 +937,12 @@ struct PgsDecoder {
     codec_id: CodecId,
     pending: VecDeque<Frame>,
     eof: bool,
+    /// Persistent epoch state retained across packets. Each `.sup` packet
+    /// is one display-set; objects, windows and palettes live across the
+    /// whole epoch so a mid-epoch palette-only update (which carries a PDS
+    /// but reuses the prior set's objects/windows) re-renders correctly.
+    /// An Epoch Start PCS resets the retained buffers (see `DisplaySet::push`).
+    epoch: DisplaySet,
 }
 
 impl Decoder for PgsDecoder {
@@ -909,17 +951,31 @@ impl Decoder for PgsDecoder {
     }
 
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
-        let mut ds = DisplaySet::default();
+        // Parse this display-set's segments into the persistent epoch state.
+        // Object/window/palette buffers carry across packets within an epoch
+        // (reset by an Epoch Start PCS); this is what lets a palette-only
+        // update re-render the prior composition with new colours.
+        let ds = &mut self.epoch;
         let mut cur = 0;
+        let mut saw_pcs = false;
         while cur < packet.data.len() {
             let (seg, next) = read_segment(&packet.data, cur)?;
+            if seg.seg_type == SEG_PCS {
+                saw_pcs = true;
+            }
             ds.push(&seg)?;
             cur = next;
         }
-        let Some(pcs) = &ds.pcs else {
-            // No PCS → nothing to render for this packet. The container
+        if !saw_pcs {
+            // No PCS in this packet → nothing to render. The container
             // normally emits packets only when an END closes a set, so
-            // getting here means a malformed or empty display-set.
+            // getting here means a malformed or empty display-set. The
+            // retained epoch PCS (from an earlier packet) is deliberately
+            // not re-rendered: a display-set with no control segment of its
+            // own carries no new composition to present.
+            return Ok(());
+        }
+        let Some(pcs) = &ds.pcs else {
             return Ok(());
         };
         let width = pcs.width as u32;
@@ -956,11 +1012,14 @@ impl Decoder for PgsDecoder {
     }
 
     fn reset(&mut self) -> Result<()> {
-        // PGS is stateless across packets — each display set comes with
-        // its own PCS/PDS/ODS chain. Just drop the ready-frame queue and
-        // clear the eof latch.
+        // A seek lands the next packet on a random-access display-set
+        // (Acquisition Point / Epoch Start), which carries all the state it
+        // needs. Drop the ready-frame queue, clear the eof latch, and discard
+        // the retained epoch buffers so a mid-epoch palette-update doesn't
+        // reuse objects from before the seek.
         self.pending.clear();
         self.eof = false;
+        self.epoch = DisplaySet::default();
         Ok(())
     }
 }
@@ -3179,6 +3238,183 @@ mod tests {
         assert_eq!(
             px[3], 0x00,
             "missing palette_id must render through the transparent default"
+        );
+    }
+
+    // --- Mid-epoch palette-only updates --------------------------------
+
+    /// Build an Epoch-Start display-set: a 1×1 canvas painting object-id 1
+    /// (palette-index 1) at (0, 0), with palette slot 0 carrying one opaque
+    /// entry at index 1 with the given luma `y0`. The PCS references slot 0.
+    fn build_epoch_start_ds(y0: u8) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut pcs = Vec::new();
+        pcs.extend_from_slice(&1u16.to_be_bytes()); // canvas w
+        pcs.extend_from_slice(&1u16.to_be_bytes()); // canvas h
+        pcs.push(0); // frame rate
+        pcs.extend_from_slice(&1u16.to_be_bytes()); // composition_number
+        pcs.push(COMP_STATE_EPOCH_START);
+        pcs.push(0); // palette_update_flag clear
+        pcs.push(0); // palette_id 0
+        pcs.push(1); // one composition object
+        pcs.extend_from_slice(&1u16.to_be_bytes()); // object_id 1
+        pcs.push(0); // window_id 0
+        pcs.push(0); // flags
+        pcs.extend_from_slice(&0u16.to_be_bytes()); // x
+        pcs.extend_from_slice(&0u16.to_be_bytes()); // y
+        push_segment(&mut out, 0, SEG_PCS, &pcs);
+
+        let mut wds = Vec::new();
+        wds.push(1);
+        wds.push(0);
+        wds.extend_from_slice(&0u16.to_be_bytes());
+        wds.extend_from_slice(&0u16.to_be_bytes());
+        wds.extend_from_slice(&1u16.to_be_bytes());
+        wds.extend_from_slice(&1u16.to_be_bytes());
+        push_segment(&mut out, 0, SEG_WDS, &wds);
+
+        let pds = build_pds_body(0, 0, &[(1, y0, 0x80, 0x80, 0xFF)]);
+        push_segment(&mut out, 0, SEG_PDS, &pds);
+
+        let rle = encode_rle(&[1u8], 1, 1);
+        let mut ods = Vec::new();
+        ods.extend_from_slice(&1u16.to_be_bytes());
+        ods.push(0);
+        ods.push(0xC0);
+        let obj_data_len = (rle.len() + 4) as u32;
+        ods.push(((obj_data_len >> 16) & 0xFF) as u8);
+        ods.push(((obj_data_len >> 8) & 0xFF) as u8);
+        ods.push((obj_data_len & 0xFF) as u8);
+        ods.extend_from_slice(&1u16.to_be_bytes());
+        ods.extend_from_slice(&1u16.to_be_bytes());
+        ods.extend_from_slice(&rle);
+        push_segment(&mut out, 0, SEG_ODS, &ods);
+
+        push_segment(&mut out, 0, SEG_END, &[]);
+        out
+    }
+
+    /// Build a palette-only update display-set: a Normal-Case PCS with the
+    /// `palette_update_flag` set and ZERO composition objects (and no WDS /
+    /// ODS), carrying a single PDS that rewrites slot 0's index-1 entry to
+    /// luma `y1`. A correct decoder reuses the prior epoch's object/window
+    /// graphics and re-renders them against the new palette.
+    fn build_palette_update_ds(y1: u8) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut pcs = Vec::new();
+        pcs.extend_from_slice(&1u16.to_be_bytes()); // canvas w
+        pcs.extend_from_slice(&1u16.to_be_bytes()); // canvas h
+        pcs.push(0); // frame rate
+        pcs.extend_from_slice(&2u16.to_be_bytes()); // composition_number
+        pcs.push(COMP_STATE_NORMAL);
+        pcs.push(0x80); // palette_update_flag SET
+        pcs.push(0); // palette_id 0
+        pcs.push(0); // ZERO composition objects
+        push_segment(&mut out, 1000, SEG_PCS, &pcs);
+
+        let pds = build_pds_body(0, 1, &[(1, y1, 0x80, 0x80, 0xFF)]);
+        push_segment(&mut out, 1000, SEG_PDS, &pds);
+
+        push_segment(&mut out, 1000, SEG_END, &[]);
+        out
+    }
+
+    /// Decode a concatenated multi-packet `.sup` stream and return the
+    /// (0, 0) RGBA pixel of every emitted frame, in order.
+    fn decode_all_first_pixels(stream: Vec<u8>) -> Vec<[u8; 4]> {
+        let resolver = oxideav_core::NullCodecResolver;
+        let input: Box<dyn ReadSeek> = Box::new(std::io::Cursor::new(stream));
+        let mut dmx = open_pgs(input, &resolver).unwrap();
+        let params = dmx.streams()[0].params.clone();
+        let mut dec = make_decoder(&params).unwrap();
+        let mut out = Vec::new();
+        while let Ok(pkt) = dmx.next_packet() {
+            dec.send_packet(&pkt).unwrap();
+            while let Ok(Frame::Video(vf)) = dec.receive_frame() {
+                let d = &vf.planes[0].data;
+                out.push([d[0], d[1], d[2], d[3]]);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn palette_only_update_rerenders_prior_objects_with_new_colour() {
+        // Epoch Start paints object 1 with a dark (low-luma) palette entry;
+        // the following palette-only update (no ODS/WDS, palette_update_flag
+        // set, zero composition objects) bumps that entry to a bright luma.
+        // The second frame must re-paint the SAME object through the new
+        // palette — proving the decoder retains epoch object/window state
+        // across packets rather than rendering a blank canvas.
+        let mut stream = build_epoch_start_ds(0x10);
+        stream.extend_from_slice(&build_palette_update_ds(0xF0));
+        let pixels = decode_all_first_pixels(stream);
+        assert_eq!(pixels.len(), 2, "two display-sets → two frames");
+        assert_eq!(pixels[0][3], 0xFF, "frame 0 object opaque");
+        assert_eq!(
+            pixels[1][3], 0xFF,
+            "palette update must re-paint the retained object opaque, not clear it"
+        );
+        // The luma rewrite (0x10 → 0xF0) must brighten the rendered grey.
+        assert!(
+            pixels[1][0] > pixels[0][0],
+            "palette-only update must brighten the reused object: {:?} → {:?}",
+            pixels[0],
+            pixels[1]
+        );
+    }
+
+    #[test]
+    fn epoch_start_discards_prior_epoch_objects() {
+        // Two independent epochs, each an Epoch Start. The second epoch's
+        // object buffer must NOT leak into / from the first — its render
+        // depends only on its own segments. We assert each epoch renders its
+        // own luma. (Regression guard for the epoch-reset path that backs
+        // the palette-update retention.)
+        let mut stream = build_epoch_start_ds(0x20);
+        stream.extend_from_slice(&build_epoch_start_ds(0xD0));
+        let pixels = decode_all_first_pixels(stream);
+        assert_eq!(pixels.len(), 2);
+        assert_eq!(pixels[0][3], 0xFF);
+        assert_eq!(pixels[1][3], 0xFF);
+        assert!(
+            pixels[1][0] > pixels[0][0],
+            "each epoch renders its own palette: {:?} vs {:?}",
+            pixels[0],
+            pixels[1]
+        );
+    }
+
+    #[test]
+    fn reset_clears_retained_epoch_so_palette_update_paints_nothing() {
+        // After a seek (reset), a stray palette-only update that arrives
+        // before any Epoch Start has no retained objects to reuse, so it
+        // renders a transparent canvas rather than resurrecting pre-seek
+        // graphics.
+        let resolver = oxideav_core::NullCodecResolver;
+        let mut stream = build_epoch_start_ds(0x10);
+        stream.extend_from_slice(&build_palette_update_ds(0xF0));
+        let input: Box<dyn ReadSeek> = Box::new(std::io::Cursor::new(stream));
+        let mut dmx = open_pgs(input, &resolver).unwrap();
+        let params = dmx.streams()[0].params.clone();
+        let mut dec = make_decoder(&params).unwrap();
+
+        // Feed the epoch-start packet, then reset (simulating a seek) BEFORE
+        // the palette update. The palette update should now paint nothing.
+        let p0 = dmx.next_packet().unwrap();
+        dec.send_packet(&p0).unwrap();
+        let _ = dec.receive_frame().unwrap();
+        dec.reset().unwrap();
+        let p1 = dmx.next_packet().unwrap();
+        dec.send_packet(&p1).unwrap();
+        let frame = match dec.receive_frame().unwrap() {
+            Frame::Video(vf) => vf,
+            other => panic!("expected video, got {other:?}"),
+        };
+        let d = &frame.planes[0].data;
+        assert_eq!(
+            d[3], 0x00,
+            "post-reset palette update has no retained object to repaint"
         );
     }
 }

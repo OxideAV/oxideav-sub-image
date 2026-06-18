@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- PGS: mid-epoch **palette-only updates** are now applied. The decoder
+  retains object / window / palette state across display-sets within an
+  epoch, so a Normal-Case PCS with `palette_update_flag = 0x80`
+  (segment-syntax §PCS, `0x80` = "palette-only update") re-renders the
+  prior display-set's composition against the freshly-merged palette
+  instead of painting a blank canvas — the mechanism behind BD-ROM fade
+  and colour-change effects. A palette-update PCS that declares zero
+  composition objects of its own reuses the previous set's objects; one
+  that re-lists them uses those (both reference the retained ODS object
+  buffer). An `Epoch Start` PCS resets the retained objects, windows and
+  palettes (a new epoch carries everything afresh); `reset()` (seek)
+  likewise discards the retained epoch so a post-seek palette update has
+  no stale graphics to resurrect. A packet that carries no PCS of its own
+  still emits nothing.
+
 - DVB subtitles: character-coded objects (`object_coding_method == 0x01`,
   ETSI EN 300 743 §7.2.4) are now parsed instead of returning
   `Error::Unsupported`. The object-data body's `number_of_codes` byte is

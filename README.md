@@ -176,6 +176,22 @@ standalone. The parsed `composition_state`, `palette_update_flag`, and
 constants and the `is_random_access(state)` helper let downstream
 consumers act on the classification without inspecting raw bytes.
 
+Mid-epoch **palette-only updates** are applied rather than rendered blank.
+The decoder retains object / window / palette state across display-sets
+inside an epoch, so a Normal-Case PCS whose `palette_update_flag` byte is
+`0x80` ("palette-only update") re-renders the prior set's composition
+against the freshly-merged palette — the mechanism a BD-ROM authoring tool
+uses for fade-in / fade-out and colour-change effects, where a single
+object is painted once and then re-coloured over successive display-sets
+without re-sending the bitmap. Such a PCS reuses the previous set's
+composition objects when it declares none of its own (and uses its own
+when it re-lists them); either way the retained ODS object buffer supplies
+the graphics. An `Epoch Start` PCS resets the retained objects, windows and
+palettes so a new epoch starts clean, and a decoder `reset()` (issued on
+seek) discards the retained epoch so a post-seek palette update can't
+resurrect pre-seek graphics. A packet carrying no control segment of its
+own still presents nothing.
+
 The Window Definition Segment is parsed into a typed
 `Vec<WindowDefinition>` (exposed via the `parse_wds` helper) and the
 decoder retains the table keyed by `window_id`. Each composition object
