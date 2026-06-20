@@ -27,6 +27,21 @@ Pure-Rust bitmap-subtitle codecs and containers:
   including max-run / chunked-over-max / boundary-length edge cases
   for each run-length form.
 
+  On the decode side, the decoder implements the **epoch state machine**
+  (§5.1 / §5.2 / §7.2.2): the composition buffer (page composition, region
+  compositions, CLUT definitions) and the pixel buffer (object data)
+  persist across PES packets within an epoch rather than being rebuilt per
+  packet. The page-composition `page_state` (Table 3) drives it — "mode
+  change" discards all retained state before applying the display set (a
+  new epoch), while "acquisition point" and "normal case" accumulate onto
+  it. This is what makes a real broadcast stream render: CLUTs / regions /
+  objects are sent once at mode-change and subsequent "normal case"
+  display sets re-send only the deltas (often just the page composition,
+  or a CLUT to recolour a retained object), which a stateless decoder
+  would paint blank. `reset()` (seek) ends the epoch and drops the
+  retained buffers; the encoder flags every self-contained set it emits as
+  "mode change" so an IRD can acquire on any frame.
+
   On the decode side, pixel-data sub-block **map-tables** (§7.2.5.1) are
   applied rather than skipped: a 2-bit or 4-bit pixel-code string carried
   inside a deeper region is remapped onto the region CLUT entry numbers

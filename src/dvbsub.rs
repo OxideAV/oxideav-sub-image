@@ -51,6 +51,20 @@
 //!   an earlier region already wrote (Porter–Duff source-over), so a
 //!   later region with a partially-transparent CLUT entry shows the
 //!   region beneath it through rather than discarding it.
+//! * **Epoch state machine (ETSI EN 300 743 §5.1 / §5.2 / §7.2.2).** The
+//!   decoder retains the composition buffer (page composition, region
+//!   compositions, CLUT definitions) and pixel buffer (object data) across
+//!   PES packets within an epoch. A page-composition segment's
+//!   `page_state` drives it (Table 3): "mode change" begins a new epoch
+//!   and discards all retained state before the display set is applied;
+//!   "acquisition point" and "normal case" accumulate onto it. A real
+//!   broadcast stream sends the CLUTs / regions / objects once at
+//!   mode-change and then transmits "normal case" deltas that re-send only
+//!   what changed (often just the page composition); without epoch
+//!   retention those delta packets would render blank. A decoder `reset`
+//!   (seek / discontinuity) ends the epoch and drops the retained buffers.
+//!   The encoder marks every self-contained display set it emits as
+//!   "mode change" so an IRD can acquire on any frame.
 //! * Page timeouts are accepted but not enforced here — caller uses the
 //!   accompanying packet duration.
 //! * `region_fill_flag` (ETSI EN 300 743 §7.2.3) is honoured: when set,
@@ -82,6 +96,21 @@ pub const SEG_DISPLAY_DEFINITION: u8 = 0x14;
 /// shift values.
 pub const SEG_DISPARITY_SIGNALLING: u8 = 0x15;
 pub const SEG_END_OF_DISPLAY_SET: u8 = 0x80;
+
+// --- page_state values (ETSI EN 300 743 §7.2.2 Table 3) ----------------
+
+/// `page_state` "normal case" (`0b00`) — page update: the display set
+/// carries only the subtitle elements changed from the previous page
+/// instance, relying on retained epoch state for the rest.
+pub const PAGE_STATE_NORMAL_CASE: u8 = 0b00;
+/// `page_state` "acquisition point" (`0b01`) — page refresh: a complete
+/// page description with unchanged memory allocation, for rapid service
+/// acquisition.
+pub const PAGE_STATE_ACQUISITION_POINT: u8 = 0b01;
+/// `page_state` "mode change" (`0b10`) — new page: begins a new epoch,
+/// discarding all prior pixel-buffer / composition-buffer allocations
+/// (§5.2) before this display set is applied.
+pub const PAGE_STATE_MODE_CHANGE: u8 = 0b10;
 
 // --- raw segments ------------------------------------------------------
 
@@ -420,11 +449,71 @@ struct PageRegion {
     y: u16,
 }
 
-fn parse_page_composition(body: &[u8]) -> Result<Vec<PageRegion>> {
+/// ETSI EN 300 743 §7.2.2 Table 3 `page_state` — the status of the page
+/// instance described by a page-composition segment, which drives the
+/// decoder's epoch state machine (§5.1 / §5.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PageState {
+    /// `0b00` — "normal case" / page update. The display set carries only
+    /// the subtitle elements that changed from the previous page instance;
+    /// the region/CLUT/object set may be incomplete and the decoder must
+    /// keep its retained epoch state for everything not re-sent.
+    NormalCase,
+    /// `0b01` — "acquisition point" / page refresh. A complete description
+    /// of the page is present, but (unlike mode change) the memory
+    /// allocation does not change; an already-acquired decoder may treat it
+    /// as a normal update, while an acquiring decoder treats it as a fresh
+    /// epoch.
+    AcquisitionPoint,
+    /// `0b10` — "mode change" / new page. The display set begins a new
+    /// epoch: all previous pixel-buffer and composition-buffer allocations
+    /// are discarded (§5.2) before this set's segments are applied.
+    ModeChange,
+    /// `0b11` — reserved for future use; surfaced verbatim so a caller can
+    /// see an out-of-spec value rather than having it silently coerced.
+    Reserved,
+}
+
+impl PageState {
+    fn from_bits(bits: u8) -> Self {
+        match bits & 0x03 {
+            0b00 => PageState::NormalCase,
+            0b01 => PageState::AcquisitionPoint,
+            0b10 => PageState::ModeChange,
+            _ => PageState::Reserved,
+        }
+    }
+}
+
+/// A decoded page-composition segment (ETSI EN 300 743 §7.2.2): the
+/// page-level timeout, version, epoch state, and the ordered list of
+/// regions active in this page instance with their display addresses.
+#[derive(Clone, Debug)]
+struct PageComposition {
+    /// `page_time_out` in seconds (§7.2.2). Informational here — the
+    /// caller enforces erase timing via the packet duration.
+    #[allow(dead_code)]
+    time_out: u8,
+    /// `page_version_number` (modulo 16). Bumped whenever the page
+    /// composition's contents change.
+    #[allow(dead_code)]
+    version: u8,
+    /// `page_state` (§7.2.2 Table 3) — drives the epoch state machine.
+    state: PageState,
+    /// Active regions, in page-composition order (which the spec mandates
+    /// to be ascending `region_vertical_address`).
+    regions: Vec<PageRegion>,
+}
+
+fn parse_page_composition(body: &[u8]) -> Result<PageComposition> {
     if body.len() < 2 {
         return Err(Error::invalid("DVB page_composition: body too short"));
     }
-    // body[0] = page_time_out (s), body[1] = version/state
+    // body[0] = page_time_out (s)
+    // body[1] = page_version_number (4) | page_state (2) | reserved (2)
+    let time_out = body[0];
+    let version = body[1] >> 4;
+    let state = PageState::from_bits((body[1] >> 2) & 0x03);
     let mut cur = 2;
     let mut regions = Vec::new();
     while cur + 6 <= body.len() {
@@ -435,7 +524,12 @@ fn parse_page_composition(body: &[u8]) -> Result<Vec<PageRegion>> {
         cur += 6;
         regions.push(PageRegion { region_id, x, y });
     }
-    Ok(regions)
+    Ok(PageComposition {
+        time_out,
+        version,
+        state,
+        regions,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -1868,7 +1962,14 @@ impl Encoder for DvbSubEncoder {
                     &mut payload,
                     SEG_PAGE_COMPOSITION,
                     ENCODER_PAGE_ID,
-                    &write_page_composition(0, version, 0, &[]),
+                    // page_state = "mode change" (0b10): every encoded
+                    // display set is fully self-contained (it re-sends DDS +
+                    // page + region + CLUT + objects), so it begins a fresh
+                    // epoch. Marking it "mode change" lets a real DVB IRD
+                    // acquire / refresh the service on any frame and tells a
+                    // stateful decoder to discard prior epoch state
+                    // (§7.2.2 Table 3 / §5.2).
+                    &write_page_composition(0, version, PAGE_STATE_MODE_CHANGE, &[]),
                 )?;
             }
             Some((bx, by, bw, bh)) => {
@@ -1884,7 +1985,13 @@ impl Encoder for DvbSubEncoder {
                     &mut payload,
                     SEG_PAGE_COMPOSITION,
                     ENCODER_PAGE_ID,
-                    &write_page_composition(0, version, 0, &[(0, bx as u16, by as u16)]),
+                    // "mode change" — see the erase branch above.
+                    &write_page_composition(
+                        0,
+                        version,
+                        PAGE_STATE_MODE_CHANGE,
+                        &[(0, bx as u16, by as u16)],
+                    ),
                 )?;
                 write_segment(
                     &mut payload,
@@ -2096,13 +2203,46 @@ pub fn make_decoder(_params: &CodecParameters) -> Result<Box<dyn Decoder>> {
         codec_id: CodecId::new(DVBSUB_CODEC_ID),
         pending: VecDeque::new(),
         eof: false,
+        epoch: EpochState::default(),
     }))
+}
+
+/// Persistent subtitle-decoder state carried across PES packets within a
+/// DVB subtitling *epoch* (ETSI EN 300 743 §5.1 / §5.2). The composition
+/// buffer (page composition, region compositions, CLUT definitions) and
+/// the pixel buffer (object data) accumulate across display sets and are
+/// only discarded when a page-composition segment with page state
+/// "mode change" arrives. A "normal case" display set re-sends only the
+/// elements that changed, relying on this retained state for everything
+/// else; without it those packets would render blank.
+#[derive(Default)]
+struct EpochState {
+    /// The most recent Display Definition Segment, retained so a normal-
+    /// case display set that omits the DDS keeps the epoch's raster size.
+    /// `None` until the first DDS (or implicitly the §6 default raster).
+    dds: Option<DisplayDefinition>,
+    /// Region compositions keyed by `region_id` (§7.2.3 composition
+    /// buffer). Persist for the epoch; a re-sent region replaces its slot.
+    regions: HashMap<u8, Region>,
+    /// CLUT definitions keyed by `clut_id` (§7.2.4). `parse_clut_into`
+    /// merges entry deltas into the existing slot, matching the spec's
+    /// incremental-update model.
+    cluts: HashMap<u8, Clut>,
+    /// Raw object-data segment bodies keyed by `object_id` (§7.2.5),
+    /// decoded lazily at render time once the referencing region's depth
+    /// is known. Persist for the epoch (the pixel buffer).
+    object_bodies: HashMap<u16, Vec<u8>>,
+    /// The active page composition — the list of displayed regions and
+    /// their addresses. Replaced wholesale by every page-composition
+    /// segment (a page instance is fully described by its region list).
+    page: Vec<PageRegion>,
 }
 
 struct DvbSubDecoder {
     codec_id: CodecId,
     pending: VecDeque<Frame>,
     eof: bool,
+    epoch: EpochState,
 }
 
 impl Decoder for DvbSubDecoder {
@@ -2112,15 +2252,63 @@ impl Decoder for DvbSubDecoder {
 
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
         let payload = strip_pes_prefix(&packet.data);
-        let mut dds = DisplayDefinition::default();
-        let mut regions: HashMap<u8, Region> = HashMap::new();
-        // Object-data segment bodies, decoded lazily per referencing
-        // region: the map-table remap of a low-depth pixel string depends
-        // on the region's colour depth (§7.2.5.1 / Figure 8), which is not
-        // known until a region references the object.
-        let mut object_bodies: HashMap<u16, Vec<u8>> = HashMap::new();
-        let mut cluts: HashMap<u8, Clut> = HashMap::new();
-        let mut page: Vec<PageRegion> = Vec::new();
+
+        // First pass: locate this display set's page-composition segment (if
+        // any) to learn its page_state *before* applying any of the set's
+        // segments. ETSI EN 300 743 §5.2: a page-composition segment with
+        // page state "mode change" destroys all previous pixel-buffer and
+        // composition-buffer allocations — i.e. the decoder state is reset —
+        // and that reset logically precedes the rest of the display set even
+        // though the PCS is normally the first segment carried. Scanning for
+        // it up front makes the reset robust to segment ordering.
+        //
+        // §5.1.1: an "acquisition point" carries a complete page description
+        // too; a decoder that is *acquiring* the service treats it like a
+        // mode change. We mark the epoch acquired at either boundary so a
+        // subsequent "normal case" delta has a base to merge onto.
+        let mut page_state: Option<PageState> = None;
+        {
+            let mut cur = 0;
+            while cur < payload.len() {
+                let (seg, next) = match read_segment(payload, cur) {
+                    Ok(x) => x,
+                    Err(Error::NeedMore) => break,
+                    Err(e) => return Err(e),
+                };
+                if seg.seg_type == SEG_PAGE_COMPOSITION {
+                    page_state = Some(parse_page_composition(&seg.body)?.state);
+                    break;
+                }
+                if seg.seg_type == SEG_END_OF_DISPLAY_SET {
+                    break;
+                }
+                cur = next;
+            }
+        }
+
+        // A "mode change" page state begins a new epoch: discard the retained
+        // composition and pixel buffers before applying this set's segments.
+        // An "acquisition point" carries a complete description but does not
+        // change the memory allocation (§5.1.1), so we keep accumulating into
+        // the existing buffers rather than wiping them — the complete set of
+        // segments it carries will overwrite each slot anyway.
+        if page_state == Some(PageState::ModeChange) {
+            self.epoch.regions.clear();
+            self.epoch.cluts.clear();
+            self.epoch.object_bodies.clear();
+            self.epoch.page.clear();
+            self.epoch.dds = None;
+        }
+        // An "acquisition point" page (§5.1.1) carries a complete page
+        // description for service acquisition; we accumulate its segments
+        // into the existing buffers (which it fully overwrites) just like any
+        // other display set, so it needs no separate handling beyond the
+        // merge below. Only "mode change" wipes the retained state.
+
+        // Second pass: merge this display set's segments into the retained
+        // epoch state. Region / CLUT / object slots that this set does not
+        // re-send keep their previously-decoded contents (the "normal case"
+        // delta model, §7.2.2 Table 3).
         let mut cur = 0;
         while cur < payload.len() {
             let (seg, next) = match read_segment(payload, cur) {
@@ -2130,17 +2318,18 @@ impl Decoder for DvbSubDecoder {
             };
             match seg.seg_type {
                 SEG_DISPLAY_DEFINITION => {
-                    dds = parse_display_definition(&seg.body)?;
+                    self.epoch.dds = Some(parse_display_definition(&seg.body)?);
                 }
                 SEG_PAGE_COMPOSITION => {
-                    page = parse_page_composition(&seg.body)?;
+                    let pc = parse_page_composition(&seg.body)?;
+                    self.epoch.page = pc.regions;
                 }
                 SEG_REGION_COMPOSITION => {
                     let (id, region) = parse_region_composition(&seg.body)?;
-                    regions.insert(id, region);
+                    self.epoch.regions.insert(id, region);
                 }
                 SEG_CLUT_DEFINITION => {
-                    parse_clut_into(&seg.body, &mut cluts)?;
+                    parse_clut_into(&seg.body, &mut self.epoch.cluts)?;
                 }
                 SEG_OBJECT_DATA => {
                     // Validate framing now (header + coding method) but defer
@@ -2150,7 +2339,7 @@ impl Decoder for DvbSubDecoder {
                     parse_object_data(&seg.body, 2)?;
                     if seg.body.len() >= 2 {
                         let id = u16::from_be_bytes([seg.body[0], seg.body[1]]);
-                        object_bodies.insert(id, seg.body.clone());
+                        self.epoch.object_bodies.insert(id, seg.body.clone());
                     }
                 }
                 SEG_DISPARITY_SIGNALLING => {
@@ -2170,6 +2359,15 @@ impl Decoder for DvbSubDecoder {
             }
             cur = next;
         }
+
+        // Render from the accumulated epoch state. A DDS is optional in any
+        // single display set; when none has ever been seen, fall back to the
+        // §6 default raster (720×576 PAL).
+        let dds = self.epoch.dds.clone().unwrap_or_default();
+        let regions = &self.epoch.regions;
+        let cluts = &self.epoch.cluts;
+        let object_bodies = &self.epoch.object_bodies;
+        let page = &self.epoch.page;
         let width = dds.width as usize;
         let height = dds.height as usize;
         if width == 0 || height == 0 {
@@ -2189,7 +2387,7 @@ impl Decoder for DvbSubDecoder {
         // blit runs through the shared alpha-aware compositor. Index 0 is
         // the conventional DVB transparent background, mapped to alpha 0
         // so it's skipped.
-        for pr in &page {
+        for pr in page {
             let Some(region) = regions.get(&pr.region_id) else {
                 continue;
             };
@@ -2328,9 +2526,12 @@ impl Decoder for DvbSubDecoder {
     }
 
     fn reset(&mut self) -> Result<()> {
-        // DVB subtitles rebuild the region/object/clut state from
-        // scratch for each PES payload, so there's no per-stream state
-        // to clear. Drop the ready-frame queue and the eof latch.
+        // A reset (seek / stream discontinuity) ends the current epoch:
+        // drop the retained composition + pixel buffers so the next display
+        // set is interpreted fresh (it will normally be a "mode change" /
+        // "acquisition point" that re-introduces everything anyway). Also
+        // drop the ready-frame queue and the eof latch.
+        self.epoch = EpochState::default();
         self.pending.clear();
         self.eof = false;
         Ok(())
@@ -2553,6 +2754,295 @@ mod tests {
         vec![
             clut_id, 0, /* entry_id */ 1, /* flags: full-precision */ 0x01, y, cr, cb, t,
         ]
+    }
+
+    /// A page-composition body with the given `page_state` referencing one
+    /// region at the page origin (0,0). The reserved low two bits match the
+    /// `write_page_composition` encoder convention (`| 0x03`).
+    fn dvb_page_one_region(page_state: u8, region_id: u8) -> Vec<u8> {
+        vec![
+            0,                                 // page_time_out
+            ((page_state & 0x03) << 2) | 0x03, // version 0 | state | reserved
+            region_id,                         // region_id
+            0xFF,                              // reserved
+            0x00,
+            0x00, // x
+            0x00,
+            0x00, // y
+        ]
+    }
+
+    /// Decode one PES payload through `dec` and return the RGBA canvas.
+    fn dvb_decode(dec: &mut Box<dyn Decoder>, pes: Vec<u8>) -> VideoFrame {
+        let pkt = Packet::new(0, TimeBase::new(1, 90_000), pes).with_pts(0);
+        dec.send_packet(&pkt).unwrap();
+        let Frame::Video(v) = dec.receive_frame().unwrap() else {
+            panic!("expected video frame");
+        };
+        v
+    }
+
+    /// 1×1-canvas DDS body (encoded as width-1 / height-1).
+    fn dvb_dds_1x1() -> Vec<u8> {
+        let mut dds = Vec::new();
+        dds.push(0);
+        dds.extend_from_slice(&0u16.to_be_bytes()); // width  - 1 → 1
+        dds.extend_from_slice(&0u16.to_be_bytes()); // height - 1 → 1
+        dds
+    }
+
+    #[test]
+    fn normal_case_page_reuses_clut_and_object_from_prior_epoch() {
+        // ETSI EN 300 743 §5.2 / §7.2.2: in a real broadcast the CLUT,
+        // region geometry and object pixels are sent once at the start of an
+        // epoch ("mode change"), and subsequent "normal case" display sets
+        // re-send only what changed — often just the page composition. A
+        // stateful decoder must retain the prior epoch's composition + pixel
+        // buffers so those delta packets still render. Here packet 1 is a
+        // complete mode-change epoch painting CLUT-entry-1 white; packet 2
+        // is a normal-case page that carries *only* the page composition
+        // (no DDS / region / CLUT / object), yet must still render white.
+        let params = CodecParameters::video(CodecId::new(DVBSUB_CODEC_ID));
+        let mut dec = make_decoder(&params).unwrap();
+
+        // Packet 1 — mode change: full epoch.
+        let mut p1 = vec![0x20, 0x00];
+        dvb_segment(&mut p1, SEG_DISPLAY_DEFINITION, &dvb_dds_1x1());
+        dvb_segment(
+            &mut p1,
+            SEG_PAGE_COMPOSITION,
+            &dvb_page_one_region(PAGE_STATE_MODE_CHANGE, 0),
+        );
+        dvb_segment(
+            &mut p1,
+            SEG_REGION_COMPOSITION,
+            &dvb_region_8bit(0, 0, 1, 1, 100),
+        );
+        dvb_segment(
+            &mut p1,
+            SEG_CLUT_DEFINITION,
+            &dvb_clut_entry1(0, 255, 128, 128, 0), // opaque white
+        );
+        dvb_segment(&mut p1, SEG_OBJECT_DATA, &dvb_object_8bit(100, &[1]));
+        dvb_segment(&mut p1, SEG_END_OF_DISPLAY_SET, &[]);
+        let v1 = dvb_decode(&mut dec, p1);
+        let a = &v1.planes[0].data[0..4];
+        assert!(
+            a[0] > 200 && a[1] > 200 && a[2] > 200 && a[3] == 255,
+            "epoch-start frame should be opaque white, got {a:?}"
+        );
+
+        // Packet 2 — normal case: page composition ONLY. Region 0, CLUT 0
+        // and object 100 are not re-sent. With epoch retention the canvas
+        // must still paint the retained white object.
+        let mut p2 = vec![0x20, 0x00];
+        dvb_segment(
+            &mut p2,
+            SEG_PAGE_COMPOSITION,
+            &dvb_page_one_region(PAGE_STATE_NORMAL_CASE, 0),
+        );
+        dvb_segment(&mut p2, SEG_END_OF_DISPLAY_SET, &[]);
+        let v2 = dvb_decode(&mut dec, p2);
+        let b = &v2.planes[0].data[0..4];
+        assert_eq!(
+            a, b,
+            "normal-case delta must re-render the retained epoch state"
+        );
+    }
+
+    #[test]
+    fn normal_case_clut_update_recolours_retained_object() {
+        // A "normal case" display set may re-send only a CLUT to recolour
+        // the retained object (§5.2: "Subsequent segments can modify the
+        // values held in the pixel buffer and composition buffer"). Epoch 1
+        // paints white via CLUT entry 1; packet 2 (normal case) re-sends the
+        // page + a CLUT redefining entry 1 to red, without re-sending the
+        // object — the retained object must now render red.
+        let params = CodecParameters::video(CodecId::new(DVBSUB_CODEC_ID));
+        let mut dec = make_decoder(&params).unwrap();
+
+        let mut p1 = vec![0x20, 0x00];
+        dvb_segment(&mut p1, SEG_DISPLAY_DEFINITION, &dvb_dds_1x1());
+        dvb_segment(
+            &mut p1,
+            SEG_PAGE_COMPOSITION,
+            &dvb_page_one_region(PAGE_STATE_MODE_CHANGE, 0),
+        );
+        dvb_segment(
+            &mut p1,
+            SEG_REGION_COMPOSITION,
+            &dvb_region_8bit(0, 0, 1, 1, 100),
+        );
+        dvb_segment(
+            &mut p1,
+            SEG_CLUT_DEFINITION,
+            &dvb_clut_entry1(0, 255, 128, 128, 0),
+        );
+        dvb_segment(&mut p1, SEG_OBJECT_DATA, &dvb_object_8bit(100, &[1]));
+        dvb_segment(&mut p1, SEG_END_OF_DISPLAY_SET, &[]);
+        let v1 = dvb_decode(&mut dec, p1);
+        let white = &v1.planes[0].data[0..4];
+        assert!(white[0] > 200 && white[1] > 200 && white[2] > 200);
+
+        // Packet 2: page + CLUT-only delta, entry 1 → red.
+        let mut p2 = vec![0x20, 0x00];
+        dvb_segment(
+            &mut p2,
+            SEG_PAGE_COMPOSITION,
+            &dvb_page_one_region(PAGE_STATE_NORMAL_CASE, 0),
+        );
+        dvb_segment(
+            &mut p2,
+            SEG_CLUT_DEFINITION,
+            &dvb_clut_entry1(0, 81, 240, 90, 0),
+        );
+        dvb_segment(&mut p2, SEG_END_OF_DISPLAY_SET, &[]);
+        let v2 = dvb_decode(&mut dec, p2);
+        let red = &v2.planes[0].data[0..4];
+        assert!(
+            red[0] > red[1] && red[0] > red[2] && red[3] == 255,
+            "CLUT-only delta should recolour the retained object red, got {red:?}"
+        );
+    }
+
+    #[test]
+    fn mode_change_resets_prior_epoch_state() {
+        // §5.2: a page composition with page state "mode change" destroys
+        // all previous pixel/composition-buffer allocations. After epoch 1
+        // defines region 0 + object, a mode-change packet that references a
+        // region it does NOT define must render nothing (the stale region
+        // from epoch 1 is gone), not the leftover white pixel.
+        let params = CodecParameters::video(CodecId::new(DVBSUB_CODEC_ID));
+        let mut dec = make_decoder(&params).unwrap();
+
+        let mut p1 = vec![0x20, 0x00];
+        dvb_segment(&mut p1, SEG_DISPLAY_DEFINITION, &dvb_dds_1x1());
+        dvb_segment(
+            &mut p1,
+            SEG_PAGE_COMPOSITION,
+            &dvb_page_one_region(PAGE_STATE_MODE_CHANGE, 0),
+        );
+        dvb_segment(
+            &mut p1,
+            SEG_REGION_COMPOSITION,
+            &dvb_region_8bit(0, 0, 1, 1, 100),
+        );
+        dvb_segment(
+            &mut p1,
+            SEG_CLUT_DEFINITION,
+            &dvb_clut_entry1(0, 255, 128, 128, 0),
+        );
+        dvb_segment(&mut p1, SEG_OBJECT_DATA, &dvb_object_8bit(100, &[1]));
+        dvb_segment(&mut p1, SEG_END_OF_DISPLAY_SET, &[]);
+        let _ = dvb_decode(&mut dec, p1);
+
+        // Packet 2 — mode change referencing region 0 but NOT redefining it.
+        // The reset wipes region 0, so nothing paints: transparent canvas.
+        let mut p2 = vec![0x20, 0x00];
+        dvb_segment(&mut p2, SEG_DISPLAY_DEFINITION, &dvb_dds_1x1());
+        dvb_segment(
+            &mut p2,
+            SEG_PAGE_COMPOSITION,
+            &dvb_page_one_region(PAGE_STATE_MODE_CHANGE, 0),
+        );
+        dvb_segment(&mut p2, SEG_END_OF_DISPLAY_SET, &[]);
+        let v2 = dvb_decode(&mut dec, p2);
+        assert_eq!(
+            &v2.planes[0].data[0..4],
+            &[0, 0, 0, 0],
+            "mode change must discard the prior epoch's region/object state"
+        );
+    }
+
+    #[test]
+    fn reset_drops_retained_epoch_state() {
+        // A decoder reset (seek / discontinuity) ends the epoch. After it,
+        // a normal-case delta that relies on previously-retained state has
+        // nothing to render against.
+        let params = CodecParameters::video(CodecId::new(DVBSUB_CODEC_ID));
+        let mut dec = make_decoder(&params).unwrap();
+
+        let mut p1 = vec![0x20, 0x00];
+        dvb_segment(&mut p1, SEG_DISPLAY_DEFINITION, &dvb_dds_1x1());
+        dvb_segment(
+            &mut p1,
+            SEG_PAGE_COMPOSITION,
+            &dvb_page_one_region(PAGE_STATE_MODE_CHANGE, 0),
+        );
+        dvb_segment(
+            &mut p1,
+            SEG_REGION_COMPOSITION,
+            &dvb_region_8bit(0, 0, 1, 1, 100),
+        );
+        dvb_segment(
+            &mut p1,
+            SEG_CLUT_DEFINITION,
+            &dvb_clut_entry1(0, 255, 128, 128, 0),
+        );
+        dvb_segment(&mut p1, SEG_OBJECT_DATA, &dvb_object_8bit(100, &[1]));
+        dvb_segment(&mut p1, SEG_END_OF_DISPLAY_SET, &[]);
+        let _ = dvb_decode(&mut dec, p1);
+
+        dec.reset().unwrap();
+
+        // Normal-case page-only delta, but the epoch is gone after reset.
+        let mut p2 = vec![0x20, 0x00];
+        dvb_segment(&mut p2, SEG_DISPLAY_DEFINITION, &dvb_dds_1x1());
+        dvb_segment(
+            &mut p2,
+            SEG_PAGE_COMPOSITION,
+            &dvb_page_one_region(PAGE_STATE_NORMAL_CASE, 0),
+        );
+        dvb_segment(&mut p2, SEG_END_OF_DISPLAY_SET, &[]);
+        let v2 = dvb_decode(&mut dec, p2);
+        assert_eq!(
+            &v2.planes[0].data[0..4],
+            &[0, 0, 0, 0],
+            "reset must drop the retained epoch so the delta renders nothing"
+        );
+    }
+
+    #[test]
+    fn encoder_marks_self_contained_sets_as_mode_change() {
+        // The encoder emits a complete, self-sufficient display set per
+        // frame, so each must be flagged "mode change" (epoch start) for a
+        // real IRD to acquire on any frame. Decode the encoder's PES and
+        // confirm the page-composition page_state byte.
+        let mut enc = make_encoder(&codec_params()).unwrap();
+        let frame = make_rgba_frame_local(1, 1, &[[200, 200, 200, 255]]);
+        enc.send_frame(&frame).unwrap();
+        let pkt = enc.receive_packet().unwrap();
+        let payload = strip_pes_prefix(&pkt.data);
+        // Walk to the page-composition segment and read its state.
+        let mut cur = 0;
+        let mut state = None;
+        while cur < payload.len() {
+            let (seg, next) = read_segment(payload, cur).unwrap();
+            if seg.seg_type == SEG_PAGE_COMPOSITION {
+                state = Some(parse_page_composition(&seg.body).unwrap().state);
+                break;
+            }
+            cur = next;
+        }
+        assert_eq!(state, Some(PageState::ModeChange));
+    }
+
+    fn codec_params() -> CodecParameters {
+        CodecParameters::video(CodecId::new(DVBSUB_CODEC_ID))
+    }
+
+    fn make_rgba_frame_local(w: usize, h: usize, px: &[[u8; 4]]) -> Frame {
+        let mut data = Vec::with_capacity(w * h * 4);
+        for p in px {
+            data.extend_from_slice(p);
+        }
+        Frame::Video(VideoFrame {
+            pts: Some(0),
+            planes: vec![VideoPlane {
+                stride: w * 4,
+                data,
+            }],
+        })
     }
 
     #[test]
@@ -4088,13 +4578,33 @@ mod tests {
         let regions = [(0u8, 0u16, 0u16), (7, 100, 200), (255, 65535, 12345)];
         let body = write_page_composition(30, 5, 2, &regions);
         let parsed = parse_page_composition(&body).unwrap();
-        assert_eq!(parsed.len(), regions.len());
-        for (got, want) in parsed.iter().zip(regions.iter()) {
+        assert_eq!(parsed.regions.len(), regions.len());
+        // page_time_out / page_version_number / page_state round-trip from
+        // the writer's header byte.
+        assert_eq!(parsed.time_out, 30);
+        assert_eq!(parsed.version, 5);
+        assert_eq!(parsed.state, PageState::ModeChange);
+        for (got, want) in parsed.regions.iter().zip(regions.iter()) {
             assert_eq!((got.region_id, got.x, got.y), *want);
         }
         // Region-free page (the erase shape) parses to an empty list.
         let empty = write_page_composition(0, 0, 0, &[]);
-        assert!(parse_page_composition(&empty).unwrap().is_empty());
+        let parsed_empty = parse_page_composition(&empty).unwrap();
+        assert!(parsed_empty.regions.is_empty());
+        assert_eq!(parsed_empty.state, PageState::NormalCase);
+    }
+
+    #[test]
+    fn page_state_decodes_all_four_table3_values() {
+        for (bits, want) in [
+            (0u8, PageState::NormalCase),
+            (1, PageState::AcquisitionPoint),
+            (2, PageState::ModeChange),
+            (3, PageState::Reserved),
+        ] {
+            let body = write_page_composition(0, 0, bits, &[(1, 0, 0)]);
+            assert_eq!(parse_page_composition(&body).unwrap().state, want);
+        }
     }
 
     #[test]

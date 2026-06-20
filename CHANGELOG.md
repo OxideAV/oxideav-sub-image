@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- DVB subtitles: the decoder now implements the **epoch state machine**
+  (ETSI EN 300 743 §5.1 / §5.2 / §7.2.2). Previously it rebuilt the
+  region / CLUT / object state from scratch for every PES packet, so it
+  rendered correctly only for self-contained display sets and would paint
+  blank for the "normal case" delta packets that dominate real broadcast
+  streams. It now retains the composition buffer (page composition, region
+  compositions, CLUT definitions) and pixel buffer (object data) across
+  packets within an epoch, driven by the page-composition `page_state`
+  (Table 3): **"mode change"** discards all retained state before applying
+  the display set (a new epoch); **"acquisition point"** / **"normal
+  case"** accumulate onto it, so a delta that re-sends only the page
+  composition — or only a CLUT to recolour a retained object — renders
+  against the carried-over buffers. `page_state` and `page_version_number`
+  are now decoded into a typed `PageComposition`, and `reset()` ends the
+  epoch (dropping the retained buffers). The encoder marks every
+  self-contained display set it emits as **"mode change"** (was "normal
+  case") so a real IRD can acquire / refresh the service on any frame; the
+  `PAGE_STATE_NORMAL_CASE` / `PAGE_STATE_ACQUISITION_POINT` /
+  `PAGE_STATE_MODE_CHANGE` constants are exposed for callers assembling
+  their own page-composition segments via `write_page_composition`.
+
 - PGS: mid-epoch **palette-only updates** are now applied. The decoder
   retains object / window / palette state across display-sets within an
   epoch, so a Normal-Case PCS with `palette_update_flag = 0x80`
