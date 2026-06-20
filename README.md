@@ -42,6 +42,15 @@ Pure-Rust bitmap-subtitle codecs and containers:
   retained buffers; the encoder flags every self-contained set it emits as
   "mode change" so an IRD can acquire on any frame.
 
+  CLUT entries follow §7.2.4 colorimetry — BT.601 Y/Cr/Cb plus T
+  (alpha = 255 − T) — including the **`Y_value == 0` full-transparency**
+  rule: a Y=0 entry decodes to alpha 0 regardless of its T / chroma
+  fields ("Full transparency is acquired through a value of zero in the
+  Y_value field"). To keep a visible colour off that sentinel, the encoder
+  floors any opaque entry's luma to the §7.2.4 NOTE 1 legal value (Y=16),
+  so opaque pure black round-trips to a near-black grey rather than a
+  transparent pixel (DVB cannot represent opaque black).
+
   On the decode side, pixel-data sub-block **map-tables** (§7.2.5.1) are
   applied rather than skipped: a 2-bit or 4-bit pixel-code string carried
   inside a deeper region is remapped onto the region CLUT entry numbers

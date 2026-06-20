@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- DVB subtitles: the CLUT decoder now honours the **`Y_value == 0` →
+  full-transparency** rule (ETSI EN 300 743 §7.2.4: "Full transparency is
+  acquired through a value of zero in the Y_value field"). A CLUT entry
+  with Y=0 now decodes to alpha 0 regardless of its T / chroma fields,
+  where previously a Y=0/T=0 entry painted opaque black. The encoder's
+  `rgba_to_clut_ycbcrt` correspondingly floors any *opaque* colour's luma
+  to the §7.2.4 NOTE 1 legal value (Y=16) so a visible colour can't
+  collapse onto the transparent sentinel — opaque pure black now
+  round-trips to a near-black grey, which is the closest representable
+  colour (DVB cannot encode opaque black).
+
 - DVB subtitles: the decoder now implements the **epoch state machine**
   (ETSI EN 300 743 §5.1 / §5.2 / §7.2.2). Previously it rebuilt the
   region / CLUT / object state from scratch for every PES packet, so it

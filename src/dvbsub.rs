@@ -65,6 +65,14 @@
 //!   (seek / discontinuity) ends the epoch and drops the retained buffers.
 //!   The encoder marks every self-contained display set it emits as
 //!   "mode change" so an IRD can acquire on any frame.
+//! * **CLUT colorimetry (§7.2.4).** Entries are BT.601 Y/Cr/Cb + T
+//!   (transparency, alpha = 255 − T). A `Y_value` of zero is the spec's
+//!   full-transparency sentinel ("Full transparency is acquired through a
+//!   value of zero in the Y_value field"), so a Y=0 entry decodes to alpha
+//!   0 regardless of its T / chroma fields. To keep a visible colour off
+//!   that sentinel, the encoder floors any opaque entry's luma to the
+//!   §7.2.4 NOTE 1 legal value (Y = 16) — opaque pure black therefore
+//!   round-trips to a near-black grey, not to a transparent pixel.
 //! * Page timeouts are accepted but not enforced here — caller uses the
 //!   accompanying packet duration.
 //! * `region_fill_flag` (ETSI EN 300 743 §7.2.3) is honoured: when set,
@@ -675,14 +683,26 @@ impl Default for Clut {
 
 fn ycbcr_to_rgba(y: u8, cr: u8, cb: u8, t8: u8) -> [u8; 4] {
     // DVB CLUT values: Y/Cb/Cr full-range 8-bit + T (transparency).
-    // Convert via BT.601.
+    // Convert via BT.601 (ETSI EN 300 743 §7.2.4 NOTE 2: Y/Cr/Cb have
+    // BT.601 / BT.656-4 meanings).
+    //
+    // §7.2.4: "A value of zero in the Y_value field signals full
+    // transparency. […] Full transparency is acquired through a value of
+    // zero in the Y_value field." So a Y of zero overrides the T_value and
+    // makes the entry fully transparent regardless of the chroma / T bits.
+    if y == 0 {
+        return [0, 0, 0, 0];
+    }
+    // §7.2.4 T_value: "A value of zero identifies no transparency." T is the
+    // complement of opacity, so alpha = 255 − T (the encoder's
+    // `rgba_to_clut_ycbcrt` is the exact inverse of this).
+    let alpha = 255u8.saturating_sub(t8);
     let y = y as i32;
     let cb = cb as i32 - 128;
     let cr = cr as i32 - 128;
     let r = y + ((91881 * cr) >> 16);
     let g = y - ((22554 * cb + 46802 * cr) >> 16);
     let b = y + ((116130 * cb) >> 16);
-    let alpha = 255u8.saturating_sub(t8);
     [
         r.clamp(0, 255) as u8,
         g.clamp(0, 255) as u8,
@@ -723,15 +743,20 @@ fn parse_clut_into(body: &[u8], cluts: &mut HashMap<u8, Clut>) -> Result<()> {
             if cur + 2 > body.len() {
                 return Err(Error::invalid("DVB CLUT: truncated short entry"));
             }
-            // Packed: 6 bits Y, 4 bits Cr, 4 bits Cb, 2 bits T — not
-            // widely used; fall back to scaling.
+            // Packed (full_range_flag == 0): the four values carry only
+            // their most-significant bits — Y(6) Cr(4) Cb(4) T(2), packed
+            // contiguously into the two bytes (§7.2.4). They are placed in
+            // the high bits of an 8-bit field (the spec is silent on the
+            // low-bit reconstruction; zero-fill keeps this the exact inverse
+            // of the `write_clut_definition` packed encoder). The Y=0
+            // full-transparency rule in `ycbcr_to_rgba` still applies.
             let b0 = body[cur];
             let b1 = body[cur + 1];
             cur += 2;
-            let y = b0 & 0xFC;
-            let cr = (((b0 & 0x03) << 2) | (b1 >> 6)) << 4;
-            let cb = ((b1 >> 2) & 0x0F) << 4;
-            let t = (b1 & 0x03) << 6;
+            let y = b0 & 0xFC; // top 6 bits of byte 0
+            let cr = (((b0 & 0x03) << 2) | (b1 >> 6)) << 4; // b0[1:0] : b1[7:6]
+            let cb = ((b1 >> 2) & 0x0F) << 4; // b1[5:2]
+            let t = (b1 & 0x03) << 6; // b1[1:0]
             entry.entries[entry_id as usize] = ycbcr_to_rgba(y, cr, cb, t);
         }
     }
@@ -1707,12 +1732,32 @@ pub fn write_clut_definition(clut_id: u8, version: u8, entries: &[ClutEntryDef])
 /// a full-range CLUT entry built from this value decodes back to
 /// within ±2 per channel. Greys (`R == G == B`) are bit-exact because
 /// `Cb = Cr = 128` makes the chroma terms vanish.
+///
+/// ETSI EN 300 743 §7.2.4 makes `Y_value == 0` mean *fully transparent*
+/// regardless of the chroma / T fields (NOTE 1: "Y=0 is disallowed in
+/// […] BT.601 […] should be […] mapped to a legal value (e.g. Y=16d)").
+/// To keep a visible (non-transparent) pixel from collapsing to that
+/// transparent code, the luma of any entry with non-zero alpha is clamped
+/// up to a minimum of 16 — the legal-range floor the note recommends.
 pub fn rgba_to_clut_ycbcrt(rgba: [u8; 4]) -> [u8; 4] {
-    let r = rgba[0] as i64;
-    let g = rgba[1] as i64;
-    let b = rgba[2] as i64;
+    let mut r = rgba[0] as i64;
+    let mut g = rgba[1] as i64;
+    let mut b = rgba[2] as i64;
     // BT.601 luma weights 0.299 / 0.587 / 0.114 scaled by 1 << 16; the
     // three integer weights sum to exactly 65536.
+    let luma = (19595 * r + 38470 * g + 7471 * b + 32768) >> 16;
+    if rgba[3] != 0 && luma < 16 {
+        // A non-transparent entry must not encode to Y=0 (the DVB
+        // full-transparency sentinel); §7.2.4 NOTE 1's legal-range floor is
+        // Y=16. Lift the whole colour by the luma deficit so the chroma
+        // difference terms `(R-Y)` / `(B-Y)` stay neutral for an achromatic
+        // input (pure black → a clean `[16,16,16]` grey) instead of picking
+        // up a tint from flooring Y alone.
+        let lift = 16 - luma;
+        r = (r + lift).min(255);
+        g = (g + lift).min(255);
+        b = (b + lift).min(255);
+    }
     let y = (19595 * r + 38470 * g + 7471 * b + 32768) >> 16;
     // The decode side reconstructs R = Y + (91881·Cr′) >> 16 and
     // B = Y + (116130·Cb′) >> 16 with Cr′/Cb′ centred on 128, so the
@@ -4689,7 +4734,11 @@ mod tests {
 
     /// Full-range CLUT entries built from grey RGBA values are bit-exact
     /// through the YCbCr roundtrip (Cb = Cr = 128 makes the chroma terms
-    /// vanish on both sides).
+    /// vanish on both sides). The one exception is opaque pure black: DVB
+    /// reserves `Y_value == 0` for full transparency (ETSI EN 300 743
+    /// §7.2.4 NOTE 1), so an opaque black is clamped to the legal luma
+    /// floor (Y = 16) by `rgba_to_clut_ycbcrt` and decodes to that grey,
+    /// not to `[0,0,0,255]`.
     #[test]
     fn clut_full_range_grey_roundtrip_is_exact() {
         let mut entries = Vec::new();
@@ -4710,10 +4759,17 @@ mod tests {
         let clut = &cluts[&3];
         for (i, v) in (0u16..=255).step_by(17).enumerate() {
             let v = v as u8;
+            // Opaque pure black is unrepresentable (Y=0 = transparent), so it
+            // floors to Y=16 grey; every other grey is bit-exact.
+            let expected = if v == 0 {
+                [16, 16, 16, 255]
+            } else {
+                [v, v, v, 255]
+            };
             assert_eq!(
                 clut.entries[i + 1],
-                [v, v, v, 255],
-                "grey {v} did not roundtrip exactly"
+                expected,
+                "grey {v} did not roundtrip as expected"
             );
         }
     }
@@ -4956,35 +5012,101 @@ mod tests {
     // --- colour conversion ---------------------------------------------
 
     #[test]
+    fn clut_y_zero_decodes_fully_transparent() {
+        // ETSI EN 300 743 §7.2.4: a CLUT entry with Y_value == 0 is fully
+        // transparent regardless of its Cr/Cb/T fields ("Full transparency
+        // is acquired through a value of zero in the Y_value field"). A
+        // full-range entry with Y=0 but T=0 (which alone would mean opaque)
+        // must still decode to alpha 0.
+        let body = write_clut_definition(
+            0,
+            0,
+            &[ClutEntryDef {
+                entry_id: 5,
+                y: 0,
+                cr: 200, // non-neutral chroma to prove it's ignored
+                cb: 40,
+                t: 0, // T alone says "opaque"
+                full_range: true,
+            }],
+        );
+        let mut cluts = HashMap::new();
+        parse_clut_into(&body, &mut cluts).unwrap();
+        assert_eq!(
+            cluts[&0].entries[5],
+            [0, 0, 0, 0],
+            "Y=0 entry must be fully transparent regardless of T/chroma"
+        );
+    }
+
+    #[test]
+    fn encoder_clamps_opaque_black_off_the_transparent_sentinel() {
+        // An opaque pure-black RGBA must not encode to the Y=0 transparent
+        // sentinel; it floors to the §7.2.4 NOTE 1 legal luma (16) and
+        // decodes to an opaque near-black grey.
+        let [y, cr, cb, t] = rgba_to_clut_ycbcrt([0, 0, 0, 255]);
+        assert_eq!(y, 16, "opaque black must floor to Y=16, got {y}");
+        let rgba = ycbcr_to_rgba(y, cr, cb, t);
+        assert_eq!(rgba[3], 255, "must stay opaque");
+        assert!(
+            rgba[0] > 0 && rgba[0] < 40,
+            "should decode to near-black grey, got {rgba:?}"
+        );
+        // A *transparent* black, by contrast, keeps Y=0 (it's transparent
+        // anyway) and round-trips to fully transparent.
+        let [y0, ..] = rgba_to_clut_ycbcrt([0, 0, 0, 0]);
+        assert_eq!(y0, 0, "transparent black keeps Y=0");
+    }
+
+    #[test]
     fn rgba_ycbcr_roundtrip_is_close_and_re_encode_bounded() {
         // decode(encode(x)) may move a colour channel by up to 2 LSBs
         // (alpha is exact). Repeated re-encoding of decoded subtitles
         // accumulates only slowly: five passes stay within 5 LSBs of
         // the original over a 200k-sample deterministic sweep, so the
         // transform cannot drift unboundedly.
+        //
+        // The exception is near-black: DVB reserves Y=0 for full
+        // transparency (§7.2.4 NOTE 1), so an opaque colour whose BT.601
+        // luma falls below the legal floor (16) is clamped up to it, which
+        // can lift a near-black channel by more than 2 LSBs. We skip the
+        // ≤2-LSB bound for those clamped samples (their behaviour is pinned
+        // by the dedicated grey-floor test) and keep it for everything else.
         let mut state: u64 = 0xC010_12D2_1F7C_0001;
         for _ in 0..200_000 {
             let v = lcg(&mut state);
             let rgba = [v as u8, (v >> 8) as u8, (v >> 16) as u8, 255];
+            // True BT.601 luma before the Y=16 floor (matches the encoder).
+            let luma =
+                (19595 * rgba[0] as i64 + 38470 * rgba[1] as i64 + 7471 * rgba[2] as i64 + 32768)
+                    >> 16;
+            let clamped = luma < 16;
             let [y, cr, cb, t] = rgba_to_clut_ycbcrt(rgba);
             let once = ycbcr_to_rgba(y, cr, cb, t);
             assert_eq!(once[3], 255, "alpha must be exact for {rgba:?}");
-            for c in 0..3 {
-                assert!(
-                    (once[c] as i32 - rgba[c] as i32).abs() <= 2,
-                    "first roundtrip drifted >2 LSBs for {rgba:?}: {once:?}"
-                );
+            if !clamped {
+                for c in 0..3 {
+                    assert!(
+                        (once[c] as i32 - rgba[c] as i32).abs() <= 2,
+                        "first roundtrip drifted >2 LSBs for {rgba:?}: {once:?}"
+                    );
+                }
             }
+            // The roundtrip must stay defined and opaque even for clamped
+            // samples (never collapse to the transparent Y=0 sentinel).
+            assert!(once[0] > 0 || once[1] > 0 || once[2] > 0 || once[3] == 255);
             let mut cur = once;
             for _ in 0..4 {
                 let [y2, cr2, cb2, t2] = rgba_to_clut_ycbcrt(cur);
                 cur = ycbcr_to_rgba(y2, cr2, cb2, t2);
             }
-            for c in 0..3 {
-                assert!(
-                    (cur[c] as i32 - rgba[c] as i32).abs() <= 5,
-                    "five-pass re-encode drifted >5 LSBs for {rgba:?}: {cur:?}"
-                );
+            if !clamped {
+                for c in 0..3 {
+                    assert!(
+                        (cur[c] as i32 - rgba[c] as i32).abs() <= 5,
+                        "five-pass re-encode drifted >5 LSBs for {rgba:?}: {cur:?}"
+                    );
+                }
             }
         }
     }
