@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- PGS: the encoder now **fragments oversized objects across multiple ODS
+  segments**. The PG segment header's `segment_size` is a 16-bit field, so
+  a single Object Definition Segment body can carry at most 65535 bytes
+  (`MAX_SEGMENT_BODY`). A large, heavily-antialiased caption — e.g. a
+  full-width 1920-pixel row of alternating colours that defeats run-length
+  compression — produces RLE data longer than that; previously the encoder
+  emitted a single ODS whose body length silently truncated through the
+  `as u16` cast, corrupting the stream. The encoder now splits such an
+  object into as many ODS as needed (each body inside the cap), all sharing
+  one `object_id`/`object_version`, with the `last_in_sequence_flag` bits
+  set per the wire format (`0x80` first, `0x40` last, `0xC0` for a
+  single-segment object, `0x00` middles); only the first fragment carries
+  the `object_data_length` + `width` + `height` header, which counts the
+  whole object. The decoder already reassembled fragments, so a large frame
+  now round-trips through `encode → decode` pixel-exact. A `debug_assert`
+  in `push_segment` now catches any other encoder path that would overflow
+  the size field. New `encode_ods_fragments` helper plus three tests
+  (single-segment fast path, a payload spanning >2× the cap, and a public
+  encoder→decoder round-trip on a 1024×70 fragmentation-forcing frame).
+
 - DVB subtitles: the CLUT decoder now honours the **`Y_value == 0` →
   full-transparency** rule (ETSI EN 300 743 §7.2.4: "Full transparency is
   acquired through a value of zero in the Y_value field"). A CLUT entry

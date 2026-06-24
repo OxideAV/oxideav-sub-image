@@ -327,6 +327,17 @@ input frame emits an erase display-set (PCS with zero composition
 objects + empty WDS), which the decoder maps to a fully-transparent
 canvas — the canonical way to clear whatever was on screen before.
 
+When the encoded object's run-length data exceeds the 65535-byte limit
+of the PG segment header's 16-bit `segment_size` field — a large,
+heavily-antialiased caption whose RLE defeats run-length compression —
+the encoder **fragments the object across multiple ODS segments** sharing
+one `object_id`, with the `last_in_sequence_flag` first/last bits set per
+the wire format and only the first fragment carrying the
+`object_data_length` + `width` + `height` header. The decoder reassembles
+the fragments by `object_id` before interpreting them, so a large frame
+round-trips pixel-exact. Previously the single-ODS body length truncated
+through the `as u16` cast and corrupted the stream.
+
 ### Codec / container IDs
 
 | Codec id  | Container id | Extensions    | Encode |

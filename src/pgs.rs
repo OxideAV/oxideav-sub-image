@@ -39,9 +39,15 @@
 //!   display-set (PCS carrying zero composition objects + empty WDS).
 //! * Objects referenced by a composition but not yet seen via ODS are
 //!   skipped silently — PGS allows carrying only palette/WDS updates.
-//! * ODS fragmentation is handled (an object carries `last_in_sequence`
-//!   bits); a PDS version update is treated as a per-entry replace
-//!   within the named `palette_id` slot.
+//! * ODS fragmentation is handled in **both** directions: the decoder
+//!   reassembles an object split across several ODS sharing one
+//!   `object_id` via the `last_in_sequence` bits, and the encoder
+//!   *produces* such fragments whenever an object's RLE would overrun the
+//!   16-bit `segment_size` field (`MAX_SEGMENT_BODY` = 65535 bytes) — a
+//!   large heavily-antialiased caption is split so every segment body
+//!   stays inside the cap instead of silently truncating the length. A
+//!   PDS version update is treated as a per-entry replace within the
+//!   named `palette_id` slot.
 //! * Multi-PDS display-sets keep each PDS in its own `palette_id`-keyed
 //!   slot; render-time palette selection follows the PCS's `palette_id`
 //!   byte rather than the last PDS seen, so two PDS with different ids
@@ -75,6 +81,27 @@ pub const SEG_ODS: u8 = 0x15;
 pub const SEG_PCS: u8 = 0x16;
 pub const SEG_WDS: u8 = 0x17;
 pub const SEG_END: u8 = 0x80;
+
+/// Largest segment *body* the 13-byte PG header can describe: `segment_size`
+/// is a 16-bit big-endian field counting only the bytes after the header, so
+/// a body can be at most `u16::MAX` (65535) bytes. Anything larger cannot be
+/// framed in a single segment and — for an ODS — must be split into several
+/// fragments sharing one `object_id` (see [`encode_ods_fragments`]).
+pub const MAX_SEGMENT_BODY: usize = u16::MAX as usize;
+
+/// ODS fragment-flag bits in `last_in_sequence_flag` (offset 3 of an ODS
+/// body). `0x80` marks the first fragment of a sequence (the one carrying the
+/// `object_data_length` + `width` + `height` header); `0x40` marks the last.
+/// A single-segment object sets both (`0xC0`); a middle fragment sets neither.
+const ODS_SEQ_FIRST: u8 = 0x80;
+const ODS_SEQ_LAST: u8 = 0x40;
+
+/// Per-ODS body overhead before any RLE payload bytes: `object_id` (2) +
+/// `object_version` (1) + `last_in_sequence_flag` (1). The first fragment
+/// additionally spends `object_data_length` (3) + `width` (2) + `height` (2),
+/// accounted for separately by [`encode_ods_fragments`].
+const ODS_FRAG_PREFIX: usize = 4;
+const ODS_FIRST_FRAG_HEADER: usize = ODS_FRAG_PREFIX + 3 + 2 + 2;
 
 // --- composition-state identifiers ---------------------------------------
 //
@@ -1465,25 +1492,92 @@ fn encode_display_set(
     }
     push_segment(&mut out, pts_90k, SEG_PDS, &pds);
 
-    // ODS — single fragment (0xC0 = first + last sequence).
+    // ODS — fragmented across as many segments as the PG `segment_size`
+    // u16 cap requires. A small object lands in a single `0xC0` (first +
+    // last) ODS; a large one (high-resolution antialiased caption whose RLE
+    // exceeds 65535 bytes) is split so every segment body stays inside
+    // `MAX_SEGMENT_BODY`. The decoder reassembles them by `object_id`.
     let rle = encode_rle(indices, obj_w as usize, obj_h as usize);
-    let mut ods = Vec::new();
-    ods.extend_from_slice(&1u16.to_be_bytes()); // object id
-    ods.push(0); // object version
-    ods.push(0xC0); // first + last
-    let obj_data_len = (rle.len() + 4) as u32; // width+height (4) + rle
-    ods.push(((obj_data_len >> 16) & 0xFF) as u8);
-    ods.push(((obj_data_len >> 8) & 0xFF) as u8);
-    ods.push((obj_data_len & 0xFF) as u8);
-    ods.extend_from_slice(&obj_w.to_be_bytes());
-    ods.extend_from_slice(&obj_h.to_be_bytes());
-    ods.extend_from_slice(&rle);
-    push_segment(&mut out, pts_90k, SEG_ODS, &ods);
+    encode_ods_fragments(&mut out, pts_90k, 1, 0, obj_w, obj_h, &rle);
 
     // END.
     push_segment(&mut out, pts_90k, SEG_END, &[]);
 
     out
+}
+
+/// Emit one Object Definition Segment per fragment for `rle`, sharing
+/// `object_id` / `object_version`, so that every segment body fits inside the
+/// 16-bit `segment_size` field (`MAX_SEGMENT_BODY`).
+///
+/// The PGS wire format puts the `object_data_length` (u24) + `width` +
+/// `height` header only in the **first** fragment; continuation fragments
+/// carry raw RLE bytes after the 4-byte `object_id` / version /
+/// `last_in_sequence_flag` prefix. `object_data_length` counts the
+/// `width` + `height` (4) plus all RLE bytes across every fragment — it is a
+/// whole-object total, not a per-fragment length, which is why the decoder
+/// concatenates fragment bodies before reading it.
+///
+/// A single fragment carries `last_in_sequence_flag = 0xC0` (first + last);
+/// otherwise the first sets `0x80`, the last `0x40`, and middles `0x00`.
+fn encode_ods_fragments(
+    out: &mut Vec<u8>,
+    pts_90k: u32,
+    object_id: u16,
+    object_version: u8,
+    obj_w: u16,
+    obj_h: u16,
+    rle: &[u8],
+) {
+    // `object_data_length` is the whole-object total: width + height (4) +
+    // every RLE byte. It lives in the first fragment regardless of how the
+    // RLE is split.
+    let obj_data_len = (rle.len() + 4) as u32;
+
+    // Bytes of RLE the first fragment can hold without overflowing the body
+    // cap, after its own (prefix + length + w/h) header.
+    let first_cap = MAX_SEGMENT_BODY - ODS_FIRST_FRAG_HEADER;
+    // Bytes of RLE each continuation fragment can hold after its 4-byte
+    // prefix.
+    let cont_cap = MAX_SEGMENT_BODY - ODS_FRAG_PREFIX;
+
+    let mut offset = 0usize;
+    let mut first = true;
+    loop {
+        let remaining = rle.len() - offset;
+        let cap = if first { first_cap } else { cont_cap };
+        let take = remaining.min(cap);
+        let chunk = &rle[offset..offset + take];
+        let is_last = offset + take >= rle.len();
+
+        let mut flag = 0u8;
+        if first {
+            flag |= ODS_SEQ_FIRST;
+        }
+        if is_last {
+            flag |= ODS_SEQ_LAST;
+        }
+
+        let mut ods = Vec::new();
+        ods.extend_from_slice(&object_id.to_be_bytes());
+        ods.push(object_version);
+        ods.push(flag);
+        if first {
+            ods.push(((obj_data_len >> 16) & 0xFF) as u8);
+            ods.push(((obj_data_len >> 8) & 0xFF) as u8);
+            ods.push((obj_data_len & 0xFF) as u8);
+            ods.extend_from_slice(&obj_w.to_be_bytes());
+            ods.extend_from_slice(&obj_h.to_be_bytes());
+        }
+        ods.extend_from_slice(chunk);
+        push_segment(out, pts_90k, SEG_ODS, &ods);
+
+        offset += take;
+        first = false;
+        if is_last {
+            break;
+        }
+    }
 }
 
 /// Encode an "erase" display-set — a PCS carrying zero composition
@@ -1523,6 +1617,16 @@ fn encode_erase_display_set(
 }
 
 fn push_segment(out: &mut Vec<u8>, pts_90k: u32, seg_type: u8, body: &[u8]) {
+    // The PG header's `segment_size` is a u16; a body longer than
+    // `MAX_SEGMENT_BODY` would silently truncate the length and corrupt the
+    // stream. Every encoder path is responsible for keeping bodies inside the
+    // cap (ODS via `encode_ods_fragments`; PCS/WDS/PDS are bounded by their
+    // small fixed record counts), so a violation here is an encoder bug.
+    debug_assert!(
+        body.len() <= MAX_SEGMENT_BODY,
+        "PGS segment body {} exceeds {MAX_SEGMENT_BODY}-byte segment_size cap",
+        body.len()
+    );
     out.extend_from_slice(b"PG");
     out.extend_from_slice(&pts_90k.to_be_bytes());
     out.extend_from_slice(&0u32.to_be_bytes()); // DTS — not used
@@ -3416,5 +3520,197 @@ mod tests {
             d[3], 0x00,
             "post-reset palette update has no retained object to repaint"
         );
+    }
+
+    // ---- Encoder ODS fragmentation --------------------------------------
+    //
+    // The PG segment header's `segment_size` is a u16, so a single ODS body
+    // can carry at most `MAX_SEGMENT_BODY` (65535) bytes. A large object —
+    // a full-width, heavily-antialiased caption — produces RLE longer than
+    // that and MUST be split across several ODS fragments sharing one
+    // object_id, or the length field silently truncates and the stream is
+    // corrupt. These tests pin the encoder's fragmentation path (the
+    // decoder's reassembly is covered separately above).
+
+    /// Walk a `.sup` blob and return the bodies of every ODS segment, in
+    /// stream order. Panics on a malformed blob.
+    fn ods_bodies(blob: &[u8]) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut cur = 0;
+        while cur < blob.len() {
+            let (seg, next) = read_segment(blob, cur).expect("encoder blob is well-formed");
+            if seg.seg_type == SEG_ODS {
+                out.push(seg.body.clone());
+            }
+            cur = next;
+        }
+        out
+    }
+
+    #[test]
+    fn encode_ods_fragments_small_object_is_single_segment() {
+        // An object whose RLE comfortably fits one segment emits exactly one
+        // ODS with the 0xC0 (first + last) sequence flag and the whole
+        // header in place.
+        let mut out = Vec::new();
+        let rle = vec![0x01u8; 100];
+        encode_ods_fragments(&mut out, 0, 1, 0, 10, 10, &rle);
+        let bodies = ods_bodies(&out);
+        assert_eq!(bodies.len(), 1, "small object must be one fragment");
+        let b = &bodies[0];
+        assert_eq!(&b[0..2], &1u16.to_be_bytes(), "object_id");
+        assert_eq!(b[3], 0xC0, "single fragment is first + last (0xC0)");
+        // object_data_length == width+height (4) + rle.
+        let len = ((b[4] as u32) << 16) | ((b[5] as u32) << 8) | b[6] as u32;
+        assert_eq!(len as usize, rle.len() + 4);
+    }
+
+    #[test]
+    fn encode_ods_fragments_splits_oversized_payload() {
+        // An RLE payload larger than a single segment body must split into
+        // several ODS, each within MAX_SEGMENT_BODY, with the first / last
+        // sequence flags set correctly and only the first carrying the
+        // width/height header.
+        let rle = vec![0x01u8; MAX_SEGMENT_BODY * 2 + 50];
+        let mut out = Vec::new();
+        encode_ods_fragments(&mut out, 0, 7, 3, 1920, 80, &rle);
+        let bodies = ods_bodies(&out);
+        assert!(
+            bodies.len() >= 3,
+            "payload > 2× cap must span at least 3 fragments, got {}",
+            bodies.len()
+        );
+
+        for (i, b) in bodies.iter().enumerate() {
+            assert!(
+                b.len() <= MAX_SEGMENT_BODY,
+                "fragment {i} body {} exceeds the {MAX_SEGMENT_BODY}-byte cap",
+                b.len()
+            );
+            assert_eq!(&b[0..2], &7u16.to_be_bytes(), "shared object_id");
+            assert_eq!(b[2], 3, "shared object_version");
+            let is_first = i == 0;
+            let is_last = i == bodies.len() - 1;
+            assert_eq!(
+                b[3] & ODS_SEQ_FIRST != 0,
+                is_first,
+                "fragment {i} first-flag wrong"
+            );
+            assert_eq!(
+                b[3] & ODS_SEQ_LAST != 0,
+                is_last,
+                "fragment {i} last-flag wrong"
+            );
+        }
+
+        // The first fragment carries the whole-object length header; its
+        // object_data_length is width+height (4) + the *entire* RLE.
+        let first = &bodies[0];
+        let len = ((first[4] as u32) << 16) | ((first[5] as u32) << 8) | first[6] as u32;
+        assert_eq!(
+            len as usize,
+            rle.len() + 4,
+            "whole-object length in fragment 0"
+        );
+
+        // Reassembling all fragment payloads must reconstruct exactly the
+        // (length + w + h + rle) byte stream the decoder concatenates.
+        let mut reassembled = Vec::new();
+        for b in &bodies {
+            reassembled.extend_from_slice(&b[ODS_FRAG_PREFIX..]);
+        }
+        assert_eq!(reassembled.len(), 3 + 2 + 2 + rle.len());
+        assert_eq!(
+            u16::from_be_bytes([reassembled[3], reassembled[4]]),
+            1920,
+            "reassembled width"
+        );
+        assert_eq!(
+            u16::from_be_bytes([reassembled[5], reassembled[6]]),
+            80,
+            "reassembled height"
+        );
+        assert_eq!(&reassembled[7..], &rle[..], "reassembled RLE matches");
+    }
+
+    #[test]
+    fn encoder_fragments_large_frame_and_roundtrips() {
+        // Drive the public encoder with a frame big enough that its RLE
+        // overruns a single ODS, forcing fragmentation. The emitted stream
+        // must (a) carry more than one ODS, (b) keep every segment within
+        // the size cap, and (c) decode back to the original RGBA so the
+        // fragment split is transparent end-to-end.
+        //
+        // A 1024-wide row of strictly-alternating distinct colours defeats
+        // run-length compression (every pixel is its own one-byte literal
+        // plus a new colour), so even a modest height blows past 65535 RLE
+        // bytes. 70 rows ⇒ ~71 680 literal bytes + per-line markers.
+        let w = 1024usize;
+        let h = 70usize;
+        let mut data = vec![0u8; w * h * 4];
+        for (i, px) in data.chunks_exact_mut(4).enumerate() {
+            // Two fully-opaque colours alternating per pixel — never
+            // transparent, so the whole frame is the bounding box and the
+            // palette has exactly two visible entries.
+            let on = i % 2 == 0;
+            px[0] = if on { 0xFF } else { 0x10 };
+            px[1] = if on { 0x20 } else { 0xE0 };
+            px[2] = if on { 0x30 } else { 0x40 };
+            px[3] = 0xFF;
+        }
+        let frame = Frame::Video(VideoFrame {
+            pts: Some(0),
+            planes: vec![VideoPlane {
+                stride: w * 4,
+                data: data.clone(),
+            }],
+        });
+        let params = CodecParameters::video(CodecId::new(PGS_CODEC_ID));
+        let mut enc = make_encoder(&params).unwrap();
+        enc.send_frame(&frame).unwrap();
+        let packet = enc.receive_packet().unwrap();
+
+        // (a) more than one ODS, (b) all segments within the cap.
+        let bodies = ods_bodies(&packet.data);
+        assert!(
+            bodies.len() >= 2,
+            "a frame this large must fragment its ODS, got {} segment(s)",
+            bodies.len()
+        );
+        let mut cur = 0;
+        while cur < packet.data.len() {
+            let (seg, next) = read_segment(&packet.data, cur).unwrap();
+            assert!(
+                seg.body.len() <= MAX_SEGMENT_BODY,
+                "segment type {:#x} body {} exceeds cap",
+                seg.seg_type,
+                seg.body.len()
+            );
+            cur = next;
+        }
+
+        // (c) decode the fragmented stream back to RGBA. The decoder
+        // reassembles the ODS fragments by object_id; the picture must
+        // match the input pixel-for-pixel (the two opaque colours survive
+        // the BT.601 palette round-trip within ±1 LSB, so compare alpha
+        // exactly and RGB within a small tolerance).
+        let decoded = decode_one(packet.data.clone());
+        assert_eq!(decoded.len(), data.len(), "decoded canvas size");
+        for (i, (got, want)) in decoded
+            .chunks_exact(4)
+            .zip(data.chunks_exact(4))
+            .enumerate()
+        {
+            assert_eq!(got[3], want[3], "alpha mismatch at pixel {i}");
+            for c in 0..3 {
+                let d = (got[c] as i32 - want[c] as i32).abs();
+                assert!(
+                    d <= 4,
+                    "channel {c} at pixel {i}: got {} want {} (Δ{d})",
+                    got[c],
+                    want[c]
+                );
+            }
+        }
     }
 }
