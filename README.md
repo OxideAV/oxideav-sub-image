@@ -251,6 +251,25 @@ existing canvas content using the Porter–Duff source-over operator
 and discarding what's underneath. Fully-opaque and fully-transparent
 pixels short-circuit to a plain copy / no-op.
 
+## Robustness / fuzzing
+
+All three decoders consume bytes straight off a Blu-ray disc, an
+over-the-air MPEG-TS multiplex, or a DVD rip, so every length / count /
+offset / dimension field in the wire format is attacker-controlled. The
+decoder-side contract is **no-panic, no-OOM, no-hang on any input**:
+malformed bytes produce an `Error`, never a crash. A nine-target
+`cargo-fuzz` harness under `fuzz/` exercises that surface — PGS / DVB /
+VobSub full-display-set decode, the PGS RLE state machine, the DVB segment
+reader, a PGS multi-packet epoch driver, the VobSub SPU control-sequence
+walker and `.idx` parser, plus the PGS and DVB encoder round-trips — and
+the bitmap dimensions, the DVB display raster, and the VobSub
+`SET_DSPXA` field-data pointers are all bounded before they drive an
+allocation or a slice (`MAX_DIMENSION` = 8192 px/axis caps the graphics
+plane, well above any HDMV/UHD/HD broadcast raster). Each crash the
+harness found is pinned by an in-tree regression test that replays the
+minimised artifact, so normal `cargo test` guards against regression even
+though the fuzz binaries themselves need a nightly toolchain.
+
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone. Zero C dependencies.
 

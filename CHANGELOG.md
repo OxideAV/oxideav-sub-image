@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Fuzz harness + decoder hardening.** A nine-target `cargo-fuzz` harness
+  now covers the untrusted-input surface of all three decoders (`fuzz/`):
+  PGS / DVB / VobSub full-display-set decode, the PGS RLE state machine,
+  the DVB segment reader, a PGS multi-packet epoch driver, the VobSub SPU
+  DCSQ-chain walker and `.idx` parser, plus PGS and DVB encoder round-trips.
+  The fuzz crate carries its own `[workspace]` so it stays out of the
+  umbrella build. The harness immediately surfaced three robustness defects,
+  each now fixed and pinned by an in-tree regression test (the fuzz binaries
+  need nightly; the regression tests run in normal CI):
+  - **PGS out-of-memory.** A PG segment chain whose PCS / ODS declare 16-bit
+    dimensions allocated `width × height × 4` (up to ~17 GiB for a 65535²
+    plane) before any validation. A `MAX_DIMENSION` bound (8192 px/axis —
+    above any HDMV/UHD PG plane) is now checked in `decode_rle`, the ODS
+    object decode, the render canvas, and the receive_frame fallback.
+  - **DVB out-of-memory.** A Display Definition Segment can name a multi-GiB
+    raster via its 16-bit `(field + 1)` dimensions; the render path now caps
+    the raster at `MAX_DIMENSION` rather than allocating it. The DDS still
+    parses to any dimension on the wire; only the render refuses an absurd one.
+  - **VobSub out-of-bounds slice.** The SPU's `SET_DSPXA` pixel-data
+    pointers are wire-controlled; the bottom-field pointer was sliced into
+    `spu` with no bounds check. Both field-data slices are now clamped to
+    the control-table offset (validated `<= spu.len()`) and guarded against
+    an inverted range — an out-of-range pointer yields an empty field
+    instead of a panic.
+
 - PGS: the encoder now **fragments oversized objects across multiple ODS
   segments**. The PG segment header's `segment_size` is a 16-bit field, so
   a single Object Definition Segment body can carry at most 65535 bytes
