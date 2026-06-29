@@ -1,0 +1,6 @@
+target
+artifacts
+corpus
+coverage
+fuzz-*.log
+Cargo.lock

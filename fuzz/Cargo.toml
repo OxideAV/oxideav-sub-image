@@ -1,0 +1,136 @@
+[package]
+name = "oxideav-sub-image-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# The bitmap-subtitle decoders are the rich fuzz surface: every one of
+# PGS / DVB-subtitle / VobSub consumes attacker-controlled bytes that come
+# straight off a Blu-ray disc, an over-the-air MPEG-TS multiplex, or a DVD
+# rip, and every byte of those streams drives offset and allocation maths:
+#
+#   * PGS — a chain of 13-byte PG segment headers (PCS / WDS / PDS / ODS /
+#     END) whose `segment_size`, composition-object counts, window /
+#     palette / object ids, cropping rectangles, ODS fragment flags +
+#     3-byte `object_data_length`, and per-scanline RLE run lengths are all
+#     under the producer's control.
+#   * DVB subtitle — page / region / CLUT / object-data / display-definition
+#     / disparity-signalling segments, with 2/4/8-bit pixel-code strings,
+#     map-table sub-blocks, character-coded objects, and a DSS update
+#     sequence, each carrying length + count + position fields.
+#   * VobSub — the SPU header's `SPDSZ` / `SP_DCSQTA` pointers, the
+#     two-field RLE pixel data, and the Display Control Sequence chain
+#     (SET_COLOR / SET_CONTR / SET_DAREA / SET_DSPXA / CHG_COLCON) walked
+#     by self-relative `SP_NXT_DCSQ_SA` offsets — a classic loop-on-bad-
+#     pointer hazard.
+#
+# There is no external system library worth pulling in as a cross-decode
+# oracle (and the clean-room wall bars the C references anyway), so the
+# decoder-side harnesses are panic-only: feed arbitrary bytes to the public
+# decode entry points and assert they always return a `Result` rather than
+# panicking / aborting / OOMing / looping forever.
+#
+# The encoder side is exercised by `pgs_roundtrip` and `dvbsub_roundtrip`,
+# which drive the encoders with fuzzer-controlled RGBA pixels and then
+# decode the output back to assert no-panic plus geometry preservation.
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+
+[dependencies.oxideav-sub-image]
+path = ".."
+
+[dependencies.oxideav-core]
+version = "0.1"
+
+# Prevent this from interfering with the umbrella workspace.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+# PGS — full display-set parse via the public decoder (PCS/WDS/PDS/ODS/END
+# segment chain, epoch state machine, cropping, window clip, fragmented
+# ODS reassembly, RLE decode).
+[[bin]]
+name = "pgs_decode"
+path = "fuzz_targets/pgs_decode.rs"
+test = false
+doc = false
+
+# PGS — focused on the per-scanline ODS run-length state machine via the
+# public `decode_rle`, with fuzzer-controlled width/height so the harness
+# spends its budget on the four RLE branches + end-of-line resync rather
+# than re-discovering valid segment headers.
+[[bin]]
+name = "pgs_rle"
+path = "fuzz_targets/pgs_rle.rs"
+test = false
+doc = false
+
+# PGS — multi-packet epoch driver: the same decoder fed a sequence of
+# fuzzer-sliced packets so retained composition / window / palette / object
+# state, palette-only updates, and reset() across an epoch are exercised.
+[[bin]]
+name = "pgs_epoch"
+path = "fuzz_targets/pgs_epoch.rs"
+test = false
+doc = false
+
+# PGS — encoder roundtrip: drive the encoder with fuzzer-controlled RGBA
+# pixels, then decode the output. No-panic on both halves plus geometry
+# preservation through the bbox-crop + palette-quantise + RLE + fragment
+# path.
+[[bin]]
+name = "pgs_roundtrip"
+path = "fuzz_targets/pgs_roundtrip.rs"
+test = false
+doc = false
+
+# DVB subtitle — full display-set parse via the public decoder (page /
+# region / CLUT / object-data / display-definition / disparity-signalling
+# segments, map-tables, character-coded objects, epoch state machine).
+[[bin]]
+name = "dvbsub_decode"
+path = "fuzz_targets/dvbsub_decode.rs"
+test = false
+doc = false
+
+# DVB subtitle — segment reader: feed arbitrary bytes to `read_segment`
+# walked to exhaustion so the sync-byte / segment_type / page_id / length
+# framing maths is fuzzed independent of the per-segment bodies.
+[[bin]]
+name = "dvbsub_segments"
+path = "fuzz_targets/dvbsub_segments.rs"
+test = false
+doc = false
+
+# DVB subtitle — encoder roundtrip: drive the encoder with fuzzer-
+# controlled RGBA pixels, then decode the output. Exercises the 2/4/8-bit
+# pixel-code-string encoders, the CLUT quantiser, and the erase-set path.
+[[bin]]
+name = "dvbsub_roundtrip"
+path = "fuzz_targets/dvbsub_roundtrip.rs"
+test = false
+doc = false
+
+# VobSub — the SPU parser + RLE decoder + Display Control Sequence walker
+# via the public `parse_and_decode_spu`. The SP_NXT_DCSQ_SA self-relative
+# pointer chain is the headline target (loop-on-bad-pointer hazard).
+[[bin]]
+name = "vobsub_spu"
+path = "fuzz_targets/vobsub_spu.rs"
+test = false
+doc = false
+
+# VobSub — the `.idx` text-index parser: feed arbitrary UTF-8-ish bytes to
+# `parse_idx` so the palette / timestamp / size line parsing is fuzzed.
+[[bin]]
+name = "vobsub_idx"
+path = "fuzz_targets/vobsub_idx.rs"
+test = false
+doc = false

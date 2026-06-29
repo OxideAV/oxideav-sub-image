@@ -89,6 +89,21 @@ pub const SEG_END: u8 = 0x80;
 /// fragments sharing one `object_id` (see [`encode_ods_fragments`]).
 pub const MAX_SEGMENT_BODY: usize = u16::MAX as usize;
 
+/// Upper bound on a single graphics-plane / object dimension, used to reject
+/// a malformed stream before it allocates.
+///
+/// The PG segment fields are 16-bit, so width and height can each declare up
+/// to 65535 px. Naively allocating `width × height × 4` for a 65535² plane is
+/// ~17 GiB — an out-of-memory abort triggered by a few attacker-controlled
+/// bytes. Real PG graphics planes match the video plane and never exceed UHD
+/// (the BD-ROM HDMV plane is at most 1920×1080; the UHD profile reaches
+/// 3840×2160), so an 8192-px cap on either axis accepts every legitimate
+/// stream while rejecting the degenerate dimensions a fuzzer or a corrupt
+/// disc rip produces. Both the PCS canvas and the ODS object bitmap are
+/// bounded by this so the decoder turns "absurd dimensions" into a clean
+/// `Error::invalid` rather than an abort.
+pub const MAX_DIMENSION: usize = 8192;
+
 /// ODS fragment-flag bits in `last_in_sequence_flag` (offset 3 of an ODS
 /// body). `0x80` marks the first fragment of a sequence (the one carrying the
 /// `object_data_length` + `width` + `height` header); `0x40` marks the last.
@@ -493,6 +508,11 @@ fn parse_ods_into(
     if width == 0 || height == 0 {
         return Err(Error::invalid("PGS ODS: zero width/height"));
     }
+    if width as usize > MAX_DIMENSION || height as usize > MAX_DIMENSION {
+        return Err(Error::invalid(
+            "PGS ODS: object dimension exceeds the sane plane bound",
+        ));
+    }
     let rle = &full[7..];
     let pixels = decode_rle(rle, width as usize, height as usize)?;
     objects.insert(
@@ -516,6 +536,11 @@ fn parse_ods_into(
 /// * `00 10LLLLLL CCCCCCCC` — L pixels of colour C (L < 0x40, L > 0).
 /// * `00 11LLLLLL LLLLLLLL CCCCCCCC` — L pixels (14 bits) of colour C.
 pub fn decode_rle(rle: &[u8], width: usize, height: usize) -> Result<Vec<u8>> {
+    if width > MAX_DIMENSION || height > MAX_DIMENSION {
+        return Err(Error::invalid(
+            "PGS RLE: bitmap dimension exceeds the sane plane bound",
+        ));
+    }
     let mut out = vec![0u8; width * height];
     let mut i = 0;
     let mut row = 0usize;
@@ -710,6 +735,11 @@ impl DisplaySet {
         let height = pcs.height as usize;
         if width == 0 || height == 0 {
             return Err(Error::invalid("PGS PCS: zero-sized canvas"));
+        }
+        if width > MAX_DIMENSION || height > MAX_DIMENSION {
+            return Err(Error::invalid(
+                "PGS PCS: canvas dimension exceeds the sane plane bound",
+            ));
         }
         let mut canvas = vec![0u8; width * height * 4];
         // The PCS picks which palette slot to render against via its
@@ -1005,12 +1035,16 @@ impl Decoder for PgsDecoder {
         let Some(pcs) = &ds.pcs else {
             return Ok(());
         };
-        let width = pcs.width as u32;
-        let height = pcs.height as u32;
+        let width = pcs.width as usize;
+        let height = pcs.height as usize;
+        if width > MAX_DIMENSION || height > MAX_DIMENSION {
+            return Err(Error::invalid(
+                "PGS PCS: canvas dimension exceeds the sane plane bound",
+            ));
+        }
         let rendered = ds
             .render()?
-            .unwrap_or_else(|| vec![0u8; (width as usize) * (height as usize) * 4]);
-        let _ = (width, height);
+            .unwrap_or_else(|| vec![0u8; width * height * 4]);
         let frame = VideoFrame {
             pts: packet.pts,
             planes: vec![VideoPlane {
@@ -2146,6 +2180,46 @@ mod tests {
         let rle: &[u8] = &[0x01, 0x00, 0x00, 0x02];
         let err = decode_rle(rle, 1, 1);
         assert!(err.is_err(), "pixel past EOL must error: {err:?}");
+    }
+
+    #[test]
+    fn rle_absurd_dimensions_rejected_before_alloc() {
+        // A 16-bit ODS width/height can declare up to 65535 px on each
+        // axis; `decode_rle` must reject anything past the sane plane bound
+        // rather than try to allocate ~17 GiB (the OOM a fuzzer found by
+        // feeding a PCS/ODS pair with maxed dimensions). Found via the
+        // `pgs_decode` fuzz target — see `fuzz/`.
+        let err = decode_rle(&[], MAX_DIMENSION + 1, 1);
+        assert!(err.is_err(), "over-wide bitmap must error: {err:?}");
+        let err = decode_rle(&[], 1, MAX_DIMENSION + 1);
+        assert!(err.is_err(), "over-tall bitmap must error: {err:?}");
+        let err = decode_rle(&[], 65535, 65535);
+        assert!(err.is_err(), "maxed 16-bit dimensions must error: {err:?}");
+        // The bound itself is accepted (allocates, then sees empty RLE).
+        let ok = decode_rle(&[0x00, 0x00], MAX_DIMENSION, 1);
+        assert!(ok.is_ok(), "exactly-at-bound bitmap must decode: {ok:?}");
+    }
+
+    /// The malformed `.sup`-style packet the `pgs_decode` fuzz target
+    /// distilled to an out-of-memory abort: a PG segment chain whose PCS /
+    /// ODS declare absurd dimensions. The decoder must turn it into a clean
+    /// error path (or a bounded render) rather than aborting the process.
+    #[test]
+    fn fuzz_oom_artifact_does_not_abort() {
+        let blob: &[u8] = &[
+            80, 71, 80, 88, 0, 80, 21, 0, 21, 21, 22, 0, 42, 80, 80, 204, 80, 71, 80, 88, 0, 115,
+            0, 0, 0, 0, 0, 0, 0, 80, 71, 80, 88, 0, 0, 21, 21, 80, 64, 88, 78, 0, 0, 21, 0, 21, 33,
+            33, 25, 80, 55, 80, 80, 80, 80,
+        ];
+        let mut params = CodecParameters::video(CodecId::new(crate::PGS_CODEC_ID));
+        params.media_type = MediaType::Subtitle;
+        params.pixel_format = Some(PixelFormat::Rgba);
+        let mut dec = make_decoder(&params).unwrap();
+        let pkt = Packet::new(0, TimeBase::new(1, 90_000), blob.to_vec()).with_pts(0);
+        // Either errors or succeeds — the only forbidden outcome is the
+        // process-killing allocation the fuzzer hit.
+        let _ = dec.send_packet(&pkt);
+        let _ = dec.receive_frame();
     }
 
     #[test]
