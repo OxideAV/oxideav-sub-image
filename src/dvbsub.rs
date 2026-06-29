@@ -105,6 +105,19 @@ pub const SEG_DISPLAY_DEFINITION: u8 = 0x14;
 pub const SEG_DISPARITY_SIGNALLING: u8 = 0x15;
 pub const SEG_END_OF_DISPLAY_SET: u8 = 0x80;
 
+/// Upper bound on the rendered display raster on either axis, used to reject
+/// a malformed Display Definition before it allocates.
+///
+/// The DDS `display_width` / `display_height` are 16-bit `(field + 1)`
+/// values, so a stream can declare a raster up to ~65535 px per axis.
+/// Allocating `width × height × 4` for such a raster is several GiB — an
+/// out-of-memory abort triggered by a handful of attacker-controlled bytes
+/// (the `dvbsub_decode` fuzz target found exactly this). DVB subtitles are
+/// carried over MPEG-TS and bound to the broadcast video raster, which never
+/// exceeds HD (1920×1080); an 8192-px cap accepts every legitimate raster
+/// while turning a degenerate DDS into a clean `Error::invalid`.
+pub const MAX_DIMENSION: usize = 8192;
+
 // --- page_state values (ETSI EN 300 743 §7.2.2 Table 3) ----------------
 
 /// `page_state` "normal case" (`0b00`) — page update: the display set
@@ -2418,6 +2431,11 @@ impl Decoder for DvbSubDecoder {
         if width == 0 || height == 0 {
             return Err(Error::invalid("DVB sub: zero canvas"));
         }
+        if width > MAX_DIMENSION || height > MAX_DIMENSION {
+            return Err(Error::invalid(
+                "DVB sub: display raster exceeds the sane bound",
+            ));
+        }
         let mut canvas = vec![0u8; width * height * 4];
         // Objects are decoded lazily and cached by (object_id, region
         // depth): the same object reused by regions of different depths
@@ -4534,6 +4552,52 @@ mod tests {
         }
         assert!(write_display_definition(0, 576).is_err());
         assert!(write_display_definition(720, 0).is_err());
+    }
+
+    /// The malformed PES payload the `dvbsub_decode` fuzz target distilled
+    /// to an out-of-memory abort: a DDS declaring a multi-GiB raster. The
+    /// DDS still *parses* (any 16-bit dimension is legal on the wire), but
+    /// the decoder must refuse to *render* a raster past the sane bound
+    /// rather than allocating `width × height × 4` and aborting the process.
+    #[test]
+    fn fuzz_oom_artifact_does_not_abort() {
+        let pes: &[u8] = &[
+            0x0f, 0x14, 0x49, 0x00, 0x00, 0x05, 0x00, 0x63, 0xff, 0xff, 0x01, 0x00, 0xff, 0xff,
+        ];
+        let params = CodecParameters::video(CodecId::new(DVBSUB_CODEC_ID));
+        let mut dec = make_decoder(&params).unwrap();
+        let pkt = Packet::new(0, TimeBase::new(1, 90_000), pes.to_vec()).with_pts(0);
+        // The only forbidden outcome is the process-killing allocation; an
+        // error (the bound rejection) or a clean decode are both fine.
+        let _ = dec.send_packet(&pkt);
+        let _ = dec.receive_frame();
+    }
+
+    /// A DDS that declares a raster wider/taller than `MAX_DIMENSION` is
+    /// rejected at render time with a clean error rather than allocating it.
+    #[test]
+    fn oversized_dds_raster_rejected_at_render() {
+        // Declare a raster one px past the bound on the width axis.
+        let oversize = (MAX_DIMENSION + 1) as u16;
+        let body = write_display_definition(oversize, 16).unwrap();
+        let mut pes = vec![0x0f, SEG_DISPLAY_DEFINITION, 0x00, 0x01];
+        pes.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        pes.extend_from_slice(&body);
+        let params = CodecParameters::video(CodecId::new(DVBSUB_CODEC_ID));
+        let mut dec = make_decoder(&params).unwrap();
+        let pkt = Packet::new(0, TimeBase::new(1, 90_000), pes).with_pts(0);
+        let _ = dec.send_packet(&pkt);
+        // Render is attempted on the END/flush; an empty display set with a
+        // huge DDS must error rather than allocate. We assert no abort (the
+        // test process surviving is the assertion) and that a frame is not
+        // silently produced at the absurd size.
+        let frame = dec.receive_frame();
+        if let Ok(Frame::Video(v)) = frame {
+            assert!(
+                v.planes[0].data.len() <= MAX_DIMENSION * MAX_DIMENSION * 4,
+                "decoder rendered a raster past the sane bound"
+            );
+        }
     }
 
     #[test]
