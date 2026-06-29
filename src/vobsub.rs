@@ -454,14 +454,27 @@ pub fn parse_and_decode_spu(spu: &[u8]) -> Result<(Spu, Vec<u8>, (u16, u16))> {
     let height = (out.y2 - out.y1 + 1) as usize;
     let mut pixels = vec![0u8; width * height];
     if width > 0 && height > 0 {
+        // The two field-data pointers come straight off the wire
+        // (`SET_DSPXA`, §"06 - SET_DSPXA"), so neither is trustworthy: a
+        // corrupt or malicious SPU can point either past the unit or before
+        // the control table. Both pixel fields live below the control table
+        // (`ctrl_off`), so clamp every slice bound to `[0, ctrl_off]` and
+        // guard against an inverted range before indexing. `ctrl_off` is
+        // already `<= spu.len()` (validated at the top), so the clamped
+        // bounds are always in-range for `spu`.
         let top_off = out.top_rle_off as usize;
         let bot_off = out.bot_rle_off as usize;
         if top_off >= spu_len {
             return Err(Error::invalid("vobsub SPU: top offset out of range"));
         }
-        let bot_end = if bot_off > top_off { bot_off } else { ctrl_off };
-        let top_bytes = &spu[top_off..bot_end.min(ctrl_off)];
-        let bot_bytes = if bot_off > 0 {
+        // The top field runs from its pointer to the bottom-field pointer
+        // (when that sits after it) or to the control table, whichever ends
+        // the field data first.
+        let raw_top_end = if bot_off > top_off { bot_off } else { ctrl_off };
+        let top_start = top_off.min(ctrl_off);
+        let top_end = raw_top_end.min(ctrl_off).max(top_start);
+        let top_bytes = &spu[top_start..top_end];
+        let bot_bytes = if bot_off > 0 && bot_off < ctrl_off {
             &spu[bot_off..ctrl_off]
         } else {
             &[][..]
@@ -1395,6 +1408,60 @@ timestamp: 00:00:03:000, filepos: 000000040
         let raw = build_demo_spu(2, 2, &[1u8, 1, 1, 1]);
         let out = extract_spu(&raw).unwrap();
         assert_eq!(out, raw);
+    }
+
+    /// The minimised SPU the `vobsub_spu` fuzz target distilled to an
+    /// out-of-bounds slice panic: a `SET_DSPXA` whose bottom-field pixel
+    /// pointer (`bot_rle_off`) is far past the end of the unit, so
+    /// `&spu[bot_off..ctrl_off]` indexed out of range. The field-data
+    /// pointers come straight off the wire and are untrusted; the decoder
+    /// must clamp them to the control-table offset and never panic.
+    #[test]
+    fn fuzz_oob_field_pointer_does_not_panic() {
+        let spu: &[u8] = &[
+            0x00, 0x0f, 0x00, 0x04, 0x00, 0x04, 0x01, 0x00, 0x00, 0x06, 0x00, 0x00, 0x06, 0xff,
+            0xff, 0x04, 0xff, 0x00, 0x03, 0x01, 0x00, 0x00, 0x00, 0x7a,
+        ];
+        // Must return a `Result` (Ok or Err), never panic / index OOB.
+        let _ = parse_and_decode_spu(spu);
+    }
+
+    /// A `SET_DSPXA` with a wildly out-of-range bottom-field pointer is
+    /// tolerated: the bottom field is treated as empty rather than slicing
+    /// past the unit. Builds a baseline decodable SPU, then rewrites only
+    /// the bottom-field pointer to a huge value and confirms the top field
+    /// still decodes without panic.
+    #[test]
+    fn out_of_range_bottom_pointer_yields_empty_bottom_field() {
+        let raw = build_demo_spu(4, 2, &[1u8, 1, 1, 1, 2, 2, 2, 2]);
+        // Sanity: the unmodified SPU decodes.
+        assert!(parse_and_decode_spu(&raw).is_ok());
+        // Find the SET_DSPXA (0x06) command in the control block and corrupt
+        // its bottom-field pointer to 0xFFFF. The control table starts at the
+        // offset named by bytes [2..4].
+        let ctrl_off = u16::from_be_bytes([raw[2], raw[3]]) as usize;
+        let mut spu = raw.clone();
+        let mut i = ctrl_off + 4; // skip SP_DCSQ_STM + SP_NXT_DCSQ_SA
+        while i < spu.len() {
+            match spu[i] {
+                0x00..=0x02 => i += 1,
+                0x03 | 0x04 => i += 3,
+                0x05 => i += 7,
+                0x06 => {
+                    // 06 + top(2) + bot(2); clobber the bottom pointer.
+                    spu[i + 3] = 0xff;
+                    spu[i + 4] = 0xff;
+                    break;
+                }
+                _ => break,
+            }
+        }
+        // Still no panic, and the top field still produced pixels.
+        let res = parse_and_decode_spu(&spu);
+        assert!(
+            res.is_ok(),
+            "corrupt bottom pointer must not error/panic: {res:?}"
+        );
     }
 
     /// Build a tiny SPU that carries one well-formed CHG_COLCON (0x07)
