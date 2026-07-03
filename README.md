@@ -1,5 +1,7 @@
 # oxideav-sub-image
 
+[![CI](https://github.com/OxideAV/oxideav-sub-image/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-sub-image/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-sub-image.svg)](https://crates.io/crates/oxideav-sub-image) [![docs.rs](https://docs.rs/oxideav-sub-image/badge.svg)](https://docs.rs/oxideav-sub-image) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Pure-Rust bitmap-subtitle codecs and containers:
 
 - **PGS** (HDMV / Blu-ray `.sup`) — decode + encode, standalone `.sup`
