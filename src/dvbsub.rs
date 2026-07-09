@@ -3802,6 +3802,83 @@ mod tests {
         }
     }
 
+    /// Known-answer pins for the EN 300 743 §7.2.5.1
+    /// `4-bit/pixel_code_string()` syntax + Table 11.
+    #[test]
+    fn decode_4bit_spec_escape_vectors() {
+        // `0000 0 000` — end_of_4-bit/pixel_code_string.
+        const EOS: [u8; 8] = [0, 0, 0, 0, 0, 0, 0, 0];
+        let case = |body: &[u8]| -> Vec<u8> {
+            let mut bits = body.to_vec();
+            bits.extend_from_slice(&EOS);
+            decode_4bit_string(&pack_bits(&bits)).unwrap().1
+        };
+
+        // switch_1 == 0, run_length_3-9 (field + 2) of colour 0.
+        // field 1 -> 3 px; field 7 -> 9 px.
+        assert_eq!(case(&[0, 0, 0, 0, 0, 0, 0, 1]), vec![0; 3]);
+        assert_eq!(case(&[0, 0, 0, 0, 0, 1, 1, 1]), vec![0; 9]);
+
+        // switch_1 == 1, switch_2 == 0: run_length_4-7 (field + 4) + colour.
+        // field 0 -> 4 px of colour 0b0101 = 5.
+        assert_eq!(
+            case(&[0, 0, 0, 0, 1, 0, /*run*/ 0, 0, /*col*/ 0, 1, 0, 1]),
+            vec![5; 4]
+        );
+
+        // switch_3 == 00: one pixel of colour 0.
+        assert_eq!(case(&[0, 0, 0, 0, 1, 1, 0, 0]), vec![0]);
+        // switch_3 == 01: two pixels of colour 0.
+        assert_eq!(case(&[0, 0, 0, 0, 1, 1, 0, 1]), vec![0, 0]);
+        // switch_3 == 10: run_length_9-24 (field + 9) + colour.
+        // field 0 -> 9 px of colour 0b1111 = 15.
+        assert_eq!(
+            case(&[0, 0, 0, 0, 1, 1, 1, 0, /*run*/ 0, 0, 0, 0, /*col*/ 1, 1, 1, 1]),
+            vec![15; 9]
+        );
+        // switch_3 == 11: run_length_25-280 (field + 25) + colour.
+        // field 0 -> 25 px of colour 0b0111 = 7.
+        let mut v = vec![0u8, 0, 0, 0, 1, 1, 1, 1];
+        v.extend([0; 8]);
+        v.extend([0, 1, 1, 1]);
+        assert_eq!(case(&v), vec![7; 25]);
+
+        // A bare non-`0000` code is a single literal pixel.
+        assert_eq!(case(&[1, 0, 1, 0, 0, 0, 0, 1]), vec![0b1010, 0b0001]);
+    }
+
+    /// Known-answer pins for the EN 300 743 §7.2.5.1
+    /// `8-bit/pixel_code_string()` syntax. The 8-bit form is byte-aligned:
+    /// literals, `00 <count>` colour-0 runs, and `00 <0x80|count> <colour>`
+    /// counted runs, ended by `00 00`.
+    #[test]
+    fn decode_8bit_spec_escape_vectors() {
+        // Literal byte.
+        assert_eq!(decode_8bit_string(&[0x05, 0x00, 0x00]).unwrap().1, vec![5]);
+        // run_length_1-127: `00 03` -> three pixels of colour 0.
+        assert_eq!(
+            decode_8bit_string(&[0x00, 0x03, 0x00, 0x00]).unwrap().1,
+            vec![0; 3]
+        );
+        // Maximum colour-0 run: `00 7F` -> 127 pixels of colour 0.
+        assert_eq!(
+            decode_8bit_string(&[0x00, 0x7F, 0x00, 0x00]).unwrap().1,
+            vec![0; 127]
+        );
+        // run_length_3-127 of a colour: `00 83 07` -> three pixels of 7.
+        assert_eq!(
+            decode_8bit_string(&[0x00, 0x83, 0x07, 0x00, 0x00])
+                .unwrap()
+                .1,
+            vec![7; 3]
+        );
+        // `00 00` is the immediate end-of-string.
+        assert_eq!(
+            decode_8bit_string(&[0x00, 0x00]).unwrap().1,
+            Vec::<u8>::new()
+        );
+    }
+
     // --- parse_pixel_lines coverage ---------------------------------
 
     #[test]
