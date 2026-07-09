@@ -7,7 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **DVB 2-bit pixel-string run-length coding** (ETSI EN 300 743 §7.2.5.1,
+  Table 10). The `2-bit/pixel_code_string()` escape tree was mis-mapped:
+  the `switch_2 == '1'` case emitted a 4-bit-counted zero run instead of a
+  single colour-0 pixel; `switch_3 == '01'` emitted one colour-0 pixel
+  instead of two; and `switch_3 == '10'` read a 3-bit count (+3) instead of
+  the 4-bit `run_length_12-27` (+12). The encoder emitted the exact inverse
+  shapes, so the in-crate round-trip stayed green while both sides diverged
+  from the spec — a compliant DVB 2-bit stream was mis-decoded, and our
+  emitted 2-bit strings would be mis-read by a compliant decoder. Both
+  `decode_2bit_string` and `emit_2bit_run` are rewritten to the spec
+  bit-tree (informative Table 15 confirms the shapes bit-for-bit); the 4-bit
+  and 8-bit paths were already correct. New `decode_2bit_spec_escape_vectors`
+  plus 4-bit/8-bit companions pin every escape form straight from spec
+  bit-strings (encoder-independent), and `object_data_2bit_run_heavy_rows_roundtrip`
+  guards the fix end-to-end through the object-data block-length accounting.
+
 ### Added
+
+- Criterion `rle` benchmark harness (`benches/rle.rs`) over the run-length
+  hot loops — PGS `encode_rle` / `decode_rle` and the DVB 2/4/8-bit
+  pixel-code-string emitters — with fixture-free, deterministically-generated
+  subtitle-shaped inputs, giving future optimisation rounds a stable baseline.
 
 - **Fuzz harness + decoder hardening.** A nine-target `cargo-fuzz` harness
   now covers the untrusted-input surface of all three decoders (`fuzz/`):
