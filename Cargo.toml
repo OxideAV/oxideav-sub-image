@@ -17,3 +17,14 @@ categories = ["multimedia", "parser-implementations"]
 oxideav-core = "0.1"
 [dev-dependencies]
 oxideav-core = "0.1"
+# Round 403 (depth-mode benchmarks): Criterion drives the `rle` harness so
+# future optimisation rounds can A/B-test tweaks to the bitmap-subtitle
+# run-length hot loops (PGS `encode_rle` / `decode_rle` and the DVB
+# 2/4/8-bit pixel-code-string emitters) against a stable, fixture-free
+# baseline. Pinned to the same 0.5 line the other OxideAV crates with
+# benches use.
+criterion = "0.5"
+
+[[bench]]
+name = "rle"
+harness = false
