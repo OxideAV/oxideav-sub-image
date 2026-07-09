@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/OxideAV/oxideav-sub-image/compare/v0.0.7...v0.0.8) - 2026-07-09
+
+### Other
+
+- changelog for the DVB 2-bit RLE fix + rle benches
+- end-to-end 2-bit run-heavy object-data roundtrip pin
+- add criterion benches for the RLE hot loops
+- pin 4-bit/8-bit pixel-string escape forms with spec vectors
+- fix 2-bit pixel-string run-length coding per EN 300 743 Table 10
+- add CI / crates.io / docs.rs / MIT-license badges
+- record the fuzz harness + the three decoder hardening fixes
+- clamp untrusted SET_DSPXA field-data pointers before slicing
+- bound the rendered display raster against a malformed DDS
+- bound graphics-plane/object dimensions + add cargo-fuzz harness
+- fragment oversized objects across multiple ODS segments on encode
+- honour Y_value=0 full-transparency rule (EN 300 743 §7.2.4)
+- implement EN 300 743 epoch state machine (§5.1/§5.2/§7.2.2)
+- apply mid-epoch palette-only updates via retained epoch state
+- parse character-coded objects (EN 300 743 §7.2.4) instead of rejecting
+- apply pixel-data map-tables (EN 300 743 §7.2.5.1) instead of skipping
+- honour object non_modifying_colour_flag (EN 300 743 §7.2.5)
+- parse Disparity Signalling Segment (EN 300 743 §7.2.7) for 3D placement
+- parse DDS display window (EN 300 743 §7.2.1) + clip canvas to it
+- land the write direction — segment writers, 2/4/8-bit pixel-code-string encoders, and an RGBA display-set encoder
+- lock in multi-region page-order source-over compositing
+- key PDS by palette_id so PCS selects the right slot at render
+- drop release-plz.toml — use release-plz defaults across the workspace
+- apply region_fill_flag before objects composite
+- typed WindowDefinition + render-time clip to declared window
+- per-DCSQ STM latching + surface FSTA_DSP forced-display flag
+- classify PCS composition_state and route to Packet keyframe flag
+- apply Composition Segment cropping rectangle to rendered objects
+- apply CHG_COLCON rectangular palette/alpha mutations to canvas
+- pixel-line property+negative sweep + scrub attributive comment
+- length-skip CHG_COLCON instead of hard-erroring
+
 ### Fixed
 
 - **DVB 2-bit pixel-string run-length coding** (ETSI EN 300 743 §7.2.5.1,
