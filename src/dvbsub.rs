@@ -5118,6 +5118,37 @@ mod tests {
         }
     }
 
+    /// Full object-data pipeline at 2-bit depth over run-heavy rows that
+    /// force every run-length escape (switch_1 3-10, switch_3 12-27 and
+    /// 29-284, plus the single/double colour-0 codes) through the
+    /// block-length accounting — the end-to-end guard for the EN 300 743
+    /// Table 10 fix.
+    #[test]
+    fn object_data_2bit_run_heavy_rows_roundtrip() {
+        let rows = vec![
+            // Long non-zero fill (uses run_length_29-284) then a tail.
+            {
+                let mut r = vec![2u8; 200];
+                r.extend([1, 3, 1]);
+                r
+            },
+            // Mid-length colour-0 run (run_length_12-27) bracketed by
+            // literals and a single/double colour-0 code.
+            {
+                let mut r = vec![1u8];
+                r.extend(std::iter::repeat_n(0u8, 20));
+                r.extend([3, 0, 2, 2, 0, 0]);
+                r
+            },
+            // Short colour runs (run_length_3-10) of every colour.
+            vec![1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 0, 0, 0],
+        ];
+        let body = write_object_data(0x0044, 2, 2, &rows, &[]).unwrap();
+        let (id, obj) = parse_object_data(&body, 2).unwrap();
+        assert_eq!(id, 0x0044);
+        assert_eq!(obj.rows(), expected_rows(&rows));
+    }
+
     /// In a 2-bit region a 2-bit code addresses the four-entry CLUT
     /// directly, so a 2-to-4 map-table prefix with an identity layout
     /// (entries 0,1,2,3) leaves the decoded pixels unchanged (§7.2.5.1).
