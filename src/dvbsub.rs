@@ -1073,8 +1073,10 @@ fn parse_pixel_lines(buf: &[u8], region_depth: u8) -> Result<Vec<Vec<u8>>> {
 
 /// Decode a 2-bit pixel-coded string. Returns (bytes_consumed, pixels).
 fn decode_2bit_string(buf: &[u8]) -> Result<(usize, Vec<u8>)> {
-    // Minimal implementation: read bit-by-bit until the terminator
-    // `00 00 00 00` (8 zero bits) — the DVB spec's end-of-2-bit-code.
+    // EN 300 743 §7.2.5.1 `2-bit/pixel_code_string()` + Table 10.
+    // A non-`00` 2-bit code is one literal pixel. A leading `00` opens an
+    // escape whose meaning is resolved by switch_1, then switch_2, then the
+    // 2-bit switch_3.
     let mut bits = BitReader::new(buf);
     let mut pixels = Vec::new();
     loop {
@@ -1083,49 +1085,47 @@ fn decode_2bit_string(buf: &[u8]) -> Result<(usize, Vec<u8>)> {
             pixels.push(code as u8);
             continue;
         }
-        let b1 = bits.read(1)?;
-        if b1 == 1 {
-            // 01 prefix followed by a 3-bit length and a 2-bit colour code:
-            // (3 + run) pixels of the carried colour. Length 0 means a
-            // 3-pixel run, length 7 means a 10-pixel run.
+        let switch_1 = bits.read(1)?;
+        if switch_1 == 1 {
+            // run_length_3-10: a 3-bit count (pixels − 3) then a 2-bit
+            // colour. Count 0 → 3 pixels, count 7 → 10 pixels.
             let run = bits.read(3)? as usize + 3;
             let col = bits.read(2)? as u8;
-            for _ in 0..run {
-                pixels.push(col);
-            }
+            pixels.extend(std::iter::repeat(col).take(run));
             continue;
         }
-        // 0 0 ...
-        let b2 = bits.read(1)?;
-        if b2 == 1 {
-            // 001 - run of 0s, 3 + 4-bit count
-            let run = bits.read(4)? as usize + 12;
-            pixels.extend(std::iter::repeat(0_u8).take(run));
+        let switch_2 = bits.read(1)?;
+        if switch_2 == 1 {
+            // switch_2 == 1: exactly one pixel of pseudo-colour '00'.
+            pixels.push(0);
             continue;
         }
-        let b3 = bits.read(2)?;
-        match b3 {
+        // switch_2 == 0: a 2-bit switch_3 selects the remaining escapes.
+        let switch_3 = bits.read(2)?;
+        match switch_3 {
             0x00 => {
-                // end of string; align to next byte.
+                // end of 2-bit/pixel_code_string; align to next byte.
                 bits.align();
                 break;
             }
-            0x01 => pixels.push(0), // one pixel of colour 0
+            0x01 => {
+                // two pixels of pseudo-colour '00'.
+                pixels.push(0);
+                pixels.push(0);
+            }
             0x02 => {
-                // 3 + 3-bit count run of 2-bit value
-                let run = bits.read(3)? as usize + 3;
+                // run_length_12-27: a 4-bit count (pixels − 12) then a
+                // 2-bit colour.
+                let run = bits.read(4)? as usize + 12;
                 let col = bits.read(2)? as u8;
-                for _ in 0..run {
-                    pixels.push(col);
-                }
+                pixels.extend(std::iter::repeat(col).take(run));
             }
             0x03 => {
-                // 8-bit count run of 2-bit value, +25
+                // run_length_29-284: an 8-bit count (pixels − 29) then a
+                // 2-bit colour.
                 let run = bits.read(8)? as usize + 29;
                 let col = bits.read(2)? as u8;
-                for _ in 0..run {
-                    pixels.push(col);
-                }
+                pixels.extend(std::iter::repeat(col).take(run));
             }
             _ => unreachable!(),
         }
@@ -1362,8 +1362,12 @@ pub fn encode_2bit_pixel_string(pixels: &[u8]) -> Result<Vec<u8>> {
 }
 
 fn emit_2bit_run(bw: &mut BitWriter, col: u8, mut n: usize) {
+    // Longest-match first, using the spec forms from EN 300 743 Table 10.
+    // Every counted-run form (run_length_3-10 / 12-27 / 29-284) carries the
+    // 2-bit colour, so all four colours share the same shapes.
     while n > 0 {
         if n >= 29 {
+            // run_length_29-284: `00 0 0 11` + 8-bit (count − 29) + colour.
             let chunk = n.min(284);
             bw.put(2, 0);
             bw.put(1, 0);
@@ -1372,30 +1376,39 @@ fn emit_2bit_run(bw: &mut BitWriter, col: u8, mut n: usize) {
             bw.put(8, (chunk - 29) as u32);
             bw.put(2, col as u32);
             n -= chunk;
-        } else if col == 0 && n >= 12 {
+        } else if n >= 12 {
+            // run_length_12-27: `00 0 0 10` + 4-bit (count − 12) + colour.
             let chunk = n.min(27);
             bw.put(2, 0);
             bw.put(1, 0);
-            bw.put(1, 1);
+            bw.put(1, 0);
+            bw.put(2, 0b10);
             bw.put(4, (chunk - 12) as u32);
+            bw.put(2, col as u32);
             n -= chunk;
         } else if n >= 3 {
-            // The 3-bit-count colour-run form carries the colour
-            // explicitly, so it covers colour 0 as well.
+            // run_length_3-10: `00 1` + 3-bit (count − 3) + colour.
             let chunk = n.min(10);
             bw.put(2, 0);
             bw.put(1, 1);
             bw.put(3, (chunk - 3) as u32);
             bw.put(2, col as u32);
             n -= chunk;
-        } else if col == 0 {
-            // Single pixel of colour 0 (a bare `00` code is the escape).
+        } else if col == 0 && n == 2 {
+            // switch_3 == '01': two pixels of colour 0.
             bw.put(2, 0);
             bw.put(1, 0);
             bw.put(1, 0);
             bw.put(2, 0b01);
+            n -= 2;
+        } else if col == 0 {
+            // switch_2 == '1': a single pixel of colour 0.
+            bw.put(2, 0);
+            bw.put(1, 0);
+            bw.put(1, 1);
             n -= 1;
         } else {
+            // A bare 2-bit code — one pixel of colour 1..=3.
             bw.put(2, col as u32);
             n -= 1;
         }
@@ -3547,10 +3560,8 @@ mod tests {
         for &p in pixels {
             assert!(p < 4);
             if p == 0 {
-                // 00 0 0 01 → one pixel of colour 0 (b3 == 0x01 branch),
-                // six bits total.
-                bits.push(0);
-                bits.push(0);
+                // 00 0 1 → one pixel of colour 0 (switch_2 == '1'),
+                // four bits total (EN 300 743 Table 10).
                 bits.push(0);
                 bits.push(0);
                 bits.push(0);
@@ -3696,6 +3707,70 @@ mod tests {
             let (_, decoded) = decode_2bit_string(&enc).unwrap();
             assert_eq!(decoded, row, "2-bit decode mismatch for {:?}", row);
         }
+    }
+
+    /// Pack MSB-first bits into bytes (zero-padding the final byte) — the
+    /// bit order `BitReader` / `decode_2bit_string` consume.
+    fn pack_bits(bits: &[u8]) -> Vec<u8> {
+        let mut out = vec![0u8; bits.len().div_ceil(8)];
+        for (i, &b) in bits.iter().enumerate() {
+            if b != 0 {
+                out[i / 8] |= 1 << (7 - (i % 8));
+            }
+        }
+        out
+    }
+
+    /// Known-answer pins for every escape in the EN 300 743 §7.2.5.1
+    /// `2-bit/pixel_code_string()` syntax + Table 10. These assert exact
+    /// decoded pixels straight from spec bit-strings, independently of the
+    /// encoder, so a decoder regression is caught even if the encoder path
+    /// were to drift in lock-step with it.
+    #[test]
+    fn decode_2bit_spec_escape_vectors() {
+        // `00 0 0 00` — end_of_2-bit/pixel_code_string.
+        const EOS: [u8; 6] = [0, 0, 0, 0, 0, 0];
+        let case = |body: &[u8]| -> Vec<u8> {
+            let mut bits = body.to_vec();
+            bits.extend_from_slice(&EOS);
+            decode_2bit_string(&pack_bits(&bits)).unwrap().1
+        };
+
+        // switch_1 == 1: run_length_3-10 (field + 3) of a 2-bit colour.
+        // field 0 -> 3 px of colour 0b10 = 2.
+        assert_eq!(case(&[0, 0, 1, /*run*/ 0, 0, 0, /*col*/ 1, 0]), vec![2; 3]);
+        // field 7 -> 10 px of colour 0b01 = 1.
+        assert_eq!(case(&[0, 0, 1, 1, 1, 1, 0, 1]), vec![1; 10]);
+
+        // switch_2 == 1: a single pixel of colour 0.
+        assert_eq!(case(&[0, 0, 0, 1]), vec![0]);
+
+        // switch_3 == 01: two pixels of colour 0.
+        assert_eq!(case(&[0, 0, 0, 0, 0, 1]), vec![0, 0]);
+
+        // switch_3 == 10: run_length_12-27 (field + 12) of a 2-bit colour.
+        // field 0 -> 12 px of colour 0b01 = 1.
+        assert_eq!(
+            case(&[0, 0, 0, 0, 1, 0, /*run*/ 0, 0, 0, 0, /*col*/ 0, 1]),
+            vec![1; 12]
+        );
+        // field 15 -> 27 px of colour 0b11 = 3.
+        assert_eq!(case(&[0, 0, 0, 0, 1, 0, 1, 1, 1, 1, 1, 1]), vec![3; 27]);
+
+        // switch_3 == 11: run_length_29-284 (field + 29) of a 2-bit colour.
+        // field 0 -> 29 px of colour 0b11 = 3.
+        let mut v = vec![0u8, 0, 0, 0, 1, 1];
+        v.extend([0; 8]);
+        v.extend([1, 1]);
+        assert_eq!(case(&v), vec![3; 29]);
+        // field 255 -> 284 px of colour 0b10 = 2.
+        let mut v = vec![0u8, 0, 0, 0, 1, 1];
+        v.extend([1; 8]);
+        v.extend([1, 0]);
+        assert_eq!(case(&v), vec![2; 284]);
+
+        // A bare non-`00` code is a single literal pixel.
+        assert_eq!(case(&[1, 0, 0, 1, 1, 1]), vec![2, 1, 3]);
     }
 
     #[test]
@@ -4375,7 +4450,7 @@ mod tests {
 
     /// Pure runs of every colour at every run-length-form boundary the
     /// 2-bit encoder switches on (literals / 3..=10 colour runs /
-    /// 12..=27 zero runs / 29..=284 long runs, plus the chunked
+    /// 12..=27 colour runs / 29..=284 long runs, plus the chunked
     /// over-284 shapes).
     #[test]
     fn encode_2bit_run_boundaries_roundtrip() {
