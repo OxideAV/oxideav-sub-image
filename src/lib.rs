@@ -79,6 +79,8 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
             max_channels: None,
             priority: 100,
             accepted_pixel_formats: Vec::new(),
+            // Fields this subtitle codec does not constrain keep their defaults.
+            ..CodecCapabilities::audio(String::new())
         };
         let factory = match id {
             PGS_CODEC_ID => pgs::make_decoder,
@@ -114,6 +116,8 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
             max_channels: None,
             priority: 100,
             accepted_pixel_formats: vec![oxideav_core::PixelFormat::Rgba],
+            // Fields this subtitle codec does not constrain keep their defaults.
+            ..CodecCapabilities::audio(String::new())
         };
         let factory = match id {
             PGS_CODEC_ID => pgs::make_encoder,
