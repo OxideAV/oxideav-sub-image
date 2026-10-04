@@ -294,23 +294,22 @@ use oxideav_core::{Frame, RuntimeContext};
 
 let mut ctx = RuntimeContext::new();
 oxideav_sub_image::register(&mut ctx);
-let codecs = &ctx.codecs;
-let containers = &ctx.containers;
 
-let input: Box<dyn oxideav_container::ReadSeek> = Box::new(
+let input: Box<dyn oxideav_core::ReadSeek> = Box::new(
     std::io::Cursor::new(std::fs::read("subs.sup")?),
 );
-let mut dmx = containers.open("pgs", input)?;
-let stream = &dmx.streams()[0];
-let mut dec = codecs.make_decoder(&stream.params)?;
+let mut dmx = ctx.containers.open_demuxer("pgs", input, &ctx.codecs)?;
+let params = dmx.streams()[0].params.clone();
+let mut dec = ctx.codecs.first_decoder(&params)?;
 
 loop {
     match dmx.next_packet() {
         Ok(pkt) => {
             dec.send_packet(&pkt)?;
             while let Ok(Frame::Video(vf)) = dec.receive_frame() {
-                // vf.format == PixelFormat::Rgba
-                // vf.planes[0].data is the composed subtitle canvas.
+                // Output is PixelFormat::Rgba (see the decoder's output
+                // params); vf.planes[0].data is the composed subtitle canvas.
+                let _ = vf;
             }
         }
         Err(oxideav_core::Error::Eof) => break,
@@ -323,16 +322,28 @@ loop {
 ### Encoding PGS
 
 ```rust
-use oxideav_core::{CodecId, CodecParameters, Frame, MediaType, PixelFormat};
+use oxideav_core::{
+    CodecId, CodecParameters, Frame, MediaType, PixelFormat, RuntimeContext, VideoFrame, VideoPlane,
+};
+
+let mut ctx = RuntimeContext::new();
+oxideav_sub_image::register(&mut ctx);
 
 let mut params = CodecParameters::video(CodecId::new("pgs"));
 params.media_type = MediaType::Subtitle;
 params.pixel_format = Some(PixelFormat::Rgba);
 
-let mut enc = codecs.make_encoder(&params)?;
+let mut enc = ctx.codecs.first_encoder(&params)?;
+// The canvas size comes from the plane: RGBA stride = width * 4.
+let (w, h) = (1920usize, 1080usize);
+let rgba_frame = VideoFrame {
+    pts: Some(0),
+    planes: vec![VideoPlane { stride: w * 4, data: vec![0u8; w * h * 4] }],
+};
 enc.send_frame(&Frame::Video(rgba_frame))?;
 let packet = enc.receive_packet()?;
 // packet.data is one complete PGS display-set (PCS + WDS + PDS + ODS + END).
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 Each `send_frame` call produces one packet. The encoder first finds the
