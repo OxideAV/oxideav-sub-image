@@ -63,25 +63,14 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
         (DVBSUB_CODEC_ID, "dvbsub_sw"),
         (VOBSUB_CODEC_ID, "vobsub_sw"),
     ] {
-        let caps = CodecCapabilities {
-            decode: true,
-            encode: false,
-            media_type: MediaType::Subtitle,
-            intra_only: true,
-            lossy: false,
-            lossless: true,
-            hardware_accelerated: false,
-            implementation: impl_name.into(),
-            max_width: None,
-            max_height: None,
-            max_bitrate: None,
-            max_sample_rate: None,
-            max_channels: None,
-            priority: 100,
-            accepted_pixel_formats: Vec::new(),
-            // Fields this subtitle codec does not constrain keep their defaults.
-            ..CodecCapabilities::audio(String::new())
-        };
+        // Constructor + builders: `CodecCapabilities` is `#[non_exhaustive]`,
+        // so a literal (or struct update) here would stop compiling whenever
+        // core adds a field.
+        let mut caps = CodecCapabilities::audio(impl_name)
+            .with_decode()
+            .with_intra_only(true)
+            .with_lossless(true);
+        caps.media_type = MediaType::Subtitle;
         let factory = match id {
             PGS_CODEC_ID => pgs::make_decoder,
             DVBSUB_CODEC_ID => dvbsub::make_decoder,
@@ -100,25 +89,12 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
     // encoder emits the display-set PES payload; riding MPEG-TS still
     // needs a TS muxer upstream.
     for id in [PGS_CODEC_ID, DVBSUB_CODEC_ID] {
-        let enc_caps = CodecCapabilities {
-            decode: false,
-            encode: true,
-            media_type: MediaType::Subtitle,
-            intra_only: true,
-            lossy: true,
-            lossless: false,
-            hardware_accelerated: false,
-            implementation: format!("{id}_sw"),
-            max_width: None,
-            max_height: None,
-            max_bitrate: None,
-            max_sample_rate: None,
-            max_channels: None,
-            priority: 100,
-            accepted_pixel_formats: vec![oxideav_core::PixelFormat::Rgba],
-            // Fields this subtitle codec does not constrain keep their defaults.
-            ..CodecCapabilities::audio(String::new())
-        };
+        let mut enc_caps = CodecCapabilities::audio(format!("{id}_sw"))
+            .with_encode()
+            .with_intra_only(true)
+            .with_lossy(true)
+            .with_pixel_format(oxideav_core::PixelFormat::Rgba);
+        enc_caps.media_type = MediaType::Subtitle;
         let factory = match id {
             PGS_CODEC_ID => pgs::make_encoder,
             DVBSUB_CODEC_ID => dvbsub::make_encoder,

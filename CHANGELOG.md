@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `CodecCapabilities` is built with the core constructors / `with_*` builders (the struct is `#[non_exhaustive]` from core 0.1.39; a literal broke the published crate when core 0.1.38 added fields).
+
 ## [0.0.8](https://github.com/OxideAV/oxideav-sub-image/compare/v0.0.7...v0.0.8) - 2026-10-04
 
 ### Other
