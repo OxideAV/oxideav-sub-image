@@ -18,7 +18,7 @@ use libfuzzer_sys::fuzz_target;
 use oxideav_core::{
     CodecId, CodecParameters, Frame, MediaType, PixelFormat, VideoFrame, VideoPlane,
 };
-use oxideav_sub_image::{dvbsub, DVBSUB_CODEC_ID};
+use oxideav_sub_image::{DVBSUB_CODEC_ID, dvbsub};
 
 fn params() -> CodecParameters {
     let mut p = CodecParameters::video(CodecId::new(DVBSUB_CODEC_ID));

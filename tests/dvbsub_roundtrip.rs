@@ -4,7 +4,7 @@
 use oxideav_core::{
     CodecId, CodecParameters, Frame, PixelFormat, TimeBase, VideoFrame, VideoPlane,
 };
-use oxideav_sub_image::{dvbsub, DVBSUB_CODEC_ID};
+use oxideav_sub_image::{DVBSUB_CODEC_ID, dvbsub};
 
 fn codec_params() -> CodecParameters {
     let mut params = CodecParameters::video(CodecId::new(DVBSUB_CODEC_ID));

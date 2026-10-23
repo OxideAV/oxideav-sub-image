@@ -3,7 +3,7 @@
 use oxideav_core::{
     CodecId, CodecParameters, Frame, Packet, PixelFormat, TimeBase, VideoFrame, VideoPlane,
 };
-use oxideav_sub_image::{pgs, PGS_CODEC_ID};
+use oxideav_sub_image::{PGS_CODEC_ID, pgs};
 
 fn codec_params() -> CodecParameters {
     let mut params = CodecParameters::video(CodecId::new(PGS_CODEC_ID));

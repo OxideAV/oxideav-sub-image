@@ -558,12 +558,12 @@ fn parse_chg_colcon_payload(payload: &[u8]) -> Result<Vec<ChgColConBand>> {
             // entry's start_col must be strictly greater than the one
             // before it. Otherwise a later entry would silently never
             // get applied (its column range would be empty or inverted).
-            if let Some(prev) = last_start {
-                if start_col <= prev {
-                    return Err(Error::invalid(
-                        "vobsub SPU: CHG_COLCON PX_CTLI start_col not strictly increasing",
-                    ));
-                }
+            if let Some(prev) = last_start
+                && start_col <= prev
+            {
+                return Err(Error::invalid(
+                    "vobsub SPU: CHG_COLCON PX_CTLI start_col not strictly increasing",
+                ));
             }
             last_start = Some(start_col);
             entries.push(ChgColConEntry {
@@ -705,13 +705,17 @@ impl<'a> NibbleReader<'a> {
             return Err(Error::invalid("vobsub: RLE bitstream ran out"));
         }
         let b = self.buf[self.pos / 2];
-        let nibble = if self.pos % 2 == 0 { b >> 4 } else { b & 0x0F };
+        let nibble = if self.pos.is_multiple_of(2) {
+            b >> 4
+        } else {
+            b & 0x0F
+        };
         self.pos += 1;
         Ok(nibble as u32)
     }
 
     fn align(&mut self) {
-        if self.pos % 2 != 0 {
+        if !self.pos.is_multiple_of(2) {
             self.pos += 1;
         }
     }
@@ -825,7 +829,7 @@ fn extract_inline_sub(idx_text: &str) -> Option<Vec<u8>> {
 
 fn decode_hex(s: &str) -> Option<Vec<u8>> {
     let clean: String = s.chars().filter(|c| !c.is_whitespace()).collect();
-    if clean.len() % 2 != 0 {
+    if !clean.len().is_multiple_of(2) {
         return None;
     }
     let mut out = Vec::with_capacity(clean.len() / 2);
@@ -951,11 +955,11 @@ fn extract_spu_from_ps(buf: &[u8]) -> Option<Vec<u8>> {
                 if target.is_none() && spu.len() >= 2 {
                     target = Some(u16::from_be_bytes([spu[0], spu[1]]) as usize);
                 }
-                if let Some(t) = target {
-                    if spu.len() >= t {
-                        spu.truncate(t);
-                        return Some(spu);
-                    }
+                if let Some(t) = target
+                    && spu.len() >= t
+                {
+                    spu.truncate(t);
+                    return Some(spu);
                 }
                 cur = pes_end;
             }
@@ -1261,7 +1265,7 @@ pub fn build_demo_spu(width: u16, height: u16, indices: &[u8]) -> Vec<u8> {
             self.nibbles.push((value & 0x0F) as u8);
         }
         fn align(&mut self) {
-            if self.nibbles.len() % 2 != 0 {
+            if !self.nibbles.len().is_multiple_of(2) {
                 self.nibbles.push(0);
             }
         }
@@ -1310,7 +1314,7 @@ pub fn build_demo_spu(width: u16, height: u16, indices: &[u8]) -> Vec<u8> {
     // Single control sequence.
     let ctrl_pos = out.len();
     out.extend_from_slice(&[0, 0]); // delay = 0
-                                    // next_offset placeholder — will point back to itself at end.
+    // next_offset placeholder — will point back to itself at end.
     out.extend_from_slice(&[0, 0]);
     out.push(0x03); // palette select
     out.push(0x01); // bg=0, pat=1
@@ -1323,7 +1327,7 @@ pub fn build_demo_spu(width: u16, height: u16, indices: &[u8]) -> Vec<u8> {
     out[last] = 0x0F; // (bg<<4)|pattern → bg=0 pat=0xF
     out[last + 1] = 0xFF; // emp1=0xF, emp2=0xF
     out.push(0x05); // coords
-                    // x1 = 0, x2 = width - 1
+    // x1 = 0, x2 = width - 1
     out.push(0);
     out.push((((width - 1) >> 8) as u8) & 0x0F);
     out.push(((width - 1) & 0xFF) as u8);
@@ -1565,7 +1569,7 @@ timestamp: 00:00:03:000, filepos: 000000040
         let mut out = Vec::new();
         out.extend_from_slice(&[0, 0]); // placeholder length
         out.extend_from_slice(&[0, 4]); // control_offset = 4 (no RLE)
-                                        // Control block.
+        // Control block.
         out.extend_from_slice(&[0, 0, 0, 0]); // delay + next placeholder
         out.push(0x07); // CHG_COLCON with no size bytes following
         let total = out.len() as u16;
@@ -1841,8 +1845,8 @@ timestamp: 00:00:03:000, filepos: 000000040
         // LN_CTLI: csln=0, n=1, ctln=1 → 00 00 10 01
         payload.extend_from_slice(&[0x00, 0x00, 0x10, 0x01]);
         payload.extend_from_slice(&0u16.to_be_bytes()); // start_col=0
-                                                        // colors: keep base (bg=0, pat=1, emp1=3, emp2=2). Byte 0
-                                                        // (bg|pat) = 0x01, byte 1 (emp1|emp2) = 0x32.
+        // colors: keep base (bg=0, pat=1, emp1=3, emp2=2). Byte 0
+        // (bg|pat) = 0x01, byte 1 (emp1|emp2) = 0x32.
         payload.extend_from_slice(&[0x01, 0x32]);
         // alphas: bg=0, pat=0 (transparent), emp1=0xF, emp2=0xF.
         payload.extend_from_slice(&[0x00, 0xFF]);

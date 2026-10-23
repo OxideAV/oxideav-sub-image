@@ -17,7 +17,7 @@ use libfuzzer_sys::fuzz_target;
 use oxideav_core::{
     CodecId, CodecParameters, Frame, MediaType, PixelFormat, VideoFrame, VideoPlane,
 };
-use oxideav_sub_image::{pgs, PGS_CODEC_ID};
+use oxideav_sub_image::{PGS_CODEC_ID, pgs};
 
 fn params() -> CodecParameters {
     let mut p = CodecParameters::video(CodecId::new(PGS_CODEC_ID));

@@ -262,7 +262,7 @@ mod tests {
     #[test]
     fn blit_clips_out_of_bounds() {
         let mut canvas = vec![0u8; 4]; // 1×1 RGBA
-                                       // 2×2 source at (0,0) on a 1×1 canvas — only (0,0) is written.
+        // 2×2 source at (0,0) on a 1×1 canvas — only (0,0) is written.
         blit_indexed(&mut canvas, 1, 1, &[vec![1, 1], vec![1, 1]], 0, 0, |_| {
             [10, 20, 30, 255]
         });

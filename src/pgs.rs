@@ -902,11 +902,11 @@ fn open_pgs(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result
         // marks Acquisition Point or Epoch Start decodes standalone and
         // is a valid seek target; a Normal Case set depends on earlier
         // palette / object data inside the same epoch and is not.
-        if seg.seg_type == SEG_PCS {
-            if let Ok(pcs) = parse_pcs(&seg.body) {
-                last_canvas = Some((pcs.width, pcs.height));
-                ds_random_access = is_random_access(pcs.composition_state);
-            }
+        if seg.seg_type == SEG_PCS
+            && let Ok(pcs) = parse_pcs(&seg.body)
+        {
+            last_canvas = Some((pcs.width, pcs.height));
+            ds_random_access = is_random_access(pcs.composition_state);
         }
         cur = next;
         if seg.seg_type == SEG_END {
@@ -2078,11 +2078,11 @@ mod tests {
         // 80-zero-run, then 200-zero-run.
         let mut pixels: Vec<u8> = Vec::new();
         pixels.push(9); // 1 literal
-        pixels.extend(std::iter::repeat(5).take(3)); // 3 of colour 5 → 3 literals
-        pixels.extend(std::iter::repeat(6).take(5)); // 5 of colour 6 → short 3-byte run
-        pixels.extend(std::iter::repeat(7).take(70)); // 70 of colour 7 → 14-bit run
-        pixels.extend(std::iter::repeat(0).take(80)); // 80 of colour 0 → 14-bit zero run
-        pixels.extend(std::iter::repeat(0).take(200)); // a second zero block
+        pixels.extend(std::iter::repeat_n(5, 3)); // 3 of colour 5 → 3 literals
+        pixels.extend(std::iter::repeat_n(6, 5)); // 5 of colour 6 → short 3-byte run
+        pixels.extend(std::iter::repeat_n(7, 70)); // 70 of colour 7 → 14-bit run
+        pixels.extend(std::iter::repeat_n(0, 80)); // 80 of colour 0 → 14-bit zero run
+        pixels.extend(std::iter::repeat_n(0, 200)); // a second zero block
         let width = pixels.len();
         let height = 1usize;
         let rle = encode_rle(&pixels, width, height);
@@ -3722,7 +3722,7 @@ mod tests {
         let w = 1024usize;
         let h = 70usize;
         let mut data = vec![0u8; w * h * 4];
-        for (i, px) in data.chunks_exact_mut(4).enumerate() {
+        for (i, px) in data.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             // Two fully-opaque colours alternating per pixel — never
             // transparent, so the whole frame is the bounding box and the
             // palette has exactly two visible entries.
@@ -3771,8 +3771,10 @@ mod tests {
         let decoded = decode_one(packet.data.clone());
         assert_eq!(decoded.len(), data.len(), "decoded canvas size");
         for (i, (got, want)) in decoded
-            .chunks_exact(4)
-            .zip(data.chunks_exact(4))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(data.as_chunks::<4>().0.iter())
             .enumerate()
         {
             assert_eq!(got[3], want[3], "alpha mismatch at pixel {i}");

@@ -25,7 +25,7 @@
 //! Run with:
 //!     cargo bench -p oxideav-sub-image --bench rle
 
-use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 
 use oxideav_sub_image::dvbsub;
 use oxideav_sub_image::pgs;

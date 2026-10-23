@@ -1091,7 +1091,7 @@ fn decode_2bit_string(buf: &[u8]) -> Result<(usize, Vec<u8>)> {
             // colour. Count 0 → 3 pixels, count 7 → 10 pixels.
             let run = bits.read(3)? as usize + 3;
             let col = bits.read(2)? as u8;
-            pixels.extend(std::iter::repeat(col).take(run));
+            pixels.extend(std::iter::repeat_n(col, run));
             continue;
         }
         let switch_2 = bits.read(1)?;
@@ -1118,14 +1118,14 @@ fn decode_2bit_string(buf: &[u8]) -> Result<(usize, Vec<u8>)> {
                 // 2-bit colour.
                 let run = bits.read(4)? as usize + 12;
                 let col = bits.read(2)? as u8;
-                pixels.extend(std::iter::repeat(col).take(run));
+                pixels.extend(std::iter::repeat_n(col, run));
             }
             0x03 => {
                 // run_length_29-284: an 8-bit count (pixels − 29) then a
                 // 2-bit colour.
                 let run = bits.read(8)? as usize + 29;
                 let col = bits.read(2)? as u8;
-                pixels.extend(std::iter::repeat(col).take(run));
+                pixels.extend(std::iter::repeat_n(col, run));
             }
             _ => unreachable!(),
         }
@@ -1153,7 +1153,7 @@ fn decode_4bit_string(buf: &[u8]) -> Result<(usize, Vec<u8>)> {
             }
             // 2..9 pixels of colour 0.
             let run = run_hdr as usize + 2;
-            pixels.extend(std::iter::repeat(0_u8).take(run));
+            pixels.extend(std::iter::repeat_n(0_u8, run));
             continue;
         }
         let b2 = bits.read(1)?;
@@ -1226,7 +1226,7 @@ fn decode_8bit_string(buf: &[u8]) -> Result<(usize, Vec<u8>)> {
                 continue;
             }
             // count pixels of colour 0.
-            pixels.extend(std::iter::repeat(0_u8).take(count));
+            pixels.extend(std::iter::repeat_n(0_u8, count));
         } else {
             if i >= buf.len() {
                 return Err(Error::invalid("DVB 8-bit: run-byte truncated"));
@@ -1673,7 +1673,7 @@ pub fn write_region_composition(def: &RegionCompositionDef) -> Result<Vec<u8>> {
         other => {
             return Err(Error::invalid(format!(
                 "DVB region_composition: depth {other} bits is not 2/4/8"
-            )))
+            )));
         }
     };
     let mut body = Vec::with_capacity(10 + def.objects.len() * 6);
@@ -1873,7 +1873,7 @@ pub fn write_object_data_flags(
         other => {
             return Err(Error::invalid(format!(
                 "DVB object_data: depth {other} bits is not 2/4/8"
-            )))
+            )));
         }
     };
     for &(t, payload) in map_tables {
@@ -2159,7 +2159,7 @@ fn encode_bbox(
     let mut any = false;
     for row in 0..height {
         let line = &plane.data[row * plane.stride..row * plane.stride + width * 4];
-        for (col, px) in line.chunks_exact(4).enumerate() {
+        for (col, px) in line.as_chunks::<4>().0.iter().enumerate() {
             if px[3] != 0 {
                 any = true;
                 min_x = min_x.min(col);
@@ -2496,7 +2496,7 @@ impl Decoder for DvbSubDecoder {
                     for y in ry0..ry1 {
                         let row_off = (y * width + rx0) * 4;
                         let row_end = (y * width + rx1) * 4;
-                        for px in canvas[row_off..row_end].chunks_exact_mut(4) {
+                        for px in canvas[row_off..row_end].as_chunks_mut::<4>().0 {
                             px.copy_from_slice(&fill_rgba);
                         }
                     }
@@ -2669,7 +2669,7 @@ pub fn build_demo_pes(canvas: (u16, u16), pixels: &[u8], width: usize, height: u
     region.push(0); // clut_id
     region.push(0); // 8-bit pixel code
     region.push(0); // 4/2-bit codes
-                    // object entry
+    // object entry
     region.extend_from_slice(&0u16.to_be_bytes()); // object_id + obj_type(0)
     region.extend_from_slice(&0u16.to_be_bytes()); // x
     region.extend_from_slice(&0u16.to_be_bytes()); // y
@@ -2699,7 +2699,7 @@ pub fn build_demo_pes(canvas: (u16, u16), pixels: &[u8], width: usize, height: u
     // Object data: 8-bit pixel-coded string, two rows top+bottom.
     let mut obj = Vec::new();
     obj.extend_from_slice(&0u16.to_be_bytes()); // object_id
-                                                // coding_method = 0 in bits 3..4 of byte[2]. Rest zero.
+    // coding_method = 0 in bits 3..4 of byte[2]. Rest zero.
     obj.push(0);
     // Build top-field / bottom-field line blocks.
     fn encode_rows_8bit(rows: &[Vec<u8>]) -> Vec<u8> {
@@ -2818,7 +2818,7 @@ mod tests {
         region.push(clut_id);
         region.push(0); // region_8-bit_pixel_code
         region.push(0); // region_4/2-bit_pixel_code
-                        // object reference at (0,0), obj_type = 0.
+        // object reference at (0,0), obj_type = 0.
         region.extend_from_slice(&object_id.to_be_bytes());
         region.extend_from_slice(&0u16.to_be_bytes()); // x
         region.extend_from_slice(&0u16.to_be_bytes()); // y
@@ -3833,7 +3833,9 @@ mod tests {
         // switch_3 == 10: run_length_9-24 (field + 9) + colour.
         // field 0 -> 9 px of colour 0b1111 = 15.
         assert_eq!(
-            case(&[0, 0, 0, 0, 1, 1, 1, 0, /*run*/ 0, 0, 0, 0, /*col*/ 1, 1, 1, 1]),
+            case(&[
+                0, 0, 0, 0, 1, 1, 1, 0, /*run*/ 0, 0, 0, 0, /*col*/ 1, 1, 1, 1
+            ]),
             vec![15; 9]
         );
         // switch_3 == 11: run_length_25-280 (field + 25) + colour.
@@ -4316,14 +4318,14 @@ mod tests {
         // Object #1: character object (type 0x01) at (x=3, y=5) with
         // foreground=0xAA, background=0xBB.
         body.extend_from_slice(&0x1234u16.to_be_bytes()); // object_id
-                                                          // object_type 0b01 << 6 | provider 0b00 << 4 | x_hi (top 6 bits of 3 = 0).
+        // object_type 0b01 << 6 | provider 0b00 << 4 | x_hi (top 6 bits of 3 = 0).
         body.push(0b0100_0000);
         body.push(0x03); // x_lo = 3
         body.push(0x00); // reserved (4) | y_hi (4) = 0
         body.push(0x05); // y_lo = 5
         body.push(0xAA); // foreground_pixel_code
         body.push(0xBB); // background_pixel_code
-                         // Object #2: a plain bitmap object (type 0x00) — no fg/bg bytes.
+        // Object #2: a plain bitmap object (type 0x00) — no fg/bg bytes.
         body.extend_from_slice(&0x0001u16.to_be_bytes());
         body.push(0x00); // type 0, x_hi 0
         body.push(0x07); // x = 7
@@ -4654,7 +4656,7 @@ mod tests {
             let row: Vec<u8> = (0..len)
                 .map(|_| {
                     let v = lcg(&mut state);
-                    if v % 3 == 0 {
+                    if v.is_multiple_of(3) {
                         (v >> 8) as u8
                     } else {
                         (v % 4) as u8
@@ -5453,7 +5455,7 @@ mod tests {
     fn dss_single_subregion_omits_position_fields() {
         let mut body = vec![(2 << 4), 0x00]; // version 2, no page flag, default 0
         body.push(0x09); // region_id = 9
-                         // region flags: update_flag=0, reserved=0, subregions_minus_1=0
+        // region flags: update_flag=0, reserved=0, subregions_minus_1=0
         body.push(0x00);
         body.push(0x03); // disparity integer = +3
         body.push(0x40); // fractional = 4 (0x4 in high nibble), reserved low
@@ -5478,7 +5480,7 @@ mod tests {
         let mut body = vec![(0 << 4), 0x00];
         body.push(0x01); // region_id = 1
         body.push(0x01); // flags: subregions_minus_1 = 1 (two subregions)
-                         // subregion 0: h=10, w=40, disparity=+5, frac=0
+        // subregion 0: h=10, w=40, disparity=+5, frac=0
         body.extend_from_slice(&10u16.to_be_bytes());
         body.extend_from_slice(&40u16.to_be_bytes());
         body.push(0x05);
@@ -5506,7 +5508,7 @@ mod tests {
     #[test]
     fn dss_page_update_sequence_round_trips() {
         let mut body = vec![(1 << 4) | 0x08, 0x02]; // version 1, page_flag, default +2
-                                                    // update sequence: length, interval_duration(3), count(1), 2×(2)
+        // update sequence: length, interval_duration(3), count(1), 2×(2)
         let mut seq = Vec::new();
         seq.extend_from_slice(&[0x00, 0x0B, 0xB8]); // interval_duration = 3000
         seq.push(0x02); // division_period_count = 2
