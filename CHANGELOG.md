@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.10](https://github.com/OxideAV/oxideav-sub-image/compare/v0.0.9...v0.0.10) - 2026-11-07
+
+### Other
+
+- API hygiene: #[non_exhaustive] growable types, #[doc(hidden)] internals
+- edition 2024, MSRV 1.95
+
 ### Added
 
 - `vobsub::VobSubIdx` gains `with_*` setters for every field (start from `Default`).
