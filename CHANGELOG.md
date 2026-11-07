@@ -7,9 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `vobsub::VobSubIdx` gains `with_*` setters for every field (start from `Default`).
+
+
 ### Changed
 
 - edition 2024, MSRV 1.95
+- API hygiene: `vobsub::VobSubIdx` (the parsed `.idx` record, which can
+  grow as more `.idx` keys are surfaced) is now `#[non_exhaustive]`. The
+  PGS / DVB / VobSub segment and composition records mirror fixed wire
+  layouts and stay exhaustive.
 
 ## [0.0.9](https://github.com/OxideAV/oxideav-sub-image/compare/v0.0.8...v0.0.9) - 2026-10-06
 

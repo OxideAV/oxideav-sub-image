@@ -78,6 +78,7 @@ use crate::VOBSUB_CODEC_ID;
 
 /// Parsed contents of a VobSub `.idx` file.
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct VobSubIdx {
     pub size: (u16, u16),
     /// 16 entries, each RGB (pre-YCbCr-to-RGB-converted).
@@ -85,6 +86,36 @@ pub struct VobSubIdx {
     pub has_palette: bool,
     /// Cue entries: (start_us, filepos).
     pub cues: Vec<(i64, u64)>,
+}
+
+impl VobSubIdx {
+    /// Set [`VobSubIdx::size`].
+    #[must_use]
+    pub fn with_size(mut self, v: (u16, u16)) -> Self {
+        self.size = v;
+        self
+    }
+
+    /// Set [`VobSubIdx::palette_rgb`].
+    #[must_use]
+    pub fn with_palette_rgb(mut self, v: [[u8; 3]; 16]) -> Self {
+        self.palette_rgb = v;
+        self
+    }
+
+    /// Set [`VobSubIdx::has_palette`].
+    #[must_use]
+    pub fn with_has_palette(mut self, v: bool) -> Self {
+        self.has_palette = v;
+        self
+    }
+
+    /// Set [`VobSubIdx::cues`].
+    #[must_use]
+    pub fn with_cues(mut self, v: Vec<(i64, u64)>) -> Self {
+        self.cues = v;
+        self
+    }
 }
 
 pub fn parse_idx(text: &str) -> Result<VobSubIdx> {
